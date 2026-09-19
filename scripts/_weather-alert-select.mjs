@@ -14,6 +14,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { roundGeoCoordinate } from './_seed-utils.mjs';
+import { finiteLat, finiteLon, lonLatPair } from './lib/geo-coord.mjs';
 
 const ISO3_TO_ISO2 = JSON.parse(
   readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'shared/iso3-to-iso2.json'), 'utf8'),
@@ -32,19 +33,20 @@ export const NWS_ALERTS_URL = 'https://api.weather.gov/alerts/active';
 export const ECCC_HOST = 'api.weather.gc.ca';
 // Live ECCC vocabulary is issued/continued/ended — not 'active'.
 // status_en=active returns an empty collection. CQL IN also returned 0,
-// so issued and continued are fetched as two separate GETs. limit is set
-// high so each national collection returns in one page; GeoMet defaults
-// to 10 without it.
+// so issued and continued are paged separately in stable feature_id order.
 export const ECCC_LIVE_STATUSES = Object.freeze(['issued', 'continued']);
+const ECCC_PAGE_SIZE = 250;
 const ECCC_ALERTS_COLLECTION = 'https://api.weather.gc.ca/collections/weather-alerts/items';
 export const ECCC_ALERTS_URLS = Object.freeze(
-  ECCC_LIVE_STATUSES.map((status) => `${ECCC_ALERTS_COLLECTION}?f=json&status_en=${status}&limit=10000`),
+  ECCC_LIVE_STATUSES.map((status) => `${ECCC_ALERTS_COLLECTION}?f=json&status_en=${status}&limit=${ECCC_PAGE_SIZE}&offset=0&sortby=feature_id`),
 );
 // Issued URL kept as the single-URL handle for existing host-policy tests.
 export const ECCC_ALERTS_URL = ECCC_ALERTS_URLS[0];
 // National GeoJSON exceeds HKO's 256KiB; 4 MiB is the upper end of the
 // deliberate 2–4 MiB ceiling for this collection.
 export const ECCC_MAX_BYTES = 4 * 1024 * 1024;
+const ECCC_MAX_AGGREGATE_BYTES = 8 * 1024 * 1024;
+const ECCC_MAX_PAGES = 8;
 
 export const SWIC_HOST = 'severeweather.wmo.int';
 export const SWIC_ALERTS_URL = 'https://severeweather.wmo.int/json/wmo_all.json';
@@ -142,10 +144,14 @@ function isClosedLinearRing(ring) {
   // rounded: sub-metre-adjacent vertices collapse onto each other, so a ring can
   // keep 4+ positions and matching endpoints while enclosing zero area. PostGIS
   // accepts that as "closed" and it reaches third-party webhooks as a degenerate
-  // Polygon. A real ring has at least 3 distinct vertices.
+  // Polygon. A real ring has at least 3 distinct vertices, and every one of
+  // them has to be a usable position: NaN and Infinity serialize as null in
+  // the outgoing GeoJSON, which PostGIS rejects at the far end of the webhook.
   const distinct = new Set();
   for (const position of ring) {
-    if (Array.isArray(position)) distinct.add(`${position[0]},${position[1]}`);
+    const pair = lonLatPair(position);
+    if (!pair) return false;
+    distinct.add(`${pair[0]},${pair[1]}`);
   }
   return distinct.size >= 3;
 }
@@ -163,8 +169,9 @@ export function calculateCentroid(coords) {
     && coords[0][0] === coords[coords.length - 1][0]
     && coords[0][1] === coords[coords.length - 1][1];
   const ring = closed ? coords.slice(0, -1) : coords;
+  if (ring.length === 0 || ring.some((position) => lonLatPair(position) == null)) return undefined;
   const sum = ring.reduce((acc, [lon, lat]) => [acc[0] + lon, acc[1] + lat], [0, 0]);
-  return [sum[0] / ring.length, sum[1] / ring.length];
+  return lonLatPair([sum[0] / ring.length, sum[1] / ring.length]) || undefined;
 }
 
 /**
@@ -394,6 +401,153 @@ export function mergeAlertSources(parts = {}, { totalLimit = MAX_ALERTS, perSour
   return sortBySeverityThenStable(kept).slice(0, totalLimit);
 }
 
+/**
+ * Slot B helper: derive a coalesce-family key from an NWS VTEC string.
+ *
+ * NWS VTEC format (https://www.weather.gov/vtec/):
+ *   /O.NEW.KSGF.SV.W.0034.250427T1257Z-250427T1330Z/
+ *    │  │   │   │  │  │
+ *    │  │   │   │  │  └── event tracking number (per-office, per-phenomenon, per-significance)
+ *    │  │   │   │  └───── significance: W=warning, A=watch, Y=advisory, etc.
+ *    │  │   │   └──────── phenomenon: SV=severe thunderstorm, TO=tornado, FF=flash flood, etc.
+ *    │  │   └──────────── forecast office (4-letter ICAO)
+ *    │  └──────────────── action: NEW, CON (continued), CAN (cancel), EXP (expired), etc.
+ *    └─────────────────── product status: O=operational, T=test, E=exercise, X=experimental
+ *
+ * The (office, phenomenon, significance, eventID) tuple identifies one logical
+ * event across adjacent zones — exactly what we want to coalesce. We drop the
+ * action so NEW + CON + CAN bulletins for the same event also collapse.
+ *
+ * Returns a stable family key like "nws:KSGF.SV.W.0034" or undefined if the
+ * VTEC string is missing or malformed.
+ *
+ * Lives here rather than in ais-relay.cjs so the notification selection below
+ * (and its tests) can call the REAL parser instead of a copy.
+ */
+export function deriveWeatherCoalesceKey(vtec) {
+  if (typeof vtec !== 'string') return undefined;
+  const m = vtec.match(/\/[OTEX]\.[A-Z]+\.([A-Z]{4})\.([A-Z]{2})\.([A-Z])\.(\d{4})\./);
+  if (!m) return undefined;
+  return `nws:${m[1]}.${m[2]}.${m[3]}.${m[4]}`;
+}
+
+/**
+ * Notification family identity for one alert — the single notion of "family"
+ * shared by the selection below and by the publisher's SET NX dedup key. When
+ * the two disagree, the selector's per-country guarantee is silently undone by
+ * publisher dedup, which is exactly how #7243 survived its first fix.
+ *
+ * NWS publishes VTEC, so its family is the VTEC tuple (adjacent-zone bulletins
+ * for one storm collapse). VTEC-less sources fall back to
+ * `source:country:title`:
+ *
+ *  - `country` is required. SWIC titles are generic WMO event names — the live
+ *    2026-08-28 payload carries "Forestfire", "Heavy rain", and one alert
+ *    titled literally "CAP Alert" — so without it two countries share a dedup
+ *    key and only the first SET NX wins.
+ *  - `title`, NOT the id. SWIC and ECCC ids embed a timestamp and a message
+ *    sequence (`2.49.0.0.398.0-20260828-101702-0470417-00-EN`), so the same
+ *    logical alert arrives with a new id on every CAP update; an id-keyed
+ *    family would re-notify each tick instead of coalescing. Titles are also
+ *    what the pre-#7243 publisher hashed, so cross-tick behaviour is unchanged
+ *    apart from the added country partition.
+ *  - `source` keeps a VTEC-less ECCC id from colliding with an NWS one on the
+ *    shared weather:alerts:v1 path.
+ *
+ * The trade-off is deliberate: 19 identically-titled Kazakh wildfires are ONE
+ * family, which is both what a subscriber wants and what frees that country's
+ * remaining slots for a genuinely different hazard.
+ */
+export function weatherAlertFamilyKey(alert) {
+  const vtecKey = deriveWeatherCoalesceKey(alert?.vtec);
+  if (vtecKey) return vtecKey;
+  const source = alert?.source || 'weather';
+  const country = weatherAlertNotifyCountryCode(alert) ?? '';
+  return `${source}:${country}:${alert?.headline || alert?.event || alert?.id || ''}`;
+}
+
+export const WEATHER_NOTIFY_HIGH_SEVERITIES = Object.freeze(['Extreme', 'Severe']);
+
+// Notification slots are PER COUNTRY, not global. The original cap was 3 and
+// global, which was the same thing when NWS was the only source: "top 3 by
+// severity" and "top 3 for the only audience" coincided. They stopped
+// coinciding at the second source. 3 is kept as the per-audience budget, so a
+// subscriber scoped to any one country sees the same volume as before.
+export const WEATHER_NOTIFY_SLOTS_PER_COUNTRY = 3;
+// Hard ceiling on one tick's publishes, so the fan-out below cannot become
+// unbounded as sources are added under #6271. Pinned to MAX_ALERTS because that
+// is already the arithmetic maximum — the payload holds at most MAX_ALERTS
+// alerts and each publishes at most once — so this bound holds no matter how
+// many countries or sources appear, and never re-breaks the per-country
+// guarantee by biting before every country has been served. Round-robin fill
+// (below) spends it breadth-first, so if it ever did bite it would only cost
+// depth slots, never a country's first slot (#7243).
+export const WEATHER_NOTIFY_MAX_PER_TICK = MAX_ALERTS;
+
+// Alerts whose countryCode is missing/unusable reach only rules with no
+// country scope (see isPermissiveUnattributedEvent in notification-relay.cjs),
+// so they are a distinct audience and get their own bucket rather than
+// competing for a real country's slots.
+const UNATTRIBUTED_NOTIFY_BUCKET = Symbol('unattributed');
+
+/**
+ * Pick the alerts one weather seed tick publishes as weather_alert
+ * notifications.
+ *
+ * Two rules, both about not silently dropping an audience:
+ *
+ * 1. Distinct FAMILIES only. A naive `slice(0, N)` over the raw list loses
+ *    events, because three adjacent-zone bulletins for one VTEC family
+ *    collapse to a single notification at the publisher while a fourth
+ *    genuinely distinct family at index 3+ is never considered (PR #3467
+ *    review, Slot B).
+ *
+ * 2. Slots are partitioned PER COUNTRY, then filled round-robin. A globally
+ *    severity-sorted budget can be spent entirely inside one country — on
+ *    2026-08-28 nine VTEC-less SWIC Swiss thunderstorms (nine distinct
+ *    families) led the sort and took every slot, and
+ *    `eventMatchesCountryScope` then dropped the tick for every CA- and
+ *    US-scoped rule despite 15 active alerts each in the same payload. This
+ *    is the notification-layer counterpart of the PER_SOURCE_FLOOR that
+ *    mergeAlertSources applies to the payload (#6627, #7243).
+ *
+ * Round-robin — every country's slot 1 before any country's slot 2 — rather
+ * than "one per country, then fill the remainder by severity": a severity fill
+ * would hand the surplus straight back to the country that already leads the
+ * sort, which is both the original starvation and nine notifications for one
+ * Swiss subscriber.
+ */
+export function selectWeatherNotificationAlerts(alerts, {
+  slotsPerCountry = WEATHER_NOTIFY_SLOTS_PER_COUNTRY,
+  maxPerTick = WEATHER_NOTIFY_MAX_PER_TICK,
+} = {}) {
+  const highSeverity = (Array.isArray(alerts) ? alerts : [])
+    .filter((a) => WEATHER_NOTIFY_HIGH_SEVERITIES.includes(a?.severity));
+
+  // Insertion order of the Map is severity order, so round-robin visits the
+  // most severe country first on every pass — deterministic and stable.
+  const byCountry = new Map();
+  const seenFamilyKeys = new Set();
+  for (const alert of sortBySeverityThenStable(highSeverity)) {
+    const familyKey = weatherAlertFamilyKey(alert);
+    if (seenFamilyKeys.has(familyKey)) continue;
+    seenFamilyKeys.add(familyKey);
+    const bucket = weatherAlertNotifyCountryCode(alert) ?? UNATTRIBUTED_NOTIFY_BUCKET;
+    const existing = byCountry.get(bucket);
+    if (existing) existing.push(alert);
+    else byCountry.set(bucket, [alert]);
+  }
+
+  const selected = [];
+  for (let slot = 0; slot < slotsPerCountry && selected.length < maxPerTick; slot += 1) {
+    for (const queue of byCountry.values()) {
+      if (selected.length >= maxPerTick) break;
+      if (slot < queue.length) selected.push(queue[slot]);
+    }
+  }
+  return sortBySeverityThenStable(selected);
+}
+
 export function carryFailedWeatherAlertSources(previousAlerts, failedSources = []) {
   const alerts = Array.isArray(previousAlerts) ? previousAlerts : [];
   const failed = new Set(
@@ -468,19 +622,18 @@ export function requireSwicItems(data) {
 
 function swicCentroid(item, member) {
   const coords = extractCoordinates(item?.geometry);
-  if (coords.length) {
-    return { coordinates: coords, centroid: calculateCentroid(coords), geometryPrecision: 'polygon' };
+  const polygonCentroid = calculateCentroid(coords);
+  if (polygonCentroid) {
+    return { coordinates: coords, centroid: polygonCentroid, geometryPrecision: 'polygon' };
   }
-  const itemLat = Number(item?.lat ?? item?.latitude);
-  const itemLon = Number(item?.lon ?? item?.lng ?? item?.longitude);
-  if (Number.isFinite(itemLat) && Number.isFinite(itemLon)
-    && itemLat >= -90 && itemLat <= 90 && itemLon >= -180 && itemLon <= 180) {
+  const itemLat = finiteLat(item?.lat ?? item?.latitude);
+  const itemLon = finiteLon(item?.lon ?? item?.lng ?? item?.longitude);
+  if (itemLat != null && itemLon != null) {
     return { coordinates: [], centroid: [itemLon, itemLat], geometryPrecision: 'point' };
   }
-  const memberLat = Number(member?.lat);
-  const memberLon = Number(member?.lng ?? member?.lon);
-  if (Number.isFinite(memberLat) && Number.isFinite(memberLon)
-    && memberLat >= -90 && memberLat <= 90 && memberLon >= -180 && memberLon <= 180) {
+  const memberLat = finiteLat(member?.lat);
+  const memberLon = finiteLon(member?.lng ?? member?.lon);
+  if (memberLat != null && memberLon != null) {
     return { coordinates: [], centroid: [memberLon, memberLat], geometryPrecision: 'country' };
   }
   return null;
@@ -550,7 +703,7 @@ export async function fetchSwicAlertCatalog({
   };
 }
 
-async function readResponseLimited(response, maxBytes) {
+async function readResponseLimited(response, maxBytes, byteBudget) {
   const advertisedLength = Number(response.headers?.get?.('content-length'));
   if (Number.isFinite(advertisedLength) && advertisedLength > maxBytes) {
     try { await response.body?.cancel?.(); } catch { /* still reject */ }
@@ -559,7 +712,10 @@ async function readResponseLimited(response, maxBytes) {
   const reader = response.body?.getReader?.();
   if (!reader) {
     const text = await response.text();
-    if (Buffer.byteLength(text, 'utf8') > maxBytes) throw new Error('RESPONSE_TOO_LARGE');
+    const bytes = Buffer.byteLength(text, 'utf8');
+    if (byteBudget) byteBudget.remaining -= bytes;
+    if (bytes > maxBytes) throw new Error('RESPONSE_TOO_LARGE');
+    if (byteBudget?.remaining < 0) throw new Error('ECCC_AGGREGATE_TOO_LARGE');
     return JSON.parse(text);
   }
   const chunks = [];
@@ -569,9 +725,10 @@ async function readResponseLimited(response, maxBytes) {
       const { done, value } = await reader.read();
       if (done) break;
       total += value.byteLength;
-      if (total > maxBytes) {
+      if (byteBudget) byteBudget.remaining -= value.byteLength;
+      if (total > maxBytes || byteBudget?.remaining < 0) {
         await reader.cancel().catch(() => {});
-        throw new Error('RESPONSE_TOO_LARGE');
+        throw new Error(total > maxBytes ? 'RESPONSE_TOO_LARGE' : 'ECCC_AGGREGATE_TOO_LARGE');
       }
       chunks.push(value);
     }
@@ -582,40 +739,66 @@ async function readResponseLimited(response, maxBytes) {
 }
 
 /**
- * Fetch issued + continued as two GETs and concatenate features.
- * One URL failing still returns the other; throws only if both fail.
+ * Fetch complete issued + continued collections within a shared byte/page budget.
+ * One status failing returns a partial result; throws only if both fail.
  */
 export async function fetchEcccAlertFeatures({
   fetchFn = globalThis.fetch,
   userAgent,
   maxBytes = ECCC_MAX_BYTES,
 } = {}) {
-  const results = await Promise.allSettled(
-    ECCC_ALERTS_URLS.map((url) => fetchApprovedWeatherJson(url, {
-      allowedHosts: [ECCC_HOST],
-      maxBytes,
-      fetchFn,
-      userAgent,
-    }).then(requireAlertFeatures)),
-  );
-
+  const byteBudget = { remaining: ECCC_MAX_AGGREGATE_BYTES };
+  let pages = 0;
+  const seenIds = new Set();
   const features = [];
   const failures = [];
   const failedStatuses = [];
-  results.forEach((result, index) => {
-    if (result.status === 'fulfilled') {
-      features.push(...result.value);
-    } else {
-      failures.push(result.reason);
-      failedStatuses.push(ECCC_LIVE_STATUSES[index]);
+  // Sequential paging makes the shared resource limits deterministic.
+  for (const [index, status] of ECCC_LIVE_STATUSES.entries()) {
+    const statusFeatures = [];
+    let matched;
+    try {
+      do {
+        if (pages >= ECCC_MAX_PAGES) throw new Error('ECCC_PAGE_LIMIT');
+        if (byteBudget.remaining <= 0) throw new Error('ECCC_AGGREGATE_TOO_LARGE');
+        const url = new URL(ECCC_ALERTS_URLS[index]);
+        url.searchParams.set('offset', String(statusFeatures.length));
+        pages += 1;
+        const data = await fetchApprovedWeatherJson(url.toString(), {
+          allowedHosts: [ECCC_HOST], maxBytes, fetchFn, userAgent, byteBudget,
+        });
+        const page = requireAlertFeatures(data);
+        if (data.type !== 'FeatureCollection'
+          || !Number.isSafeInteger(data.numberMatched) || data.numberMatched < 0
+          || !Number.isSafeInteger(data.numberReturned) || data.numberReturned !== page.length
+          || page.length > ECCC_PAGE_SIZE) {
+          throw new Error('ECCC_MALFORMED_PAGE');
+        }
+        if (matched !== undefined && data.numberMatched !== matched) throw new Error('ECCC_COUNT_DRIFT');
+        matched = data.numberMatched;
+        if (statusFeatures.length + page.length > matched
+          || (page.length === 0 && statusFeatures.length < matched)) {
+          throw new Error('ECCC_PAGE_PROGRESS');
+        }
+        for (const feature of page) {
+          if (typeof feature?.id !== 'string' || !feature.id.trim()) throw new Error('ECCC_INVALID_ID');
+          if (seenIds.has(feature.id)) throw new Error('ECCC_DUPLICATE_ID');
+          seenIds.add(feature.id);
+        }
+        statusFeatures.push(...page);
+      } while (statusFeatures.length < matched);
+      features.push(...statusFeatures);
+    } catch (err) {
+      failures.push(err);
+      failedStatuses.push(status);
     }
-  });
-  if (failures.length === results.length) {
+  }
+  if (failures.length === ECCC_LIVE_STATUSES.length) {
     const detail = failures.map((err) => err?.message || String(err)).join('; ');
     throw new Error(`ECCC issued and continued fetches both failed: ${detail}`);
   }
   // Returns an OBJECT, not a bare array, so a partial fetch cannot be consumed
-  // as if it were the whole set. `issued` and `continued` are two separate GETs
+  // as if it were the whole set. `issued` and `continued` are separate collections
   // and each carries alerts the other does not: `continued` is where an ONGOING
   // warning lives after its first issue. Returning just the surviving features
   // when one status 500s publishes a silently truncated national alert set —
@@ -640,6 +823,7 @@ export async function fetchApprovedWeatherJson(url, {
   userAgent = CHROME_UA,
   timeoutMs = 15_000,
   accept = 'application/geo+json',
+  byteBudget,
 } = {}) {
   const parsed = new URL(url);
   const allowed = new Set((allowedHosts || []).map((host) => String(host).toLowerCase()));
@@ -652,5 +836,5 @@ export async function fetchApprovedWeatherJson(url, {
     signal: AbortSignal.timeout(timeoutMs),
   });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  return readResponseLimited(response, maxBytes);
+  return readResponseLimited(response, maxBytes, byteBudget);
 }

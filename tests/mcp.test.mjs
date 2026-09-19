@@ -13,6 +13,7 @@ import {
 } from './helpers/mcp-pro-deps.mjs';
 import { buildOfficialChinaMacroFixture } from './helpers/china-macro-fixture.mjs';
 import { TOOL_REGISTRY } from '../api/mcp/registry/index.ts';
+import { documentedOutputSchema } from './helpers/mcp-output-schema.mjs';
 
 const originalFetch = globalThis.fetch;
 const originalEnv = { ...process.env };
@@ -98,14 +99,17 @@ describe('api/mcp.ts — PRO MCP Server', () => {
 
   // --- Public discovery (initialize + tools/list + resources/list servable without creds) ---
 
-  it('initialize succeeds WITHOUT credentials (public discovery)', async () => {
-    const req = new Request(BASE_URL, {
+  // The transport challenges an unauthenticated handshake
+  // (tests/mcp-transport-challenge.test.mjs); the anonymous handshake lives on
+  // the machine-discovery alias, where agent-readiness scanners POST theirs.
+  it('initialize succeeds WITHOUT credentials on the discovery alias (public discovery)', async () => {
+    const req = new Request('https://worldmonitor.app/.well-known/mcp', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(initBody(1)),
     });
     const res = await handler(req);
-    assert.equal(res.status, 200, 'unauthenticated initialize must be public');
+    assert.equal(res.status, 200, 'unauthenticated initialize must be public on the discovery alias');
     const body = await res.json();
     assert.equal(body.result?.protocolVersion, '2025-03-26');
     assert.equal(body.result?.serverInfo?.name, 'worldmonitor');
@@ -355,6 +359,82 @@ describe('api/mcp.ts — PRO MCP Server', () => {
     assert.equal(body.error?.code, -32600);
   });
 
+  it('rejects an oversized JSON-RPC body before parsing (#7406)', async () => {
+    const { MAX_JSON_RPC_BODY_BYTES } = await import(`../api/mcp.ts?t=${Date.now()}`);
+    const rpc = '{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}';
+    const oversized = `${rpc.slice(0, -1)}${' '.repeat(MAX_JSON_RPC_BODY_BYTES - rpc.length + 1)}}`;
+    assert.ok(
+      new TextEncoder().encode(oversized).byteLength > MAX_JSON_RPC_BODY_BYTES,
+      'fixture must exceed the shared body cap',
+    );
+
+    const res = await handler(new Request(BASE_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-WorldMonitor-Key': VALID_KEY },
+      body: oversized,
+    }));
+
+    assert.equal(res.status, 413, 'oversized bodies must be HTTP 413');
+    assertNoStore(res, 'oversized body rejection');
+    const body = await res.json();
+    assert.equal(body.id, null, 'oversized body must not reflect a parsed id');
+    assert.equal(body.error?.code, -32600);
+    assert.match(body.error?.message ?? '', new RegExp(String(MAX_JSON_RPC_BODY_BYTES)));
+    assert.equal(res.headers.get('Content-Type'), 'application/json');
+    // Structured self-correction payload — an agent must not have to parse the
+    // message string to learn the cap.
+    assert.equal(body.error?.data?.reason, 'body-too-large');
+    assert.equal(body.error?.data?.maxBytes, MAX_JSON_RPC_BODY_BYTES);
+    assert.ok(body.error?.data?.nextStep, 'the 413 must tell an agent what to do next');
+  });
+
+  it('rejects an oversized Content-Length without reading the body (#7406)', async () => {
+    const { MAX_JSON_RPC_BODY_BYTES } = await import(`../api/mcp.ts?t=${Date.now()}`);
+    let pullCount = 0;
+    const body = new ReadableStream({
+      pull(controller) {
+        pullCount += 1;
+        controller.enqueue(new TextEncoder().encode('{"jsonrpc":"2.0","id":1,"method":"ping"}'));
+        controller.close();
+      },
+    });
+
+    const res = await handler(new Request(BASE_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': String(MAX_JSON_RPC_BODY_BYTES + 1),
+        'X-WorldMonitor-Key': VALID_KEY,
+      },
+      // @ts-expect-error — undici duplex is required for streaming request bodies
+      duplex: 'half',
+      body,
+    }));
+
+    assert.equal(res.status, 413);
+    assert.equal(pullCount, 0, 'Content-Length over the cap must not pull the stream');
+    const payload = await res.json();
+    assert.equal(payload.error?.code, -32600);
+  });
+
+  it('accepts a JSON-RPC body at the exact byte cap', async () => {
+    const { MAX_JSON_RPC_BODY_BYTES } = await import(`../api/mcp.ts?t=${Date.now()}`);
+    const rpc = '{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}';
+    const atCap = `${rpc.slice(0, -1)}${' '.repeat(MAX_JSON_RPC_BODY_BYTES - rpc.length)}}`;
+    assert.equal(new TextEncoder().encode(atCap).byteLength, MAX_JSON_RPC_BODY_BYTES);
+
+    const res = await handler(new Request(BASE_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-WorldMonitor-Key': VALID_KEY },
+      body: atCap,
+    }));
+
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.error, undefined);
+    assert.deepEqual(body.result, {});
+  });
+
   it('accepts ordinary scalar JSON-RPC IDs and echoes them unchanged', async () => {
     for (const id of [42, 'correlation-id']) {
       const res = await handler(makeReq('POST', { jsonrpc: '2.0', id, method: 'ping', params: {} }));
@@ -536,6 +616,28 @@ describe('api/mcp.ts — PRO MCP Server', () => {
     assert.ok(toolNames.includes('describe_tool'), 'describe_tool must be registered (v1.5.0 schema compression)');
   });
 
+  it('analysis stale schemas scope content age to declared contracts', () => {
+    const expectedDescription = 'True when any contributing cache key fails its freshness contract: fetched longer ago than its per-key maxStaleMin budget, below a declared minRecordCount, or — for keys that declare a content-age contract — carrying upstream observations older than maxContentAgeMin even though the fetch itself is recent. A recent cached_at with stale:true means the fetch is current but the underlying data has stopped advancing, so refetching will not help.';
+    const analysisToolNames = [
+      'get_signal_convergence',
+      'get_focal_points',
+      'simulate_infrastructure_cascade',
+      'get_military_surge',
+      'get_population_exposure',
+      'get_alert_digest',
+      'get_hotspot_escalation',
+    ];
+
+    for (const name of analysisToolNames) {
+      const tool = TOOL_REGISTRY.find((candidate) => candidate.name === name);
+      assert.equal(
+        tool?.outputSchema.properties?.stale?.description,
+        expectedDescription,
+        `${name} must describe content age as an opt-in contract, not a universal stale cause`,
+      );
+    }
+  });
+
   // --- tools/call ---
 
   it('tools/call with unknown tool returns JSON-RPC -32602', async () => {
@@ -577,7 +679,7 @@ describe('api/mcp.ts — PRO MCP Server', () => {
       [
         { key: 'seed-meta:climate:anomalies', maxStaleMin: 120 },
         { key: 'seed-meta:climate:co2-monitoring', maxStaleMin: 2880 },
-        { key: 'seed-meta:climate:ocean-ice', maxStaleMin: 1440 },
+        { key: 'seed-meta:climate:ocean-ice', maxStaleMin: 2880 },
         { key: 'seed-meta:weather:alerts', maxStaleMin: 45 },
       ],
       [
@@ -599,7 +701,7 @@ describe('api/mcp.ts — PRO MCP Server', () => {
       [
         { key: 'seed-meta:climate:anomalies', maxStaleMin: 120 },
         { key: 'seed-meta:climate:co2-monitoring', maxStaleMin: 2880 },
-        { key: 'seed-meta:climate:ocean-ice', maxStaleMin: 1440 },
+        { key: 'seed-meta:climate:ocean-ice', maxStaleMin: 2880 },
         { key: 'seed-meta:weather:alerts', maxStaleMin: 45 },
       ],
       [
@@ -629,6 +731,115 @@ describe('api/mcp.ts — PRO MCP Server', () => {
 
     assert.equal(freshness.stale, true);
     assert.equal(freshness.cached_at, new Date(now - 12 * 60 * 60_000).toISOString());
+  });
+
+  it('evaluateFreshness marks content-age stale even when fetchedAt is fresh (#7141)', () => {
+    const now = Date.UTC(2026, 7, 27, 12, 0, 0);
+    const freshness = evaluateFreshness(
+      [{ key: 'seed-meta:temporal:anomalies', maxStaleMin: 45, honorContentAge: true }],
+      [{
+        fetchedAt: now - 5 * 60_000,
+        recordCount: 2,
+        newestItemAt: now - 72 * 60 * 60_000,
+        maxContentAgeMin: 48 * 60,
+      }],
+      now,
+    );
+
+    assert.equal(freshness.stale, true, 'a frozen-but-200 feed must not read stale:false');
+    assert.equal(freshness.cached_at, new Date(now - 5 * 60_000).toISOString());
+  });
+
+  it('evaluateFreshness stays fresh when content-age is inside budget', () => {
+    const now = Date.UTC(2026, 7, 27, 12, 0, 0);
+    const freshness = evaluateFreshness(
+      [{ key: 'seed-meta:temporal:anomalies', maxStaleMin: 45, honorContentAge: true }],
+      [{
+        fetchedAt: now - 5 * 60_000,
+        recordCount: 2,
+        newestItemAt: now - 20 * 60_000,
+        maxContentAgeMin: 48 * 60,
+      }],
+      now,
+    );
+
+    assert.equal(freshness.stale, false);
+  });
+
+  // Health classifyKey fail-closes these same arms (#3596 / #3845). Without
+  // these cases MCP can regress to stale:false while health stays STALE_CONTENT.
+  it('evaluateFreshness marks content-age stale when newestItemAt is null (#7141)', () => {
+    const now = Date.UTC(2026, 7, 27, 12, 0, 0);
+    const freshness = evaluateFreshness(
+      [{ key: 'seed-meta:temporal:anomalies', maxStaleMin: 45, honorContentAge: true }],
+      [{
+        fetchedAt: now - 5 * 60_000,
+        recordCount: 2,
+        newestItemAt: null,
+        maxContentAgeMin: 48 * 60,
+      }],
+      now,
+    );
+
+    assert.equal(freshness.stale, true, 'undatable content must not read stale:false');
+    assert.equal(freshness.cached_at, new Date(now - 5 * 60_000).toISOString());
+  });
+
+  it('evaluateFreshness marks content-age stale when newestItemAt is in the future (#7141)', () => {
+    const now = Date.UTC(2026, 7, 27, 12, 0, 0);
+    const freshness = evaluateFreshness(
+      [{ key: 'seed-meta:temporal:anomalies', maxStaleMin: 45, honorContentAge: true }],
+      [{
+        fetchedAt: now - 5 * 60_000,
+        recordCount: 2,
+        newestItemAt: now + 60 * 60_000,
+        maxContentAgeMin: 48 * 60,
+      }],
+      now,
+    );
+
+    assert.equal(freshness.stale, true, 'future-dated content must not read stale:false');
+    assert.equal(freshness.cached_at, new Date(now - 5 * 60_000).toISOString());
+  });
+
+  it('content-age is opt-in per check, not inferred from seed-meta presence', () => {
+    // Many seeders already stamp maxContentAgeMin. Inferring the opt-in from
+    // the stored meta silently enrolled ~14 unrelated keys whose tools never
+    // declared a content-age contract and have no coverage for one. The gate
+    // lives on the check, like minRecordCount and requireContentFreshness.
+    const now = Date.UTC(2026, 7, 27, 12, 0, 0);
+    const meta = [{
+      fetchedAt: now - 5 * 60_000,
+      recordCount: 2,
+      newestItemAt: now - 72 * 60 * 60_000,
+      maxContentAgeMin: 48 * 60,
+    }];
+
+    assert.equal(
+      evaluateFreshness([{ key: 'seed-meta:some:other-key', maxStaleMin: 45 }], meta, now).stale,
+      false,
+      'a key that never declared honorContentAge must not gain a content-age gate',
+    );
+    assert.equal(
+      evaluateFreshness(
+        [{ key: 'seed-meta:some:other-key', maxStaleMin: 45, honorContentAge: true }],
+        meta,
+        now,
+      ).stale,
+      true,
+      'the same meta DOES go stale once the check opts in',
+    );
+  });
+
+  it('honorContentAge is a no-op when the producer stamps no maxContentAgeMin', () => {
+    const now = Date.UTC(2026, 7, 27, 12, 0, 0);
+    const freshness = evaluateFreshness(
+      [{ key: 'seed-meta:temporal:anomalies', maxStaleMin: 45, honorContentAge: true }],
+      [{ fetchedAt: now - 5 * 60_000, recordCount: 2 }],
+      now,
+    );
+
+    assert.equal(freshness.stale, false, 'no content-age contract stamped -> nothing to age');
   });
 
   it('get_chokepoint_status declares the PortWatch 174-country freshness floor', async () => {
@@ -1201,7 +1412,7 @@ describe('api/mcp.ts — PRO MCP Server', () => {
     assert.match(economic.description, /no proxies/i);
     assert.match(economic.description, /launchReady/i);
     assert.doesNotMatch(economic.description, /NBS\/SAFE live/i);
-    const chinaSchema = economic.outputSchema.properties.data.properties['china-macro'];
+    const chinaSchema = documentedOutputSchema(economic).properties.data.properties['china-macro'];
     assert.ok(chinaSchema.properties.indicators);
     assert.ok(!chinaSchema.properties.observations);
     const indicatorSchema = chinaSchema.properties.indicators.items.properties;
@@ -1273,6 +1484,30 @@ describe('api/mcp.ts — PRO MCP Server', () => {
     mockCacheKeys({ 'economic:imf:macro:v2': macro }, meta);
     const full = await callTool('get_country_macro', {});
     assert.equal(Object.keys(full.data.macro.countries).length, 3, 'no args → all countries retained');
+  });
+
+  it('get_country_macro: a country NAME narrows, rather than falling open to all', async () => {
+    // `pickMapKeys` FAILS OPEN — a filter matching nothing returns the whole
+    // map (api/mcp/filters.ts:100). The country-briefing prompt fans one
+    // argument out to three tools, and once the other two accepted names, an
+    // un-normalized name reaching this one spliced EVERY country's macro
+    // indicators into a single-country brief.
+    const macro = { countries: { US: { inflationPct: 3 }, DE: { inflationPct: 2 }, CN: { inflationPct: 1 } }, seededAt: 1 };
+    const meta = {
+      'seed-meta:economic:imf-macro': { fetchedAt: Date.now() - 60_000, recordCount: 3 },
+      'seed-meta:economic:imf-growth': { fetchedAt: Date.now() - 60_000, recordCount: 0 },
+      'seed-meta:economic:imf-labor': { fetchedAt: Date.now() - 60_000, recordCount: 0 },
+      'seed-meta:economic:imf-external': { fetchedAt: Date.now() - 60_000, recordCount: 0 },
+    };
+    for (const designator of ['Germany', 'DEU']) {
+      mockCacheKeys({ 'economic:imf:macro:v2': macro }, meta);
+      const out = await callTool('get_country_macro', { countries: [designator] });
+      assert.deepEqual(
+        Object.keys(out.data.macro.countries),
+        ['DE'],
+        `"${designator}" must narrow to DE, not fall open to every country`,
+      );
+    }
   });
 
   it('get_energy_intelligence: country filter matches the gas-storage string[] payload', async () => {
@@ -1588,7 +1823,8 @@ describe('api/mcp.ts — PRO MCP Server', () => {
     // says "when no countries filter is supplied" — this regression test
     // pins that contract so a future "should limit further-narrow a
     // countries result" rewrite trips the test instead of breaking callers.
-    const payload = { countries: makeCountryMap('C', 60) };
+    const codes = ['US', 'DE', 'CN', 'IQ', 'FR', 'GB'];
+    const payload = { countries: Object.fromEntries(codes.map((code) => [code, { value: 1 }])) };
     const meta = {
       'seed-meta:economic:imf-macro': { fetchedAt: Date.now() - 60_000, recordCount: 60 },
       'seed-meta:economic:imf-growth': { fetchedAt: Date.now() - 60_000, recordCount: 0 },
@@ -1596,7 +1832,7 @@ describe('api/mcp.ts — PRO MCP Server', () => {
       'seed-meta:economic:imf-external': { fetchedAt: Date.now() - 60_000, recordCount: 0 },
     };
     mockCacheKeys({ 'economic:imf:macro:v2': payload }, meta);
-    const out = await callTool('get_country_macro', { countries: ['C0', 'C1', 'C2', 'C3', 'C4'], limit: 1 });
+    const out = await callTool('get_country_macro', { countries: codes.slice(0, 5), limit: 1 });
     assert.equal(Object.keys(out.data.macro.countries).length, 5,
       'countries filter takes precedence; limit is ignored when countries is supplied');
   });
@@ -2338,6 +2574,12 @@ describe('api/mcp.ts — PRO MCP Server', () => {
     const portwatchPortsPayload = { countries: { US: { ports: 23 } } };
     const chokepointBaselinesPayload = { suez: { lat: 30.0, lon: 32.5 } };
     const portwatchChokepointsRefPayload = { count: 13, ids: ['suez', 'hormuz', 'malacca'] };
+    // Deliberately source-LESS, mirroring a blob an older seeder deploy could
+    // still hold. The served expectation below states the narrowed shape
+    // explicitly rather than hiding the synthesis behind an in-taxonomy fixture
+    // value, so this stays a byte-identity check on the served slice: any field
+    // get_chokepoint_status's _postFilter adds or drops in future goes red here,
+    // in a file independent of the taxonomy suite that introduced the behaviour.
     const chokepointFlowsPayload = { suez: { dailyBarrels: 9_200_000 } };
 
     // transit-summaries budget=30min → 5min old (fresh)
@@ -2447,7 +2689,11 @@ describe('api/mcp.ts — PRO MCP Server', () => {
     assert.deepEqual(payload.data['_countries'], portwatchPortsPayload, 'portwatch-ports slice labelled from trailing _countries segment');
     assert.deepEqual(payload.data['chokepoint-baselines'], chokepointBaselinesPayload, 'chokepoint-baselines slice labelled from cache-key suffix');
     assert.deepEqual(payload.data['ref'], portwatchChokepointsRefPayload, 'portwatch:chokepoints:ref slice labelled from trailing ref segment');
-    assert.deepEqual(payload.data['chokepoint-flows'], chokepointFlowsPayload, 'chokepoint-flows slice labelled from cache-key suffix');
+    assert.deepEqual(
+      payload.data['chokepoint-flows'],
+      { suez: { dailyBarrels: 9_200_000, source: 'FLOW_SOURCE_UNSPECIFIED' } },
+      'chokepoint-flows slice labelled from cache-key suffix, with `source` narrowed onto the FlowSource taxonomy (#6113)',
+    );
   });
 
   it('get_chokepoint_status: fast transit-summaries fresh but slow portwatch-ports past budget flips aggregate stale', async () => {
@@ -2763,10 +3009,10 @@ describe('api/mcp.ts — PRO MCP Server', () => {
       if (u.includes('/api/aviation/v1/track-aircraft')) {
         return new Response(JSON.stringify({
           positions: [
-            { callsign: 'UAE123', icao24: 'abc123', lat: 24.5, lon: 54.3, altitude_m: 11000, ground_speed_kts: 480, track_deg: 270, on_ground: false },
+            { callsign: 'UAE123', icao24: 'abc123', lat: 24.5, lon: 54.3, altitudeM: 11000, groundSpeedKts: 480, trackDeg: 270, onGround: false },
           ],
           source: 'wingbits',
-          updated_at: 1711620000000,
+          updatedAt: 1711620000000,
         }), { status: 200, headers: { 'Content-Type': 'application/json' } });
       }
       if (u.includes('/api/military/v1/list-military-flights')) {
@@ -2791,6 +3037,26 @@ describe('api/mcp.ts — PRO MCP Server', () => {
     assert.ok(data.bounding_box?.sw_lat !== undefined, 'bounding_box must be present');
     assert.equal(data.partial, undefined, 'no partial flag when both sources succeed');
     assert.equal(data.source, 'wingbits');
+    assert.deepEqual(data.civilian_flights, [{
+      callsign: 'UAE123', icao24: 'abc123', lat: 24.5, lon: 54.3,
+      altitude_m: 11000, speed_kts: 480, heading_deg: 270, on_ground: false,
+    }]);
+    assert.equal(data.updated_at, new Date(1711620000000).toISOString());
+  });
+
+  it('get_airspace retains multiple camelCase military records and their fields for an ordinary country', async () => {
+    globalThis.fetch = async () => Response.json({ flights: [
+      { callsign: 'FIRST', hexCode: 'abc123', aircraftType: 'MILITARY_AIRCRAFT_TYPE_TRANSPORT', aircraftModel: 'C-17', operatorCountry: 'US', isInteresting: true, source: 'wingbits' },
+      { callsign: 'SECOND', hexCode: 'def456', aircraftType: 'MILITARY_AIRCRAFT_TYPE_TANKER', aircraftModel: 'KC-135', operatorCountry: 'GB', isInteresting: false, source: 'wingbits' },
+    ] });
+    const res = await handler(makeReq('POST', callBody('get_airspace', { country_code: 'AE', type: 'military' })));
+    const body = await res.json();
+    const data = JSON.parse(body.result.content[0].text);
+    assert.equal(data.military_count, 2);
+    assert.deepEqual(data.military_flights.map(f => [f.hex_code, f.aircraft_type, f.aircraft_model, f.operator_country, f.is_interesting]), [
+      ['abc123', 'MILITARY_AIRCRAFT_TYPE_TRANSPORT', 'C-17', 'US', true],
+      ['def456', 'MILITARY_AIRCRAFT_TYPE_TANKER', 'KC-135', 'GB', false],
+    ]);
   });
 
   it('get_airspace excludes OpenSky observations even if a downstream response regresses', async () => {
@@ -2799,7 +3065,7 @@ describe('api/mcp.ts — PRO MCP Server', () => {
       if (u.includes('/api/aviation/v1/track-aircraft')) {
         return new Response(JSON.stringify({
           positions: [
-            { callsign: 'OSKY1', icao24: 'abc123', lat: 24.5, lon: 54.3, altitude_m: 11000, ground_speed_kts: 480, track_deg: 270, on_ground: false },
+            { callsign: 'OSKY1', icao24: 'abc123', lat: 24.5, lon: 54.3, altitudeM: 11000, groundSpeedKts: 480, trackDeg: 270, onGround: false },
           ],
           source: 'opensky',
         }), { status: 200, headers: { 'Content-Type': 'application/json' } });
@@ -2807,8 +3073,8 @@ describe('api/mcp.ts — PRO MCP Server', () => {
       if (u.includes('/api/military/v1/list-military-flights')) {
         return new Response(JSON.stringify({
           flights: [
-            { callsign: 'OSKY2', hex_code: 'def456', source: 'opensky-auth' },
-            { callsign: 'WING1', hex_code: 'fed654', source: 'wingbits' },
+            { callsign: 'OSKY2', hexCode: 'def456', source: 'opensky-auth' },
+            { callsign: 'WING1', hexCode: 'fed654', source: 'wingbits' },
           ],
         }), { status: 200, headers: { 'Content-Type': 'application/json' } });
       }
@@ -2828,6 +3094,76 @@ describe('api/mcp.ts — PRO MCP Server', () => {
     assert.equal(data.partial, true);
   });
 
+  it('get_airspace splits Russia into ordinary flight queries on both sides of the dateline', async () => {
+    const queries = [];
+    const points = [
+      { callsign: 'MOSCOW', icao24: 'a', lat: 55.75, lon: 37.62 },
+      { callsign: 'CHUKOTKA', icao24: 'b', lat: 65, lon: -175 },
+      { callsign: 'BERLIN', icao24: 'c', lat: 52.52, lon: 13.4 },
+    ];
+    globalThis.fetch = async url => {
+      const parsed = new URL(url);
+      if (!/\/api\/(aviation|military)\//.test(parsed.pathname)) return Response.json({});
+      const west = Number(parsed.searchParams.get('sw_lon'));
+      const east = Number(parsed.searchParams.get('ne_lon'));
+      queries.push([parsed.pathname, west, east]);
+      assert.ok(west <= east && east - west < 360);
+      const positions = points.filter(p => p.lon >= west && p.lon <= east);
+      return Response.json(parsed.pathname.includes('/military/')
+        ? { flights: positions.map(p => ({ callsign: p.callsign, hexCode: p.icao24, source: 'wingbits', location: { latitude: p.lat, longitude: p.lon } })) }
+        : { positions, source: 'wingbits', updatedAt: 1711620000000 });
+    };
+    const res = await handler(makeReq('POST', callBody('get_airspace', { country_code: 'RU' })));
+    const body = await res.json();
+    const data = JSON.parse(body.result.content[0].text);
+    assert.deepEqual(data.civilian_flights.map(f => f.callsign), ['MOSCOW', 'CHUKOTKA']);
+    assert.deepEqual(data.military_flights.map(f => f.callsign), ['MOSCOW', 'CHUKOTKA']);
+    assert.equal(queries.length, 4);
+    assert.deepEqual(queries.map(q => q.slice(1)).sort(), [[-180, -169.7], [-180, -169.7], [19.6, 180], [19.6, 180]].sort());
+    assert.equal(data.updated_at, new Date(1711620000000).toISOString());
+  });
+
+  it('get_airspace rejects full-longitude country queries before fetching', async () => {
+    let calls = 0;
+    globalThis.fetch = async url => {
+      if (/\/api\/(aviation|military)\//.test(new URL(url).pathname)) calls++;
+      return Response.json({});
+    };
+    const res = await handler(makeReq('POST', callBody('get_airspace', { country_code: 'AQ' })));
+    const body = await res.json();
+    assert.match(JSON.parse(body.result.content[0].text).error, /full-longitude/);
+    assert.equal(calls, 0);
+  });
+
+  it('get_airspace reports a failed Russia half as unavailable military coverage', async () => {
+    globalThis.fetch = async url => {
+      const parsed = new URL(url);
+      if (!parsed.pathname.includes('/military/')) return Response.json({ positions: [], source: 'wingbits' });
+      if (Number(parsed.searchParams.get('sw_lon')) < 0) return new Response('unavailable', { status: 503 });
+      return Response.json({ flights: [{ callsign: 'MOSCOW', hexCode: 'a', source: 'wingbits' }] });
+    };
+    const res = await handler(makeReq('POST', callBody('get_airspace', { country_code: 'RU' })));
+    const body = await res.json();
+    const data = JSON.parse(body.result.content[0].text);
+    assert.equal(data.partial, true);
+    assert.match(data.warnings.join(' '), /military/);
+    assert.deepEqual(data.military_flights, [], 'one successful half must not appear to be complete coverage');
+  });
+
+  it('get_airspace preserves a billing denial when the other Russia half fails first', async () => {
+    globalThis.fetch = async url => {
+      if (Number(new URL(url).searchParams.get('sw_lon')) > 0) return new Response('unavailable', { status: 500 });
+      await Promise.resolve();
+      return Response.json({ error: 'Renewal verification pending', code: 'renewal_verification_pending' }, {
+        status: 503, headers: { 'Retry-After': '21', 'X-Billing-Verification': 'renewal_verification_pending' },
+      });
+    };
+    const res = await handler(makeReq('POST', callBody('get_airspace', { country_code: 'RU', type: 'civilian' })));
+    assert.equal(res.status, 503);
+    assert.equal(res.headers.get('Retry-After'), '21');
+    assert.equal((await res.json()).error.data.code, 'renewal_verification_pending');
+  });
+
   it('get_airspace returns error for unknown country code', async () => {
     const res = await handler(makeReq('POST', {
       jsonrpc: '2.0', id: 11, method: 'tools/call',
@@ -2836,7 +3172,12 @@ describe('api/mcp.ts — PRO MCP Server', () => {
     assert.equal(res.status, 200);
     const body = await res.json();
     const data = JSON.parse(body.result.content[0].text);
-    assert.ok(data.error?.includes('Unknown country code'), 'must return error for unknown code');
+    // `XX` is shape-valid alpha-2, so it passes through resolution and misses
+    // the bounding-box table. Resolution deliberately does NOT gate on a known-
+    // code list: the two local maps are geojson-derived and omit real codes
+    // (CX, TK, BV, SJ, YT, RE, MQ, GP), so gating rejected valid input.
+    assert.ok(data.error?.includes('No airspace coverage'), `expected a coverage error: ${data.error}`);
+    assert.ok(data.error?.includes('XX'), 'error must name the code');
   });
 
   it('get_airspace returns partial:true + warning when military source fails', async () => {
@@ -3059,6 +3400,20 @@ describe('api/mcp.ts — PRO MCP Server', () => {
     assert.deepEqual(names, ['Across the dateline', 'West of Fiji in-box'], 'dateline-adjacent point must match; far-Pacific point must not');
   });
 
+  it('get_maritime_activity excludes the North Sea from Russia and keeps the dateline', async () => {
+    globalThis.fetch = async () => Response.json({ snapshot: {
+      densityZones: [
+        { name: 'North Sea', location: { latitude: 55, longitude: 5 } },
+        { name: 'Dateline east', location: { latitude: 65, longitude: 179 } },
+        { name: 'Dateline west', location: { latitude: 65, longitude: -175 } },
+      ], disruptions: [],
+    } });
+    const res = await handler(makeReq('POST', callBody('get_maritime_activity', { country_code: 'RU' })));
+    const body = await res.json();
+    const data = JSON.parse(body.result.content[0].text);
+    assert.deepEqual(data.density_zones.map(z => z.name), ['Dateline east', 'Dateline west']);
+  });
+
   it('get_maritime_activity matches every longitude for full-span bboxes (AQ stored as -180..180)', async () => {
     globalThis.fetch = async (url) => {
       if (url.toString().includes('/api/maritime/v1/get-vessel-snapshot')) {
@@ -3119,7 +3474,9 @@ describe('api/mcp.ts — PRO MCP Server', () => {
     }));
     const body = await res.json();
     const data = JSON.parse(body.result.content[0].text);
-    assert.ok(data.error?.includes('Unknown country code'), 'must return error for unknown code');
+    // See the get_airspace counterpart: `ZZ` is shape-valid and uncovered.
+    assert.ok(data.error?.includes('No maritime coverage'), `expected a coverage error: ${data.error}`);
+    assert.ok(data.error?.includes('ZZ'), 'error must name the code');
   });
 
   it('get_maritime_activity returns JSON-RPC -32603 when vessel API fails', async () => {
@@ -3667,8 +4024,8 @@ describe('api/mcp.ts — U7 Pro-path', () => {
   it('F4: post-DECR-failure overshoot → next request clamps counter back via DECR sweep', async () => {
     // Models the failure mode: counter is pinned at 100 (50 + 50 leaked
     // overshoot from prior DECR failures). Without F4 the user 429s for
-    // the rest of the UTC day. With F4 the next rejection-path probe
-    // sees newCount > limit + 1 and DECR-sweeps the overshoot.
+    // the rest of the UTC day. With F4 the next rejection-path EVAL
+    // owner-rolls-back and clamps residue back to the limit.
     const { deps, pipe } = makeProDeps({ pipelineOpts: { initialCount: 100 } });
     process.env.UPSTASH_REDIS_REST_URL = 'https://stub.upstash';
     process.env.UPSTASH_REDIS_REST_TOKEN = 'stub';

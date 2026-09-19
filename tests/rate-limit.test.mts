@@ -28,6 +28,8 @@ import {
 } from '../server/_shared/rate-limit.ts';
 // @ts-expect-error — JS module, no declaration file
 import { rateLimitErrorLevel as apiRateLimitErrorLevel, rateLimitFingerprintStage as apiRateLimitFingerprintStage } from '../api/_rate-limit.js';
+// @ts-expect-error — JS module, no declaration file
+import { limitWithFallback } from '../api/_rate-limit-fallback.js';
 
 const originalFetch = globalThis.fetch;
 const originalEnv = { ...process.env };
@@ -309,6 +311,48 @@ describe('rate-limit fail-open / fail-closed posture (#3531 M9)', () => {
     );
   });
 
+  for (const pathname of [
+    '/api/military/v1/get-aircraft-details',
+    '/api/military/v1/get-aircraft-details-batch',
+  ]) {
+    it(`${pathname} is an explicit fail-closed endpoint policy route (#7108)`, async () => {
+      // Both Wingbits aircraft-enrichment routes proxy a PAID provider on cache
+      // miss, so a Redis outage must 503 rather than inherit the gateway's
+      // availability-first 600/min fallback and hand out unmetered upstream
+      // spend. Registering the policy is not enough on its own: the registry
+      // entry can be present while the runtime lookup or the failClosed default
+      // regresses, and scripts/enforce-rate-limit-policies.mjs is static-only —
+      // it cross-checks the registries and OpenAPI but never calls the limiter.
+      // So assert the behavior, matching summarize-article / deduct-situation /
+      // reverse-geocode above. The batch sibling is included because it predates
+      // this convention and had the same untested gap.
+      delete process.env.UPSTASH_REDIS_REST_URL;
+      delete process.env.UPSTASH_REDIS_REST_TOKEN;
+      const mod = await importFreshRateLimitModule();
+
+      assert.deepEqual(ENDPOINT_RATE_POLICIES[pathname], { limit: 30, window: '60 s' });
+      assert.ok(
+        pathname in FAIL_CLOSED_ENDPOINT_RATE_POLICY_REQUIRED,
+        `${pathname} must stay in the fail-closed requirement registry — a Redis outage must 503, not inherit the fail-open fallback`,
+      );
+
+      const res = await mod.checkEndpointRateLimit(
+        makeRequest({ 'cf-connecting-ip': '203.0.113.7' }),
+        pathname,
+        { 'Access-Control-Allow-Origin': 'https://worldmonitor.app' },
+      );
+
+      assert.ok(res, `expected ${pathname} endpoint policy to fail closed without Redis config`);
+      assert.equal(res.status, 503);
+      assert.equal(res.headers.get('X-RateLimit-Mode'), 'degraded');
+      assert.equal(
+        res.headers.get('Access-Control-Allow-Origin'),
+        'https://worldmonitor.app',
+        'CORS headers should be propagated on the degraded response',
+      );
+    });
+  }
+
   it('gateway reverse-geocode RPC is a Nominatim provider route with a matched 60/min fail-closed policy (#6432)', async () => {
     // #6432 — the second Nominatim caller. The legacy edge route carries a
     // per-IP 60/min budget (#6234); this RPC must carry the same policy or it
@@ -366,6 +410,77 @@ describe('rate-limit fail-open / fail-closed posture (#3531 M9)', () => {
     assert.equal(handlerCalls, 0, 'the gateway must reject before route execution');
   });
 
+  it('anonymous crypto quote requests fail closed before cache or provider I/O', async () => {
+    delete process.env.UPSTASH_REDIS_REST_URL;
+    delete process.env.UPSTASH_REDIS_REST_TOKEN;
+    process.env.WM_SESSION_SECRET = 'synthetic-crypto-session-secret-at-least-32-bytes';
+    __resetRateLimitForTest();
+    const { issueSessionToken } = await import('../api/_session.js');
+    const { createDomainGateway } = await import('../server/gateway.ts');
+    const { createMarketServiceRoutes } = await import('../src/generated/server/worldmonitor/market/v1/service_server.ts');
+    const { marketHandler } = await import('../server/worldmonitor/market/v1/handler.ts');
+    const token = (await issueSessionToken()).token;
+    const calls: string[] = [];
+    globalThis.fetch = (async (input) => {
+      calls.push(String(input));
+      return new Response('unexpected I/O', { status: 500 });
+    }) as typeof fetch;
+    const gateway = createDomainGateway(createMarketServiceRoutes(marketHandler));
+    const response = await gateway(new Request(
+      'https://worldmonitor.app/api/market/v1/list-crypto-quotes?ids=dogecoin',
+      { headers: { Origin: 'https://worldmonitor.app', 'X-WorldMonitor-Key': token, 'x-real-ip': '203.0.113.7' } },
+    ));
+    assert.equal(response.status, 503);
+    assert.equal(response.headers.get('X-RateLimit-Mode'), 'degraded');
+    assert.deepEqual(calls, [], 'no cache or provider transport reached');
+  });
+
+  it('crypto quote requests stop at the 60/min budget before additional provider work', async () => {
+    const { installRedis } = await import('./helpers/fake-upstash-redis.mts');
+    const redis = installRedis({ 'market:crypto:v1': { quotes: [] } });
+    process.env.WM_SESSION_SECRET = 'synthetic-crypto-cap-secret-at-least-32-bytes';
+    __resetRateLimitForTest();
+    const { issueSessionToken } = await import('../api/_session.js');
+    const { createDomainGateway } = await import('../server/gateway.ts');
+    const { createMarketServiceRoutes } = await import('../src/generated/server/worldmonitor/market/v1/service_server.ts');
+    const { marketHandler } = await import('../server/worldmonitor/market/v1/handler.ts');
+    let providerCalls = 0;
+    let admissions = 0;
+    globalThis.fetch = (async (input, init) => {
+      if (new URL(String(input)).hostname === 'api.coingecko.com') {
+        providerCalls += 1;
+        return Response.json([{ id: 'budget-coin', name: 'Budget coin', symbol: 'bud', current_price: 1 }]);
+      }
+      const response = await redis.fetchImpl(input, init);
+      if (init?.body) {
+        const commands = JSON.parse(String(init.body));
+        if (Array.isArray(commands[0])) {
+          const results = await response.json();
+          for (let i = 0; i < commands.length; i += 1) {
+            if (String(commands[i][0]).toUpperCase() === 'EVALSHA') {
+              // The shared fake is always-allow. Model the storage reply for
+              // this route so the real SDK/gateway also exercise exhaustion.
+              results[i] = { result: [60 - ++admissions, 60] };
+            }
+          }
+          return Response.json(results);
+        }
+      }
+      return response;
+    }) as typeof fetch;
+    const token = (await issueSessionToken()).token;
+    const gateway = createDomainGateway(createMarketServiceRoutes(marketHandler));
+    const request = () => new Request('https://worldmonitor.app/api/market/v1/list-crypto-quotes?ids=budget-coin', {
+      headers: { Origin: 'https://worldmonitor.app', 'X-WorldMonitor-Key': token, 'x-real-ip': '203.0.113.8' },
+    });
+    for (let i = 0; i < 60; i += 1) assert.equal((await gateway(request())).status, 200);
+    assert.equal(providerCalls, 1, 'successful calls reuse the gap cache');
+    const blocked = await gateway(request());
+    assert.equal(blocked.status, 429);
+    assert.ok(Number(blocked.headers.get('Retry-After')) > 0);
+    assert.equal(providerCalls, 1, 'exhausted callers cannot cause provider work');
+  });
+
   it('paid-provider market routes each have explicit fail-closed policies (#6236)', async () => {
     delete process.env.UPSTASH_REDIS_REST_URL;
     delete process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -374,6 +489,7 @@ describe('rate-limit fail-open / fail-closed posture (#3531 M9)', () => {
       ['/api/market/v1/analyze-stock', { limit: 60, window: '60 s' }],
       ['/api/market/v1/backtest-stock', { limit: 60, window: '60 s' }],
       ['/api/market/v1/get-insider-transactions', { limit: 60, window: '60 s' }],
+      ['/api/market/v1/list-crypto-quotes', { limit: 60, window: '60 s' }],
       ['/api/market/v1/get-country-stock-index', { limit: 30, window: '60 s' }],
       ['/api/economic/v1/list-world-bank-indicators', { limit: 30, window: '60 s' }],
     ] as const);
@@ -575,9 +691,24 @@ describe('rate-limit fail-closed call-site policy (#3531)', () => {
 describe('scoped rate-limit degraded call-site policy (#3531)', () => {
   const SCOPED_RATE_LIMIT_CALLERS = [
     {
+      path: 'server/worldmonitor/aviation/v1/track-aircraft.ts',
+      expected: /if\s*\(limit\.degraded\)\s*\{[\s\S]*?throw Object\.assign\(new ApiError\(503,/,
+      reason: 'aircraft identifier lookups must fail closed before cache or provider work when the shared limiter is unavailable',
+    },
+    {
+      path: 'api/reverse-geocode.js',
+      expected: /failClosed:\s*true/,
+      reason: 'the provider-wide Nominatim bucket is shared across both routes and must fail closed before upstream work',
+    },
+    {
       path: 'server/worldmonitor/leads/v1/register-interest.ts',
       expected: /if\s*\(\s*scoped\.degraded\s*\)\s*\{/,
       reason: 'desktop lead capture bypasses Turnstile, so Redis degradation must fail closed locally',
+    },
+    {
+      path: 'server/worldmonitor/infrastructure/v1/reverse-geocode.ts',
+      expected: /if\s*\(\s*providerLimit\.degraded\s*\)\s*\{/,
+      reason: 'the gateway half of the provider-wide Nominatim bucket must fail closed before upstream work',
     },
     {
       path: 'api/a2a.ts',
@@ -620,7 +751,7 @@ describe('scoped rate-limit degraded call-site policy (#3531)', () => {
     const fs = await import('node:fs');
     const cp = await import('node:child_process');
     const repo = new URL('..', import.meta.url);
-    const output = cp.execFileSync('git', ['grep', '-lF', 'checkScopedRateLimit(', '--', 'server', 'api'], {
+    const output = cp.execFileSync('git', ['grep', '-lE', 'checkScopedRateLimit\\(|PROVIDER_RATE_LIMIT_IDENTIFIER', '--', 'server', 'api'], {
       cwd: repo,
       encoding: 'utf8',
     });
@@ -634,7 +765,7 @@ describe('scoped rate-limit degraded call-site policy (#3531)', () => {
     assert.deepEqual(
       callers,
       SCOPED_RATE_LIMIT_CALLERS.map(({ path }) => path).sort(),
-      'new checkScopedRateLimit callers must be added here with a degraded-path decision',
+      'new scoped or provider-wide rate-limit callers must be added here with a degraded-path decision',
     );
 
     for (const { path, expected, reason } of SCOPED_RATE_LIMIT_CALLERS) {
@@ -987,6 +1118,45 @@ describe('EVALSHA-unsupported fallback (#7c — self-hosted redis-rest proxy blo
       });
   }
 
+  it('keeps a provider-global fallback bucket raw across preview deployments', async () => {
+    process.env.VERCEL_ENV = 'preview';
+    process.env.VERCEL_GIT_COMMIT_SHA = 'deadbeefcafebabe';
+    const incrementedKeys: string[] = [];
+    const pipelineHandler = makeProxyPipelineHandler();
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      const commands = JSON.parse(String(init?.body)) as unknown[][];
+      incrementedKeys.push(String(commands[0]?.[1]));
+      return new Response(JSON.stringify(pipelineHandler(commands)), { status: 200 });
+    }) as typeof fetch;
+
+    const unsupportedLuaLimiter = {
+      limit: async () => {
+        throw new Error('Command not allowed: EVALSHA');
+      },
+    };
+    const fallbackKey = 'rl:scope:fw:reverse-geocode:global';
+
+    const first = await limitWithFallback(
+      unsupportedLuaLimiter,
+      'reverse-geocode:global',
+      fallbackKey,
+      1,
+      60,
+    );
+    process.env.VERCEL_GIT_COMMIT_SHA = 'cafebabe01234567';
+    const second = await limitWithFallback(
+      unsupportedLuaLimiter,
+      'reverse-geocode:global',
+      fallbackKey,
+      1,
+      60,
+    );
+
+    assert.deepEqual(incrementedKeys, [fallbackKey, fallbackKey]);
+    assert.equal(first.success, true);
+    assert.equal(second.success, false, 'the second preview must consume the shared provider budget');
+  });
+
   it('canonical checkRateLimit enforces the non-Lua fallback window directly', async () => {
     const pipelineHandler = makeProxyPipelineHandler();
     let luaAttempts = 0;
@@ -1122,6 +1292,60 @@ describe('EVALSHA-unsupported fallback (#7c — self-hosted redis-rest proxy blo
     assert.ok(
       !incrementedKeys.has('rl:fw:ip:203.0.113.13'),
       'anonymous global traffic must not reset into a new namespaced key',
+    );
+  });
+
+  // WORLDMONITOR-12A: a customer's own API key and their browser session resolve
+  // to the SAME Clerk user id, so both landed in one `user:<id>` bucket. Observed
+  // in production 2026-09-11T17:47Z: an OSINT scraper on an api_starter key spent
+  // 598 of the 600/min budget, leaving the same person's dashboard 2 successes and
+  // 22 × 429 — their country deep-dive rendered half-empty. Programmatic traffic
+  // must not be able to starve the interactive session behind the same account.
+  it('gives a principal separate API-key and interactive-session buckets (WORLDMONITOR-12A)', async () => {
+    const pipelineHandler = makeProxyPipelineHandler();
+    const incrementedKeys = new Set<string>();
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      const commands = JSON.parse(String(init?.body)) as unknown[][];
+      for (const command of commands) {
+        if (String(command[0]).toUpperCase() === 'INCR') {
+          incrementedKeys.add(String(command[1]));
+        }
+      }
+      return new Response(JSON.stringify(pipelineHandler(commands)), { status: 200 });
+    }) as typeof fetch;
+
+    const mod = await importFreshRateLimitModule();
+    const req = makeRequest({ 'x-real-ip': '203.0.113.21' });
+    const principalUserId = 'api-customer';
+
+    // Drain the whole per-minute budget through the API key, exactly as the
+    // scraper did.
+    for (let i = 0; i < 600; i++) {
+      assert.equal(
+        await mod.checkRateLimit(req, {}, { principalUserId, principalScope: 'api_key' }),
+        null,
+      );
+    }
+    assert.equal(
+      (await mod.checkRateLimit(req, {}, { principalUserId, principalScope: 'api_key' }))?.status,
+      429,
+      'API-key traffic must still be capped — separation must not become an exemption',
+    );
+
+    // The same human's dashboard must survive their own scraper.
+    assert.equal(
+      await mod.checkRateLimit(req, {}, { principalUserId }),
+      null,
+      'the interactive session must not inherit the API key\'s exhausted bucket',
+    );
+
+    assert.ok(
+      incrementedKeys.has(`rl:fw:apikey-user:${principalUserId}`),
+      'API-key traffic must use its own namespace',
+    );
+    assert.ok(
+      incrementedKeys.has(`rl:fw:user:${principalUserId}`),
+      'session traffic must keep the established user: namespace so live buckets are not reset',
     );
   });
 

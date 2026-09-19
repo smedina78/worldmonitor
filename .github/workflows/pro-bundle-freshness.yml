@@ -18,7 +18,9 @@ name: Pro bundle freshness
 on:
   pull_request:
     paths:
+      - 'api/mcp/registry/**'
       - 'convex/config/productCatalog.ts'
+      - 'public/.well-known/agent-card.json'
       - 'scripts/generate-product-config.mjs'
       - 'scripts/generate-public-product-facts.mjs'
       - 'shared/content-attribution.ts'
@@ -31,7 +33,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
         with:
@@ -71,6 +73,8 @@ jobs:
           # gitignored, and `git diff --exit-code` on an untracked path exits 0,
           # so listing it reads as coverage while never being able to fail.
           # tests/public-product-facts.test.mjs is what actually guards it.
+          # public/.well-known/agent-card.json is tracked and rewritten by the
+          # same generator, so a stale committed catalog size must fail here.
           if ! git diff --exit-code \
             api/_product-catalog.generated.js \
             pro-test/index.html \
@@ -78,6 +82,7 @@ jobs:
             pro-test/src/generated/tiers.json \
             pro-test/src/locales/ \
             pro-test/welcome.html \
+            public/.well-known/agent-card.json \
             scripts/shared/product-catalog.generated.json \
             scripts/shared/product-facts.generated.json \
             shared/product-catalog.generated.json \

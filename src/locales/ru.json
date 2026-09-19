@@ -119,7 +119,8 @@
       "activeSirens": "Активные сирены",
       "sirens24h": "Сирены / 24ч",
       "aviationDisruptions": "Авиационные сбои",
-      "gpsJammingZones": "Зоны глушения GPS"
+      "gpsJammingZones": "Зоны глушения GPS",
+      "temporalUnavailable": "Временные наблюдения недоступны"
     },
     "fallback": {
       "instabilityIndex": "**Индекс нестабильности: {{score}}/100** ({{level}}, {{trend}})",
@@ -196,7 +197,7 @@
       "decisionSignalsUnavailable": "Снимок сигналов принятия решений Китая в настоящее время недоступен."
     },
     "foodStocks": "Food stocks",
-    "foodStocksHelp": "USDA PSD commodity stocks-to-use by marketing year, with the world ratio alongside for context. FAOSTAT fills production only where PSD has no country coverage.",
+    "foodStocksHelp": "USDA PSD commodity stocks-to-use by marketing year, with the world ratio alongside for context. FAOSTAT Food Balances supplies production and domestic supply when PSD has no complete country balance.",
     "loadingFoodStocks": "Loading food stocks…",
     "foodStocksUnavailable": "Food stocks unavailable.",
     "foodStocksProLocked": "Upgrade to PRO for commodity stocks-to-use",
@@ -236,6 +237,71 @@
       "manufacturingShare": "Manufacturing employment",
       "source": "Sources: {{sources}}.",
       "retained": "{{stage}} data retained from the last successful refresh."
+    },
+    "fiveFactorScorecard": {
+      "title": "Пятифакторная карта устойчивости",
+      "help": "Зафиксированные оценки v1 по продовольствию, энергетике, демографии, технологиям и обороне. Разверните строку, чтобы просмотреть входные данные, источники и причины отсутствия данных.",
+      "loading": "Загрузка пятифакторной карты…",
+      "unavailable": "Пятифакторная карта недоступна.",
+      "proLocked": "Перейдите на PRO для доступа к пятифакторной карте устойчивости",
+      "insufficient": "Недостаточно данных",
+      "notAvailable": "Недоступно",
+      "noEvidence": "Нет данных по этому фактору.",
+      "score": "{{score}}/5",
+      "coverage": "Покрытие: {{coverage}}%",
+      "methodologyVersion": "Методология v{{version}}",
+      "methodologyLink": "Методология",
+      "pillars": {
+        "food": "Продовольствие",
+        "energy": "Энергетика",
+        "demographics": "Демография",
+        "technology": "Технологии",
+        "defense": "Оборона"
+      },
+      "reasons": {
+        "source-unavailable": "Источник недоступен",
+        "country-unavailable": "Страна недоступна",
+        "invalid-value": "Некорректное значение источника",
+        "stale": "Устаревшие данные",
+        "coverage-below-floor": "Покрытие ниже минимального порога оценки",
+        "required-group-missing": "Отсутствует обязательная группа данных",
+        "missing-population": "Данные о населении недоступны",
+        "redistribution-blocked": "Перераспределение источника запрещено",
+        "pillar-unavailable": "Столп недоступен"
+      },
+      "inputs": {
+        "population": "Population",
+        "food_productionBalance": "Баланс производства",
+        "food_stocksToUse": "Запасы для использования",
+        "food_waterSecurity": "Водная безопасность",
+        "food_importDiversity": "Диверсификация импорта",
+        "energy_productionBalance": "Баланс производства",
+        "energy_lowCarbonShare": "Доля низкоуглеродной энергии",
+        "energy_gridEfficiency": "Эффективность энергосетей",
+        "demographics_totalDependency": "Общий коэффициент иждивенчества",
+        "demographics_oldAgeDependency": "Коэффициент иждивенчества пожилых",
+        "demographics_workingAgeProjection": "Прогноз трудоспособного населения",
+        "demographics_tertiaryEnrollment": "Охват высшим образованием",
+        "demographics_researchersPerMillion": "Исследователи на миллион населения",
+        "demographics_stemGraduateShare": "Доля выпускников STEM",
+        "demographics_trainedIndustrialShare": "Доля квалифицированных промышленных кадров",
+        "demographics_manufacturingEmploymentShare": "Доля занятости в обрабатывающей промышленности",
+        "technology_internetUse": "Использование интернета",
+        "technology_mobileSubscriptions": "Подписки на мобильную связь",
+        "technology_fixedBroadband": "Стационарный широкополосный доступ",
+        "technology_rdSpend": "Расходы на исследования и разработки",
+        "technology_researchersPerMillion": "Исследователи на миллион населения",
+        "technology_stemGraduateShare": "Доля выпускников STEM",
+        "technology_electricityAccess": "Доступ к электроэнергии",
+        "defense_expenditureUsd": "Военные расходы",
+        "defense_expenditurePctGdp": "Военная нагрузка",
+        "defense_personnel": "Личный состав вооруженных сил",
+        "defense_industrialBalance": "Баланс оборонной промышленности",
+        "defense_supplierDiversity": "Разнообразие поставщиков вооружений"
+      }
+    },
+    "defenseIndustrialBase": {
+      "proLocked": "Обновитесь на PRO для анализа зависимости от поставщиков вооружений и военного потенциала"
     }
   },
   "header": {
@@ -534,6 +600,10 @@
       "recent": "Недавние запросы",
       "empty": "Поиск данных или выполнение команд",
       "noResults": "Ничего не найдено",
+      "resultAnnouncement_one": "{{count}} результат по запросу {{query}}",
+      "resultAnnouncement_few": "{{count}} результата по запросу {{query}}",
+      "resultAnnouncement_many": "{{count}} результатов по запросу {{query}}",
+      "resultAnnouncement_other": "{{count}} результатов по запросу {{query}}",
       "commands": "Команды",
       "results": "Результаты",
       "seeAllCommands": "Показать все команды",
@@ -792,7 +862,6 @@
   "components": {
     "webcams": {
       "paused": "Веб-камеры приостановлены",
-      "pausedIdle": "Веб-камеры приостановлены — переместите мышь для возобновления",
       "regions": {
         "all": "ВСЕ",
         "mideast": "БЛИЖНИЙ ВОСТОК",
@@ -919,7 +988,8 @@
       "refineryStage": "Refine",
       "stageUnavailable": "No published figures for this stage",
       "withheldNote": "W withheld",
-      "productionCaption": "Country shares of actual production. The map deposits layer shows where resources sit; this table shows who mines or refines them."
+      "productionCaption": "Country shares of actual production. The map deposits layer shows where resources sit; this table shows who mines or refines them.",
+      "productionProLocked": "Обновитесь на PRO для просмотра доли стран в добыче и переработке с показателем концентрации (HHI) по этапам"
     },
     "tradePolicy": {
       "tariffs": "Тарифы",
@@ -1113,9 +1183,6 @@
       "datacenter": "Дата-центр",
       "base": "База",
       "nuclear": "Ядерный"
-    },
-    "community": {
-      "joinDiscussion": "Help Shape What's Next"
     },
     "threatLabels": {
       "critical": "КРИТ",
@@ -1428,7 +1495,10 @@
       "provenanceTitle": "Происхождение охвата: количество полученных историй и отдельных источников, из которых была выбрана эта сводка",
       "compiledFrom": "Собрано из {{stories}} историй из {{sources}} источников",
       "briefFreshness": "Сгенерировано {{minutes}}м назад · последний источник {{hours}}ч старый",
-      "briefStoryDetails": "Story details ({{count}})"
+      "briefStoryDetails": "Подробности новости ({{count}})",
+      "streamIdleStopLabel": "Остановить прямую трансляцию при неактивности",
+      "streamIdleStopDesc": "Останавливает Live News и Live Webcams после указанного времени без активности и показывает уведомление на панели.",
+      "streamIdleStopNever": "Никогда"
     },
     "settings": {
       "exportSettings": "Экспорт настроек",
@@ -1757,6 +1827,16 @@
       "loading": "Подключение к ретранслятору Telegram...",
       "empty": "Сообщения отсутствуют",
       "disabled": "Ретранслятор Telegram неактивен",
+      "watchlistPlaceholder": "Добавить публичный канал по @username",
+      "resolving": "Поиск канала...",
+      "invalidUsername": "Используйте публичное имя @username в Telegram",
+      "resolveFailed": "Не удалось найти канал",
+      "watchlistLimit": "Можно отслеживать до {{count}} пользовательских каналов",
+      "previewMembers": "{{count}} участников",
+      "addChannel": "Добавить канал",
+      "added": "Добавлен",
+      "remove": "Удалить",
+      "custom": "Пользовательский",
       "filterAll": "Все",
       "filterBreaking": "Срочное",
       "filterConflict": "Конфликты",
@@ -1968,6 +2048,22 @@
       "metals": {
         "gold": "Gold",
         "silver": "Silver"
+      },
+      "divergence": {
+        "compositeValue": "Индекс физического стресса: {{value}} / 100",
+        "fiveDayTrend": "Тренд премии за пять торговых дней",
+        "regimes": {
+          "normal": "Нормальный",
+          "elevated": "Повышенный",
+          "stressed": "Напряженный",
+          "extreme": "Экстремальный"
+        },
+        "states": {
+          "insufficientHistory": "Прогрев: {{count}} / {{required}} торговых точек",
+          "staleInput": "Физический бенчмарк устарел",
+          "missingInput": "Сигнал дивергенции недоступен"
+        },
+        "twentyDayTrend": "Тренд премии за двадцать торговых дней"
       }
     },
     "crypto": {
@@ -2134,6 +2230,26 @@
         "failedToLoad": "Ошибка загрузки"
       },
       "cissStale": "ЕЦБ не опубликовал новое значение — это показание может быть устаревшим."
+    },
+    "supplyVulnerability": {
+      "title": "Уязвимость по сырьевым товарам",
+      "help": "Экспозиция страны по товару с учетом концентрации поставщиков, морского транзита и доступных стратегических запасов.",
+      "loading": "Загрузка данных об уязвимости…",
+      "unavailable": "Данные об уязвимости по сырьевым товарам недоступны",
+      "noCoverage": "Недостаточно данных для этой страны",
+      "unknown": "Неизвестно",
+      "concentration": "Концентрация",
+      "transit": "Транзит",
+      "buffer": "Резерв",
+      "sources": "Источники",
+      "methodology": "Методология",
+      "hormuzTitle": "Сырьевые зависимости",
+      "dependentCountries": "Зависимые страны",
+      "dependentCommodities": "Зависимые товары",
+      "stateOk": "Актуально",
+      "stateStale": "Устаревшие входные данные",
+      "stateInsufficient": "Недостаточно данных",
+      "proLocked": "Обновитесь на PRO для оценки уязвимости сырьевых ресурсов"
     },
     "hormuzTracker": {
       "infoTooltip": "<strong>Трекер торговли в Ормузе</strong> Отслеживание судов AIS в реальном времени через Ормузский пролив — самую критическую точку нефтяного узкого места в мире. Отслеживает количество танкеров, события нарушений и еженедельные изменения потоков. Примерно 20% мировых поставок нефти проходит здесь ежедневно.",
@@ -2539,7 +2655,14 @@
       "analyzing": "Анализ...",
       "viewOnMap": "Просмотреть на карте",
       "signals_few": "{{count}} сигнала",
-      "signals_many": "{{count}} сигналов"
+      "signals_many": "{{count}} сигналов",
+      "waiting": "Ожидание следующего обновления данных. Эта панель обновляется автоматически.",
+      "offline": "Ожидание подключения. Эта панель обновится автоматически после восстановления соединения.",
+      "updated": "Обновлено {{time}}",
+      "saved": "Последнее известное обновление {{time}} · Проверка обновлений",
+      "savedOffline": "Последнее известное обновление {{time}} · Нет подключения",
+      "localSignals": "На основе загруженных сигналов панели мониторинга",
+      "emptySaved": "В последнем известном обновлении конвергенция не обнаружена."
     },
     "thermalEscalation": {
       "title": "Тепловая эскалация",
@@ -2699,6 +2822,47 @@
       "rubBase": "Банк России — рублей за 1 единицу",
       "rubPerUnit": "Рублей за единицу",
       "sourceCbr": "Источник: Банк России"
+    },
+    "passkeyOffer": {
+      "title": "Сохранить пароль?",
+      "body": "При следующем входе используйте отпечаток пальца, лицо или PIN-код устройства — без необходимости помнить пароль.",
+      "accept": "Сохранить пароль",
+      "dismiss": "Позже",
+      "close": "Закрыть",
+      "announce": "Сохраните пароль, чтобы войти быстрее в следующий раз.",
+      "busy": "Ожидание ответа устройства…",
+      "succeeded": "Пароль сохранён. Вы можете использовать его при следующем входе.",
+      "retryable": "Операция не завершена. Можете попробовать снова.",
+      "failed": "Не удалось сохранить пароль на этом устройстве."
+    },
+    "decisionBrief": {
+      "commodityTitle": "Справка для решений по сырью",
+      "commodity": "Сырьё / продукт",
+      "blockedChokepoint": "Предполагаемый заблокированный проход",
+      "commodityCapture": "Зафиксировать сравнение сырья",
+      "title": "Сводка для принятия решения",
+      "fuel": "Топливо",
+      "chokepoint": "Узкое место",
+      "baseline": "Базовое нарушение поставок",
+      "comparison": "Сравниваемое нарушение поставок",
+      "capture": "Загрузить / обновить оба",
+      "downloadHtml": "Скачать сводку в HTML",
+      "downloadJson": "Скачать сводку в JSON",
+      "back": "← Назад к сводке по стране",
+      "select": "Выберите нарушение энергоснабжения, затем загрузите оба сценария.",
+      "changed": "Выбор изменён. Загрузите оба сценария перед экспортом.",
+      "loading": "Загрузка обоих сценариев…",
+      "captured": "Загружено. Перед скачиванием проверьте даты наблюдений и ограничения.",
+      "failed": "Не удалось загрузить сценарии. Проверьте доступ и повторите попытку. Нет результата для экспорта.",
+      "locked": "Сводка для принятия решения доступна в Pro."
+    },
+    "liveMedia": {
+      "idleStatus": "Приостановлено из-за неактивности",
+      "idleBody": "Прямая трансляция остановлена после {{duration}} без активности мыши, клавиатуры или сенсорного ввода.",
+      "idleResume": "Возобновить",
+      "idleKeepPlaying": "Продолжить воспроизведение при неактивности",
+      "idleSettingsHint": "Измените это в любой момент в Параметры › Медиа.",
+      "idleKeepPlayingToast": "Прямая трансляция будет продолжаться при неактивности. Измените в Параметры › Медиа."
     }
   },
   "popups": {
@@ -2742,9 +2906,9 @@
     },
     "gpsJamming": {
       "title": "Помехи GPS/GNSS",
-      "navPerformance": "Nav Performance",
-      "samples": "ADS-B Samples",
-      "aircraft": "Aircraft",
+      "navPerformance": "Воздушные суда, затронутые помехами",
+      "samples": "Количество воздушных судов, затронутых помехами",
+      "aircraft": "Общее количество наблюдаемых воздушных судов",
       "h3Hex": "H3 Hex"
     },
     "flight": {
@@ -3480,7 +3644,8 @@
   "auth": {
     "signIn": "Вход",
     "createAccount": "Создать аккаунт",
-    "settings": "Параметры"
+    "settings": "Параметры",
+    "passkeyOffer": {}
   },
   "mcp": {
     "connectPanel": "Подключить MCP",

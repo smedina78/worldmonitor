@@ -1,5 +1,6 @@
 import { TOOL_DESCRIPTION_MAX_BYTES } from '../constants';
 import { JMESPATH_SCHEMA } from '../jmespath';
+import { advertisedOutputSchema } from '../structured-content';
 import type { McpAccessClass, PublicToolShape, ToolDef } from '../types';
 import { compressDescription, utf8ByteLength } from '../utils';
 import { CACHE_TOOLS } from './cache-tools';
@@ -21,6 +22,30 @@ export const FREE_TIER_TOOL_NAMES: ReadonlySet<string> = new Set(
 /** Metadata reads stay authenticated but never spend an allowance or quota slot. */
 export function isQuotaExemptMetadataTool(tool: ToolDef): boolean {
   return tool.name === 'describe_tool';
+}
+
+/**
+ * What one `tools/call` COSTS, in REST-request units.
+ *
+ * Whether that cost is charged is `reserveQuota`'s call: only an `api`
+ * allowance pays the weight, because only there is an MCP call meant to be
+ * comparable to a REST request. A dedicated MCP allowance charges one unit per
+ * call regardless of what this returns.
+ *
+ * A cache tool answers from the Upstash bootstrap cache and costs what a REST
+ * request costs, so it charges 1. A tool with `_execute` fetches downstream
+ * through the gateway, which `server/gateway.ts` deliberately exempts from the
+ * per-account meter for internal-MCP callers — so the edge has to charge that
+ * work here or it goes unbilled entirely.
+ *
+ * Most execution tools make one downstream call. Per-tool overrides cover
+ * the maximum fan-out of country briefs (two) and airspace (four when split
+ * at the dateline). The weight is fixed before execution, including when a
+ * request selects fewer sources or needs only one longitude interval.
+ */
+export function toolWeight(tool: ToolDef): number {
+  if (tool._weight !== undefined) return tool._weight;
+  return tool._execute === undefined ? 1 : 2;
 }
 
 /** Single access classifier used by tools/list, describe_tool, and resources. */
@@ -96,6 +121,11 @@ export function buildPublicTool(
   if (isCacheTool) {
     clonedProperties.summary = structuredClone(SUMMARY_SCHEMA);
   }
+  // Universal, with no roster: a licence-bearing tool declares `_attribution`
+  // instead, and the dispatcher re-attaches its sources to every projection
+  // (shared/attribution-rider.ts). Nothing here is allowed to gate it, because
+  // a tool advertising no `jmespath` is exactly the state that made the old
+  // roster's gaps invisible.
   clonedProperties.jmespath = structuredClone(JMESPATH_SCHEMA);
 
   const description = opts.compressDescriptions
@@ -109,16 +139,21 @@ export function buildPublicTool(
       type: tool.inputSchema.type,
       properties: clonedProperties,
       required: [...tool.inputSchema.required],
+      ...(tool.inputSchema.oneOf ? { oneOf: structuredClone(tool.inputSchema.oneOf) } : {}),
     },
     // Deep-clone for the same reason as inputSchema.properties — mutating the
     // returned object must not corrupt the module-level outputSchema literal.
-    outputSchema: structuredClone(tool.outputSchema),
+    // Advertised as `anyOf [documented shape, projection / soft-envelope
+    // shapes]` so the `structuredContent` every call returns validates in a
+    // strict client whatever the response kind (api/mcp/structured-content.ts).
+    outputSchema: advertisedOutputSchema(structuredClone(tool.outputSchema)),
     // Per-tool annotations declared on each registry entry (v1.7.0).
     // Deep-cloned so a mutating client can't poison the registry literal —
     // matches the inputSchema.properties + outputSchema treatment above.
     annotations: structuredClone(tool.annotations),
     _meta: {
       'worldmonitor/access': toolAccess(tool),
+      'worldmonitor/weight': toolWeight(tool),
     },
   };
 

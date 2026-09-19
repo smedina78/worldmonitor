@@ -7,13 +7,16 @@
  *      (historical path; Dodo-owned URL shape)
  *   2. Dodo full-page redirect with failure: `?status=failed|declined|
  *      cancelled` (same URL shape, different status)
- *   3. `/pro` overlay-success bridge: `?wm_checkout=success` — set by
- *      the /pro marketing page when its embedded Dodo overlay
- *      resolves; used when the buyer is redirected from /pro to the
- *      main dashboard and the overlay's manualRedirect means Dodo
- *      itself doesn't write any URL params. The marker is a WorldMonitor-
- *      namespaced param (not `?success=`) to avoid collision with
- *      unrelated query strings and to make the origin intent-explicit.
+ *   3. Overlay-success bridge: `?wm_checkout=success` — historically set
+ *      by /pro when its embedded Dodo overlay resolved, because the
+ *      overlay's manualRedirect meant Dodo itself wrote no URL params.
+ *      The marker is a WorldMonitor-namespaced param (not `?success=`) to
+ *      avoid collision with unrelated query strings and to make the origin
+ *      intent-explicit. NO PRODUCER REMAINS: #7222 deleted /pro's
+ *      `initOverlay` and `DASHBOARD_CHECKOUT_SUCCESS_URL`, and the
+ *      dashboard overlay has also been removed. The legacy acceptor grants
+ *      no entitlement (Convex stays authoritative); its effect is UX/analytics
+ *      only. Hosted checkout does not produce this marker.
  *   4. Dashboard full-page return bridge: `?wm_checkout=return` — set
  *      as the merchant return URL for Dodo sessions so 3DS returns land
  *      on the dashboard route instead of `/`, which is now the public

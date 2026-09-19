@@ -113,7 +113,7 @@ async function fetchFollowedCountriesEdge(
   const convexSiteUrl =
     process.env.CONVEX_SITE_URL
     ?? (process.env.CONVEX_URL ?? '').replace('.convex.cloud', '.convex.site');
-  const relaySecret = process.env.RELAY_SHARED_SECRET ?? '';
+  const relaySecret = process.env.CONVEX_TENANT_RELAY_SECRET ?? '';
   if (!convexSiteUrl || !relaySecret) return [];
   if (typeof userId !== 'string' || userId.length === 0) return [];
   try {
@@ -213,7 +213,9 @@ export default async function handler(
   // "expired" page.
   let envelope: unknown;
   try {
-    envelope = await readRawJsonFromUpstash(`brief:${userId}:${issueDate}`);
+    // Seeder-owned envelope (#7674): the Railway digest composer writes the
+    // per-user brief envelope key bare — read it raw in every environment.
+    envelope = await readRawJsonFromUpstash(`brief:${userId}:${issueDate}`, 3_000, true);
   } catch (err) {
     console.error('[api/brief] Upstash read failed:', (err as Error).message);
     captureSilentError(err, { tags: { route: 'api/brief', step: 'envelope-read' }, ctx });

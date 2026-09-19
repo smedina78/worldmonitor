@@ -38,6 +38,7 @@ const MAX_OPTIONAL_PROPERTIES = 5;
 const FLAG_CONTAINER_KEYS = new Set(['featureflags', 'rolloutflags']);
 const CHINA_CORRIDOR_PATH = '/api/supply-chain/v1/get-china-corridor-control-towers';
 const CHINA_DECISION_SIGNALS_PATH = '/api/intelligence/v1/get-china-decision-signals';
+const DISPLACEMENT_EXAMPLE_YEAR = 2025;
 
 // ── Curated per-parameter example overrides ───────────────────────────────
 // The field-name heuristic in stringExample() picks structurally-valid but
@@ -187,14 +188,34 @@ function isCuratedOmission(key, context = {}) {
   // unavailableReason at the UNSPECIFIED zero value. The generic enum picker
   // skips the zero value and so paired rows with INVALID_REQUEST — a response
   // the handler cannot produce. See #6309 / #6316.
-  return key === 'unavailableReason'
+  if (key === 'unavailableReason'
     && (where.includes('gettradeflows') || where.includes('get-trade-flows')
-      || where.includes('gettarifftrends') || where.includes('get-tariff-trends'));
+      || where.includes('gettarifftrends') || where.includes('get-tariff-trends'))) {
+    return true;
+  }
+  // GetCountryProducts: none of its objects has a `required` list, so the
+  // optional-slot cap keeps the alphabetically first fields, and bookkeeping
+  // that sorts early pushes out the fields each object exists for. Each list
+  // below is dropped so those slots go to the trade evidence.
+  if (!where.includes('getcountryproducts') && !where.includes('get-country-products')) return false;
+  // The array's item object carries the array's own key as its `name`.
+  // CountryProduct: the recovery/threshold fields pushed out topExporters and totalValue.
+  if (context.name === 'products') return ['fetchedAt', 'omittedPartnerCount', 'omittedPartnerShare', 'partnerBasis'].includes(key);
+  // ProductExporter: the volume and scale fields pushed out share and value.
+  if (context.name === 'topExporters') return ['netWeightEstimated', 'quantity', 'quantityUnitCode', 'scale'].includes(key);
+  // CountryProductEvidence: the recovery and world-export fields pushed out source.
+  if (context.name === 'evidence') return ['recoveredHs4s', 'worldExportsFetchedAt'].includes(key);
+  return false;
 }
 
 function overrideStringExample(key, context = {}) {
   const where = `${context.operationId ?? ''} ${context.path ?? ''}`.toLowerCase();
   if (key === 'jmespath') return 'keys(@)';
+  if (where.includes('listvulnerabilityrankings') || where.includes('list-vulnerability-rankings')) {
+    if (key === 'commodityid') return 'crude_oil';
+    if (key === 'band') return 'high';
+    if (key === 'state') return 'ok';
+  }
   // RunScenario's async-job envelope (202 Accepted, see
   // openapi-inject-async-jobs.mjs): status is ALWAYS "pending" at enqueue
   // time, and statusUrl is the server-computed GetScenarioStatus poll URL —
@@ -570,6 +591,7 @@ function patternString(pattern, key) {
 
 function stringExample(name, schema = {}, context = {}) {
   const key = normalizeKey(name || context.name || context.operationId);
+  const parent = normalizeKey(context.parent || '');
   const description = String(schema.description ?? context.description ?? '').toLowerCase();
   const where = `${context.operationId ?? ''} ${context.path ?? ''}`.toLowerCase();
   // The ODP Patent File Wrapper source cannot populate this compatibility
@@ -581,6 +603,18 @@ function stringExample(name, schema = {}, context = {}) {
   // If the contract's pattern ever changes this falls through to the generic
   // heuristic and the schema-validity check reds — the correct failure mode.
   if (schema.pattern === '^(conflict|military|energy)?$') return 'conflict';
+  if (schema.pattern === '^(?:|USMCA|EU27|BRICS|GCC|ASEAN|NATO)$') return 'NATO';
+  if (key === 'unavailablereason') return '';
+  if (key === 'countrycode' && parent === 'inputs') return '';
+  if (key === 'quality') return 'observed';
+  if (schema.pattern === '^(?:food|energy|demographics|technology|defense)$') return 'food';
+  if (schema.pattern === '^(?:|severe-deficit|material-deficit|mixed-capability|strong-capability|high-capability)$') return 'mixed-capability';
+  if (schema.pattern === '^(?:country-weighted-components|aggregate-physical-inputs|population-weighted-continuous-score)$') return 'country-weighted-components';
+  if (schema.pattern?.includes('source-unavailable|country-unavailable|invalid-value')) return 'source-unavailable';
+  if (schema.pattern === '^(?:|observed|retained|derived)$') return 'observed';
+  if (schema.pattern === '^[A-Z]{2}$') return 'US';
+  if (schema.pattern === '^(?:|[A-Z]{2})$') return 'US';
+  if (key === 'reason' && where.includes('getphysicaldivergenceindex')) return '';
   // get-similar-events `situation` enforces min_len 10; the generic
   // placeholder is shorter and produces an un-runnable request sample.
   if (key === 'situation') return constrainedString('chokepoint closure with an energy price spike', schema);
@@ -620,6 +654,7 @@ function stringExample(name, schema = {}, context = {}) {
   if (key.includes('toiso')) return constrainedString('US', schema);
   if (key.includes('iso3')) return constrainedString('USA', schema);
   if (key.includes('iso2') || key.includes('country') || key.includes('countrycode')) return constrainedString('US', schema);
+  if (key === 'members' || key === 'includedmembers') return constrainedString('US', schema);
   if (key.includes('bbox')) return constrainedString('-74.10,40.60,-73.70,40.90', schema);
   if (key.includes('lat')) return constrainedString('40.7128', schema);
   if (key.includes('lng') || key.includes('lon')) return constrainedString('-74.0060', schema);
@@ -659,6 +694,7 @@ function numberExample(name, schema = {}, integer = false) {
   // Deliberately `ordinal` only, NOT `index`: in this repo `index` is a price index
   // (base = 100) on ConsumerPricesService, where 0 is a nonsense example value.
   if (key === 'ordinal') value = 0;
+  else if (key === 'score' && schema.minimum === 0 && schema.maximum === 5) value = 3;
   else if (key.includes('page') || key.includes('limit')) value = 25;
   else if (key.includes('days')) value = 7;
   else if (key.includes('closuredays')) value = 30;
@@ -818,8 +854,54 @@ function exampleForSchema(schema, spec, context = {}, depth = 0, seen = new Set(
   if (ref) {
     if (seen.has(ref)) return {};
     seen = new Set([...seen, ref]);
+    const resolvedName = refName(ref);
+    if (resolvedName === 'ScorecardObservation') {
+      return {
+        name: 'internetUsePercent',
+        value: 92.4,
+        year: 2025,
+        unit: 'percent',
+        source: 'World Bank',
+        indicatorCode: 'IT.NET.USER.ZS',
+      };
+    }
+    if (resolvedName === 'GetFiveFactorScorecardResponse' || resolvedName === 'GetBlocScorecardResponse') {
+      return {
+        scorecard: exampleForSchema(schema.properties.scorecard, spec, { ...context, name: 'scorecard' }, depth + 1, seen),
+        unavailable: false,
+        unavailableReason: '',
+      };
+    }
+    if (resolvedName === 'ListFiveFactorScorecardsResponse') {
+      return {
+        methodologyVersion: '1.0.0',
+        computedAt: '2026-01-15T12:00:00Z',
+        scorecards: exampleForSchema(schema.properties.scorecards, spec, { ...context, name: 'scorecards' }, depth + 1, seen),
+        unavailable: false,
+        unavailableReason: '',
+      };
+    }
+    if (resolvedName === 'GetDisplacementSummaryResponse') {
+      const summary = exampleForSchema(
+        schema.properties.summary,
+        spec,
+        { ...context, name: 'summary' },
+        depth + 1,
+        seen,
+      );
+      // A generic integer example is 1, but a served displacement snapshot
+      // always carries a real UNHCR data year.
+      summary.year = DISPLACEMENT_EXAMPLE_YEAR;
+      return {
+        dataAvailable: true,
+        fetchedAt: 1717200000000,
+        summary,
+      };
+    }
   }
 
+  if (context.operationId === 'GetDisplacementSummary' && context.name === 'year'
+    && (context.exampleSurface === 'parameter' || context.exampleSurface === 'request')) return 0;
   if (schema.example !== undefined) return clone(schema.example);
   if (schema.default !== undefined) return clone(schema.default);
   if (schema.const !== undefined) return clone(schema.const);
@@ -912,8 +994,55 @@ function successResponses(op) {
   );
 }
 
-function injectSpecExamples(spec) {
+function injectDisplacementYearContract(spec) {
+  const year = spec.components?.schemas?.GetDisplacementSummaryRequest?.properties?.year;
+  if (!year) return false;
+  const currentYear = new Date().getFullYear();
+
+  // Buf validates the non-zero range but its OpenAPI generator cannot express
+  // IGNORE_IF_ZERO_VALUE. Publish the actual union accepted by the route so
+  // schema-driven clients can use the documented latest-snapshot sentinel.
+  const desired = {
+    description: year.description,
+    oneOf: [
+      // `const` alone is valid JSON Schema but does not establish the value
+      // type for generic OpenAPI consumers. Keep the integer declaration so
+      // the sentinel is self-describing as well as exact.
+      { const: 0, type: 'integer' },
+      { type: 'integer', format: 'int32', minimum: 1951, maximum: currentYear },
+    ],
+  };
   let changed = false;
+  if (!eq(year, desired)) {
+    changed = true;
+  }
+  // Assign the canonical insertion order even when the JSON serializer has
+  // alphabetized an equivalent prior artifact. The YAML artifact preserves
+  // object insertion order, and make generate must be idempotent.
+  spec.components.schemas.GetDisplacementSummaryRequest.properties.year = desired;
+
+  // REST clients consume the Parameter Object schema rather than the request
+  // component, so keep the public query contract equally precise.
+  const parameter = spec.paths?.['/api/displacement/v1/get-displacement-summary']?.get?.parameters
+    ?.find((item) => item?.in === 'query' && item.name === 'year');
+  const parameterSchema = { oneOf: clone(desired.oneOf) };
+  if (parameter && !eq(parameter.schema, parameterSchema)) {
+    changed = true;
+  }
+  if (parameter) parameter.schema = parameterSchema;
+  return changed;
+}
+
+function injectSpecExamples(spec) {
+  let changed = injectDisplacementYearContract(spec);
+  const runId = spec.components?.schemas?.GetSimulationOutcomeRequest?.properties?.runId;
+  const runIdParameter = spec.paths?.['/api/forecast/v1/get-simulation-outcome']?.get?.parameters
+    ?.find((item) => item?.in === 'query' && item.name === 'runId');
+  if (runId && runIdParameter) {
+    const schema = { type: 'string', maxLength: runId.maxLength, pattern: runId.pattern, example: runId.example ?? runId.examples?.[0] };
+    if (!eq(runIdParameter.schema, schema)) changed = true;
+    runIdParameter.schema = schema;
+  }
   let operations = 0;
   let requestBearingOperations = 0;
   let responseOperations = 0;
@@ -1126,6 +1255,27 @@ function replaceParamExample(lines, opStart, opEnd, name, example) {
   throw new Error(`could not locate YAML parameter ${name}`);
 }
 
+function replaceParamSchema(lines, opStart, opEnd, name, schema) {
+  for (let i = opStart + 1; i < opEnd; i++) {
+    const match = lines[i].match(/^(\s*)-\s+name:\s+(.+)$/);
+    if (!match || countIndent(lines[i]) !== 16) continue;
+    if (unquoteYamlScalar(match[2]) !== name) continue;
+    const propIndent = 18;
+    const end = blockEnd(lines, i, 16);
+    const schemaStart = lines.findIndex((line, index) =>
+      index > i
+      && index < end
+      && countIndent(line) === propIndent
+      && (line.trim() === 'schema:' || line.trim() === '"schema":'),
+    );
+    if (schemaStart === -1) throw new Error(`could not locate YAML parameter schema ${name}`);
+    const schemaEnd = blockEnd(lines, schemaStart, propIndent);
+    lines.splice(schemaStart, schemaEnd - schemaStart, ...renderYamlNode({ schema }, propIndent));
+    return;
+  }
+  throw new Error(`could not locate YAML parameter ${name}`);
+}
+
 function findChildLine(lines, start, end, indent, text) {
   for (let i = start + 1; i < end; i++) {
     if (countIndent(lines[i]) === indent && lines[i].trim() === text) return i;
@@ -1183,8 +1333,39 @@ function replaceResponseExample(lines, opStart, opEnd, code, example) {
   replaceMediaExample(lines, mediaStart, example);
 }
 
+function patchYamlDisplacementYearSchema(lines, schema) {
+  const requestStart = lines.findIndex((line) => line.trim().endsWith('GetDisplacementSummaryRequest:'));
+  if (requestStart === -1) return;
+  const requestIndent = countIndent(lines[requestStart]);
+  const requestEnd = blockEnd(lines, requestStart, requestIndent);
+  const yearStart = lines.findIndex((line, index) =>
+    index > requestStart
+    && index < requestEnd
+    && countIndent(line) === requestIndent + 8
+    && (line.trim() === 'year:' || line.trim() === '"year":'),
+  );
+  if (yearStart === -1) throw new Error('could not locate GetDisplacementSummaryRequest.year in YAML artifact');
+  const yearIndent = countIndent(lines[yearStart]);
+  const yearEnd = blockEnd(lines, yearStart, yearIndent);
+  lines.splice(yearStart, yearEnd - yearStart, ...renderYamlNode({ year: schema }, yearIndent));
+}
+
 function patchYamlExamples(raw, spec, label) {
   const lines = raw.split('\n');
+  const displacementYear = spec.components?.schemas?.GetDisplacementSummaryRequest?.properties?.year;
+  if (displacementYear) patchYamlDisplacementYearSchema(lines, displacementYear);
+  const displacementParameter = spec.paths?.['/api/displacement/v1/get-displacement-summary']?.get?.parameters
+    ?.find((item) => item?.in === 'query' && item.name === 'year');
+  if (displacementParameter?.schema) {
+    const loc = findOperation(lines, '/api/displacement/v1/get-displacement-summary', 'get', label);
+    replaceParamSchema(lines, loc.start, loc.end, 'year', displacementParameter.schema);
+  }
+  const runIdPath = '/api/forecast/v1/get-simulation-outcome';
+  const runIdParameter = spec.paths?.[runIdPath]?.get?.parameters?.find((item) => item?.in === 'query' && item.name === 'runId');
+  if (runIdParameter) {
+    const loc = findOperation(lines, runIdPath, 'get', label);
+    replaceParamSchema(lines, loc.start, loc.end, 'runId', runIdParameter.schema);
+  }
   for (const [path, ops] of Object.entries(spec.paths ?? {})) {
     for (const [method, op] of Object.entries(ops ?? {})) {
       if (!HTTP_METHODS.has(method) || !op || typeof op !== 'object') continue;

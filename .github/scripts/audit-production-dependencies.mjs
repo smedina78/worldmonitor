@@ -36,12 +36,6 @@ const DAY_MS = 86_400_000;
 export const BASELINE_ADVISORIES_BY_LOCKFILE = {
   'package-lock.json': [
     {
-      id: 'GHSA-f88m-g3jw-g9cj',
-      expiresAt: '2026-11-05',
-      reason:
-        'sharp inherited libvips decode CVEs need attacker-crafted image BYTES fed to sharp. Neither root chain decodes untrusted input: @vercel/og\'s sharp only converts satori-rendered first-party buffers (brief carousel), and @xenova/transformers is consumed solely by the browser ML worker (src/workers/ml.worker.ts) — its Node-only sharp binary never executes server-side. The clean fix (sharp 0.35.x) is semver-major across both chains; baselined until the parents bump.',
-    },
-    {
       id: 'GHSA-5p2g-fcmc-qvqq',
       expiresAt: '2026-11-05',
       reason:
@@ -57,12 +51,6 @@ export const BASELINE_ADVISORIES_BY_LOCKFILE = {
   'consumer-prices-core/package-lock.json': [],
   'blog-site/package-lock.json': [],
   'pro-test/package-lock.json': [
-    {
-      id: 'GHSA-395f-4hp3-45gv',
-      expiresAt: '2026-11-05',
-      reason:
-        'shell-quote quadratic-complexity DoS in parse() reaches pro-test only via react-native -> react-devtools-core, a mobile/dev-tooling chain the Vite web build never bundles into public/pro/. The parse() DoS is unreachable from the shipped browser bundle. Drop once react-native leaves pro-test\'s tree.',
-    },
     {
       id: 'GHSA-5p2g-fcmc-qvqq',
       expiresAt: '2026-11-05',

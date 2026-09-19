@@ -1,4 +1,5 @@
 import ISO2_TO_ISO3 from '../../../shared/iso2-to-iso3.js';
+import { normalizeSocialVelocity } from '../../_social-velocity.js';
 import { CHINA_MACRO_REQUIRED_SERIES } from '../../../shared/china-macro-contract.js';
 import {
   normalizeChinaMacroObservations,
@@ -14,7 +15,9 @@ import {
   computeCredibilityScore,
 } from '../../../shared/news-credibility.js';
 import { getSourceTier } from '../../../server/_shared/source-tiers';
+import { FLOW_SOURCE_WIRE_VALUES, narrowFlowSource } from '../../../server/_shared/flow-source';
 import { hasRedistributableProviderAttribution } from '../../../shared/provider-redistribution';
+import { torontoSafetySourceById } from '../../../shared/toronto-safety.js';
 import { CII_RISK_SCORE_CACHE_KEYS } from '../../_cii-risk-cache-keys.js';
 // @ts-expect-error — generated Edge-safe JS mirror; authored types live in shared/bootstrap-tier-keys.d.ts
 import { BOOTSTRAP_CACHE_KEYS } from '../../_bootstrap-tier-keys.js';
@@ -43,8 +46,16 @@ import {
   selectDatasets,
   summarizeData,
 } from '../filters';
+import { resolveCountryFilter } from '../_country-args';
 import type { ToolDef } from '../types';
+
 import { utf8ByteLength } from '../utils';
+import {
+  PHYSICAL_DIVERGENCE_OUTPUT_SCHEMA,
+  PHYSICAL_PREMIUM_OUTPUT_SCHEMA,
+  PHYSICAL_PREMIUM_SYMBOL_ALIASES,
+  normalizePhysicalDivergenceDataset,
+} from '../../../server/_shared/mcp-physical-divergence';
 import {
   CHOKEPOINT_MONITOR_UI_URI,
   CONFLICT_EVENTS_UI_URI,
@@ -54,6 +65,16 @@ import {
   NEWS_INTELLIGENCE_UI_URI,
   PREDICTION_MARKETS_UI_URI,
 } from '../ui/registry';
+
+// Eurostat uses EL for Greece and also publishes these two non-country geos.
+function resolveEurostatCountryFilter(raw: unknown): string[] {
+  if (raw == null || (typeof raw === 'string' && !raw.trim())) return [];
+  return (Array.isArray(raw) ? raw : [raw]).flatMap((value) => {
+    const geo = argStr(value);
+    if (geo === 'ea20' || geo === 'eu27_2020') return [geo];
+    return resolveCountryFilter(value, 'countries').map((code) => code === 'gr' ? 'el' : code);
+  });
+}
 
 // Iran-events domain sunset (war ended 2026-07). Default OFF: drop the dormant
 // conflict:iran-events:v1 key from the get_conflict_events cache set so the MCP
@@ -67,10 +88,31 @@ const IRAN_EVENTS_ENABLED = (process.env.IRAN_EVENTS_ENABLED ?? 'false').toLower
 const CONFLICT_EVENTS_OUTPUT_BUDGET_BYTES = 128 * 1024;
 const CONFLICT_EVENTS_DATA_BUDGET_BYTES = CONFLICT_EVENTS_OUTPUT_BUDGET_BYTES - 1024;
 const CONFLICT_EVENT_LISTS = ['ucdp-events', 'iran-events', 'events'] as const;
-const PHYSICAL_PREMIUM_SYMBOL_ALIASES: Record<string, string[]> = {
-  gold: ['gold', 'xau', 'gc=f'],
-  silver: ['silver', 'xag', 'si=f'],
-};
+const CROSS_SOURCE_SIGNAL_TYPES = [
+  'CROSS_SOURCE_SIGNAL_TYPE_COMPOSITE_ESCALATION',
+  'CROSS_SOURCE_SIGNAL_TYPE_THERMAL_SPIKE',
+  'CROSS_SOURCE_SIGNAL_TYPE_GPS_JAMMING',
+  'CROSS_SOURCE_SIGNAL_TYPE_MILITARY_FLIGHT_SURGE',
+  'CROSS_SOURCE_SIGNAL_TYPE_UNREST_SURGE',
+  'CROSS_SOURCE_SIGNAL_TYPE_OREF_ALERT_CLUSTER',
+  'CROSS_SOURCE_SIGNAL_TYPE_VIX_SPIKE',
+  'CROSS_SOURCE_SIGNAL_TYPE_COMMODITY_SHOCK',
+  'CROSS_SOURCE_SIGNAL_TYPE_CYBER_ESCALATION',
+  'CROSS_SOURCE_SIGNAL_TYPE_SHIPPING_DISRUPTION',
+  'CROSS_SOURCE_SIGNAL_TYPE_SANCTIONS_SURGE',
+  'CROSS_SOURCE_SIGNAL_TYPE_EARTHQUAKE_SIGNIFICANT',
+  'CROSS_SOURCE_SIGNAL_TYPE_RADIATION_ANOMALY',
+  'CROSS_SOURCE_SIGNAL_TYPE_INFRASTRUCTURE_OUTAGE',
+  'CROSS_SOURCE_SIGNAL_TYPE_WILDFIRE_ESCALATION',
+  'CROSS_SOURCE_SIGNAL_TYPE_DISPLACEMENT_SURGE',
+  'CROSS_SOURCE_SIGNAL_TYPE_FORECAST_DETERIORATION',
+  'CROSS_SOURCE_SIGNAL_TYPE_MARKET_STRESS',
+  'CROSS_SOURCE_SIGNAL_TYPE_WEATHER_EXTREME',
+  'CROSS_SOURCE_SIGNAL_TYPE_MEDIA_TONE_DETERIORATION',
+  'CROSS_SOURCE_SIGNAL_TYPE_REGULATORY_ACTION',
+  'CROSS_SOURCE_SIGNAL_TYPE_RISK_SCORE_SPIKE',
+  'CROSS_SOURCE_SIGNAL_TYPE_PHYSICAL_PREMIUM_REGIME_TRANSITION',
+] as const;
 
 function fitConflictEventsToBudget(data: Record<string, unknown>): void {
   const lists = CONFLICT_EVENT_LISTS.flatMap((label) => {
@@ -307,6 +349,10 @@ export const CACHE_TOOLS: ToolDef[] = [
   {
     name: 'get_toronto_reported_occurrences',
     _outputBudgetBytes: 65536,
+    // TPS rows are licensed for reuse with attribution. Extract it from the
+    // cache envelope so a projection over `records` cannot leave the rows
+    // without the licence assertion that permits redistributing them.
+    _attribution: 'data.reported_occurrences.{attribution: attribution, source: source, fetchedAt: fetchedAt}',
     description: 'Bounded Toronto Police Service Major Crime Indicators rows. Retrospective reported occurrences only; coordinates are approximate and this is not live dispatch.',
     inputSchema: {
       type: 'object',
@@ -353,6 +399,10 @@ export const CACHE_TOOLS: ToolDef[] = [
   {
     name: 'get_toronto_calls_attended',
     _outputBudgetBytes: 65536,
+    // Read AFTER `_postFilter`, which rewrites `attribution` from the source
+    // descriptor — a pre-CKAN cached blob still carries the retired
+    // OGL-Ontario claim, and the rider must publish the current licence.
+    _attribution: 'data.annual_aggregates.{attribution: attribution, source: source, fetchedAt: fetchedAt}',
     description: 'Bounded Toronto Police Service Calls for Service Attended annual aggregates. These are neighbourhood and division counts, not incident points.',
     inputSchema: {
       type: 'object',
@@ -389,6 +439,16 @@ export const CACHE_TOOLS: ToolDef[] = [
       ));
       const requested = argNum(params.limit);
       capNested(data, 'annual_aggregates', 'records', Math.min(Math.max(requested ?? 50, 1), 100));
+      // Attribution is a licence assertion, so it comes from the descriptor —
+      // never from whatever snapshot happens to be cached. A pre-CKAN blob
+      // still carries the retired OGL-Ontario claim until it is overwritten.
+      const aggregates = (data as Record<string, unknown>).annual_aggregates;
+      if (aggregates && typeof aggregates === 'object') {
+        const descriptor = torontoSafetySourceById('tps-calls-attended');
+        if (descriptor?.attribution) {
+          (aggregates as Record<string, unknown>).attribution = descriptor.attribution;
+        }
+      }
       return data;
     },
     _cacheKeys: ['safety:toronto:tps-calls-attended:v1'],
@@ -405,14 +465,14 @@ export const CACHE_TOOLS: ToolDef[] = [
     // docs/finance-data.mdx § Client parity.
     name: 'get_market_data',
     _outputBudgetBytes: 131072,
-    description: 'Real-time equity quotes, commodity prices (including SGE physical-vs-COMEX gold and silver premiums), crypto prices, forex FX rates, sector performance and valuation coverage, ETF flows, and Gulf market quotes from WorldMonitor\'s curated bootstrap cache. Covers the curated symbol universe only — it filters that snapshot rather than looking up arbitrary tickers.',
+    description: 'Real-time equity quotes, commodity prices, SGE physical-vs-COMEX premiums, physical-divergence regimes and trends, crypto, FX, sectors with explicit valuation coverage, ETF flows, and Gulf markets. Covers the curated symbol universe only — it filters that snapshot rather than looking up arbitrary tickers.',
     inputSchema: {
       type: 'object',
       properties: {
         symbols: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Tickers to keep, e.g. ["AAPL","GC=F","BTC"]. Case-insensitive; matches equity/commodity/crypto/gulf quotes, physical-premium aliases (gold/XAU/GC=F, silver/XAG/SI=F), sector ETFs, and ETF-flow tickers. Omit for the full snapshot.',
+          description: 'Tickers to keep, e.g. ["AAPL","GC=F","BTC"]. Case-insensitive; matches equity/commodity/crypto/gulf quotes, physical-premium and divergence aliases (gold/XAU/GC=F, silver/XAG/SI=F), sector ETFs, and ETF-flow tickers. Omit for the full snapshot.',
         },
         asset_class: {
           type: 'array',
@@ -423,11 +483,17 @@ export const CACHE_TOOLS: ToolDef[] = [
       },
       required: [],
     },
+    // Every quote list serves `change` (a PERCENT — the seeders
+    // normalise Finnhub `dp` / Alpha Vantage / Yahoo through
+    // scripts/shared/market-quote-provider.mjs) and ETF rows serve `estFlow`.
+    // This schema previously advertised `changePercent` and `flow`, which no
+    // producer has ever written, so every agent projecting per the hint got
+    // null for each row. Keep these names pinned to the seeders.
     outputSchema: cacheEnvelope({
       'stocks-bootstrap': {
         type: ['object', 'null'],
         properties: {
-          quotes: { type: 'array', items: { type: 'object', properties: { symbol: { type: 'string' }, price: { type: 'number' }, changePercent: { type: 'number' } } } },
+          quotes: { type: 'array', items: { type: 'object', properties: { symbol: { type: 'string' }, price: { type: 'number' }, change: { type: 'number', description: 'Percent change vs prior close.' } } } },
           finnhubSkipped: { type: 'boolean' },
           skipReason: { type: 'string' },
           rateLimited: { type: 'boolean' },
@@ -436,39 +502,24 @@ export const CACHE_TOOLS: ToolDef[] = [
       'commodities-bootstrap': {
         type: ['object', 'null'],
         properties: {
-          quotes: { type: 'array', items: { type: 'object', properties: { symbol: { type: 'string' }, price: { type: 'number' }, changePercent: { type: 'number' } } } },
+          quotes: { type: 'array', items: { type: 'object', properties: { symbol: { type: 'string' }, price: { type: 'number' }, change: { type: 'number', description: 'Percent change vs prior close.' } } } },
         },
       },
-      'physical-premium': {
-        type: ['object', 'null'],
-        properties: {
-          premiums: {
-            type: 'array',
-            items: {
-              type: 'object',
-              properties: {
-                metal: { type: 'string', enum: ['gold', 'silver'] },
-                physical: { type: 'object', properties: { price: { type: 'number' }, currency: { type: 'string' }, unit: { type: 'string' }, source: { type: 'string' }, asOf: { type: 'string' } } },
-                paper: { type: 'object', properties: { price: { type: 'number' }, source: { type: 'string' }, asOf: { type: 'string' } } },
-                premiumUsdPerOz: { type: 'number' },
-                premiumPct: { type: 'number' },
-                computedAt: { type: 'string' },
-              },
-            },
-          },
-          fx: { type: 'object', properties: { pair: { type: 'string' }, rate: { type: 'number' }, source: { type: 'string' }, asOf: { type: 'string' } } },
-        },
-      },
+      'physical-premium': PHYSICAL_PREMIUM_OUTPUT_SCHEMA,
+      'physical-divergence': PHYSICAL_DIVERGENCE_OUTPUT_SCHEMA,
       crypto: {
         type: ['object', 'null'],
         properties: {
-          quotes: { type: 'array', items: { type: 'object', properties: { symbol: { type: 'string' }, price: { type: 'number' }, changePercent: { type: 'number' } } } },
+          // Crypto trades continuously, so there is no prior close to compare
+          // against: scripts/seed-crypto-quotes.mjs carries the provider's
+          // rolling percent_change_24h straight into `change`.
+          quotes: { type: 'array', items: { type: 'object', properties: { symbol: { type: 'string' }, price: { type: 'number' }, change: { type: 'number', description: 'Percent change over the trailing 24 hours (crypto trades continuously; this is not a prior-close comparison).' } } } },
         },
       },
       sectors: {
         type: ['object', 'null'],
         properties: {
-          sectors: { type: 'array', items: { type: 'object', properties: { symbol: { type: 'string' }, name: { type: 'string' }, changePercent: { type: 'number' } } } },
+          sectors: { type: 'array', items: { type: 'object', properties: { symbol: { type: 'string' }, name: { type: 'string' }, change: { type: 'number', description: 'Percent change vs prior close.' } } } },
           valuations: { type: ['object', 'array', 'null'] },
           valuationCoverage: {
             type: ['object', 'null'],
@@ -535,14 +586,14 @@ export const CACHE_TOOLS: ToolDef[] = [
         properties: {
           timestamp: { type: ['string', 'number', 'null'] },
           summary: { type: ['object', 'null'] },
-          etfs: { type: 'array', items: { type: 'object', properties: { ticker: { type: 'string' }, flow: { type: 'number' } } } },
+          etfs: { type: 'array', items: { type: 'object', properties: { ticker: { type: 'string' }, estFlow: { type: 'number', description: 'Estimated net USD flow (volume x price heuristic).' } } } },
           rateLimited: { type: 'boolean' },
         },
       },
       'gulf-quotes': {
         type: ['object', 'null'],
         properties: {
-          quotes: { type: 'array', items: { type: 'object', properties: { symbol: { type: 'string' }, price: { type: 'number' }, changePercent: { type: 'number' } } } },
+          quotes: { type: 'array', items: { type: 'object', properties: { symbol: { type: 'string' }, price: { type: 'number' }, change: { type: 'number', description: 'Percent change vs prior close.' } } } },
           rateLimited: { type: 'boolean' },
         },
       },
@@ -562,6 +613,7 @@ export const CACHE_TOOLS: ToolDef[] = [
     }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _postFilter: (data, params) => {
+      normalizePhysicalDivergenceDataset(data);
       const symbols = argStrList(params.symbols);
       if (symbols.length > 0) {
         for (const label of ['stocks-bootstrap', 'commodities-bootstrap', 'crypto', 'gulf-quotes']) {
@@ -574,6 +626,28 @@ export const CACHE_TOOLS: ToolDef[] = [
           if (!aliases) return false;
           return aliases.some((alias) => matchesCode(alias, symbols));
         });
+        narrowNested(data, 'physical-divergence', 'readings', (reading) => {
+          const aliases = typeof reading.metal === 'string'
+            ? PHYSICAL_PREMIUM_SYMBOL_ALIASES[reading.metal]
+            : undefined;
+          return aliases?.some((alias) => matchesCode(alias, symbols)) ?? false;
+        });
+        const divergence = data['physical-divergence'];
+        if (divergence && typeof divergence === 'object' && !Array.isArray(divergence)) {
+          const divergenceRecord = divergence as Record<string, unknown>;
+          const readings = Array.isArray(divergenceRecord.readings)
+            ? divergenceRecord.readings
+            : [];
+          const visibleMetals = new Set(readings.flatMap((reading) => (
+            reading && typeof reading === 'object' && !Array.isArray(reading)
+            && typeof (reading as Record<string, unknown>).metal === 'string'
+              ? [(reading as Record<string, unknown>).metal]
+              : []
+          )));
+          if (!(visibleMetals.has('gold') && visibleMetals.has('silver'))) {
+            delete divergenceRecord.composite;
+          }
+        }
         narrowNested(data, 'sectors', 'sectors', (s) => matchesCode(s.symbol, symbols));
         const sectorData = data.sectors;
         if (sectorData && typeof sectorData === 'object' && !Array.isArray(sectorData)) {
@@ -701,7 +775,7 @@ export const CACHE_TOOLS: ToolDef[] = [
       const cls = argStrList(params.asset_class);
       if (cls.length > 0) {
         const map: Record<string, string[]> = {
-          equity: ['stocks-bootstrap'], commodity: ['commodities-bootstrap', 'physical-premium'], crypto: ['crypto'],
+          equity: ['stocks-bootstrap'], commodity: ['commodities-bootstrap', 'physical-premium', 'physical-divergence'], crypto: ['crypto'],
           sectors: ['sectors'], etf: ['etf-flows'], gulf: ['gulf-quotes'], sentiment: ['fear-greed'],
         };
         return selectDatasets(data, cls.flatMap((assetClass) => map[assetClass] ?? []));
@@ -715,6 +789,7 @@ export const CACHE_TOOLS: ToolDef[] = [
       'market:stocks-bootstrap:v1',
       'market:commodities-bootstrap:v1',
       'market:physical-premium:v1',
+      'market:physical-divergence:v1',
       'market:crypto:v1',
       'market:sectors:v2',
       'market:etf-flows:v1',
@@ -735,6 +810,7 @@ export const CACHE_TOOLS: ToolDef[] = [
     _apiPaths: [
       "GET /api/market/v1/get-fear-greed-index",
       "GET /api/market/v1/get-physical-premiums",
+      "GET /api/market/v1/get-physical-divergence-index",
       "GET /api/market/v1/get-sector-summary",
       "GET /api/market/v1/list-commodity-quotes",
       "GET /api/market/v1/list-crypto-quotes",
@@ -917,7 +993,7 @@ export const CACHE_TOOLS: ToolDef[] = [
     name: 'get_news_intelligence',
     _uiResourceUri: NEWS_INTELLIGENCE_UI_URI,
     _outputBudgetBytes: 131072,
-    description: 'AI-classified geopolitical threat news summaries, GDELT intelligence signals, cross-source signals, and security advisories from WorldMonitor\'s intelligence layer. Each top story carries full corroboration metadata — uniqueSourceCount, corroborationSourceCount, entityCorroboration, sourceTier, the contributing outlet names, every clustered headline, and credibilityScore (0-100 source reliability, distinct from importance).',
+    description: 'AI-classified geopolitical threat news summaries, GDELT intelligence signals, cross-source signals including physical-premium regime transitions, and security advisories from WorldMonitor\'s intelligence layer. Each top story carries full corroboration metadata — uniqueSourceCount, corroborationSourceCount, entityCorroboration, sourceTier, the contributing outlet names, every clustered headline, and credibilityScore (0-100 source reliability, distinct from importance).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -927,7 +1003,7 @@ export const CACHE_TOOLS: ToolDef[] = [
           description: 'Filter GDELT intelligence to a single topic.',
         },
         category: { type: 'string', description: 'Filter top news stories to one category (e.g. "conflict", "economy"; fallback is "general").' },
-        country: { type: 'string', description: 'Filter top stories and travel advisories to one ISO 3166-1 alpha-2 country code (case-insensitive).' },
+        country: { type: 'string', description: 'Filter top stories and travel advisories to one ISO 3166-1 alpha-2 country code (case-insensitive). Country names and alpha-3 codes are accepted; unresolved inputs return Invalid params.' },
         alerts_only: { type: 'boolean', description: 'Keep only top stories flagged as alerts.' },
         query: { type: 'string', description: 'Keep only top stories whose headline, primary source, or any clustered member headline contains this text (case-insensitive substring). This filters the LIVE news window only — it is not a historical index, so an event older than the current digest will not be found here. Use search_intel_history for that.' },
         min_importance: { type: 'number', description: 'Keep only top stories whose effectiveImportanceScore is at least this value. 0 is honoured as a real floor rather than treated as absent; a story carrying no score is excluded when this is set, never treated as scoring zero.' },
@@ -941,7 +1017,9 @@ export const CACHE_TOOLS: ToolDef[] = [
         properties: {
           topStories: { type: 'array', items: { type: 'object', properties: {
             primaryTitle: { type: 'string' }, primarySource: { type: 'string' }, primaryLink: { type: 'string' },
-            pubDate: { type: 'string' }, sourceCount: { type: 'number' }, importanceScore: { type: 'number' },
+            // Epoch milliseconds from the digest pipeline, or an ISO string when a
+            // feed item carried only a text date (scripts/seed-insights.mjs).
+            pubDate: { type: ['string', 'number'] }, sourceCount: { type: 'number' }, importanceScore: { type: 'number' },
             credibilityScore: { type: 'number', description: '0-100 source-reliability score, distinct from importanceScore. Built from source tier, propaganda risk, and independent corroboration. State-controlled media is capped at 40.' },
             // Corroboration and clustering fields the seeder already writes
             // into every news:insights:v1 topStories entry (see the object
@@ -989,7 +1067,17 @@ export const CACHE_TOOLS: ToolDef[] = [
       },
       'cross-source-signals': {
         type: ['object', 'null'],
-        properties: { signals: { type: 'array', items: { type: 'object' } } },
+        properties: { signals: { type: 'array', items: { type: 'object', properties: {
+          id: { type: 'string' },
+          type: { type: 'string', enum: [...CROSS_SOURCE_SIGNAL_TYPES] },
+          theater: { type: 'string' },
+          summary: { type: 'string' },
+          severity: { type: 'string' },
+          severityScore: { type: 'number' },
+          detectedAt: { type: 'number' },
+          contributingTypes: { type: 'array', items: { type: 'string' } },
+          signalCount: { type: 'number' },
+        } } } },
       },
       'advisories-bootstrap': {
         type: ['object', 'null'],
@@ -1002,7 +1090,7 @@ export const CACHE_TOOLS: ToolDef[] = [
     _postFilter: (data, params) => {
       const topic = argStr(params.topic);
       const category = argStr(params.category);
-      const countries = argStrList(params.country);
+      const countries = resolveCountryFilter(params.country, 'country');
       const limit = (argNum(params.limit) ?? DEFAULT_LIST_LIMIT);
       mapNested(data, 'insights', 'topStories', addNewsSourceProvenance);
       if (topic) narrowNested(data, 'gdelt-intel', 'topics', (t) => argStr(t.id) === topic);
@@ -1049,7 +1137,7 @@ export const CACHE_TOOLS: ToolDef[] = [
     // matching api/health.js.
     _freshnessChecks: [
       { key: 'seed-meta:news:insights',                    maxStaleMin: 30 },  // 15min cron × 2
-      { key: 'seed-meta:intelligence:gdelt-intel',         maxStaleMin: 45 },  // 15min materializer; matches api/health.js
+      { key: 'seed-meta:intelligence:gdelt-intel',         maxStaleMin: 45, honorContentAge: true }, // 15min materializer; matches api/health.js
       { key: 'seed-meta:intelligence:cross-source-signals', maxStaleMin: 60 }, // 30min cron × 2
     ],
     _apiPaths: [
@@ -1211,9 +1299,9 @@ export const CACHE_TOOLS: ToolDef[] = [
         min_severity: {
           type: 'string',
           enum: ['low', 'medium', 'high', 'critical'],
-          description: 'Drop threats below this severity level.',
+          description: 'Keep only threats with a known severity at or above this level; exclude missing or unrecognized severities.',
         },
-        country: { type: 'string', description: 'Filter to one ISO 3166-1 alpha-2 country code (many threats have no country and are dropped by this filter).' },
+        country: { type: 'string', description: 'Filter to one ISO 3166-1 alpha-2 country code (many threats have no country and are dropped by this filter). Country names and alpha-3 codes are accepted; unresolved inputs return Invalid params.' },
         limit: { type: 'number', description: 'Cap the threat list to at most this many items (default 30, pass 0 for no cap).' },
       },
       required: [],
@@ -1232,7 +1320,7 @@ export const CACHE_TOOLS: ToolDef[] = [
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _postFilter: (data, params) => {
       const type = argStr(params.threat_type);
-      const countries = argStrList(params.country);
+      const countries = resolveCountryFilter(params.country, 'country');
       const minSev = argStr(params.min_severity).replace('criticality_level_', '');
       const ranks: Record<string, number> = { low: 1, medium: 2, high: 3, critical: 4 };
       const minRank = ranks[minSev];
@@ -1244,7 +1332,7 @@ export const CACHE_TOOLS: ToolDef[] = [
         narrowNested(data, 'threats-bootstrap', 'threats', (t) => {
           const tok = argStr(t.severity).replace('criticality_level_', '');
           const r = ranks[tok];
-          return r == null || r >= minRank;
+          return r != null && r >= minRank;
         });
       }
       capNested(data, 'threats-bootstrap', 'threats', (argNum(params.limit) ?? DEFAULT_LIST_LIMIT));
@@ -1271,7 +1359,7 @@ export const CACHE_TOOLS: ToolDef[] = [
         },
         country: {
           type: 'string',
-          description: 'Filter the country-keyed datasets (fuel-prices, BIS DSR/property, economic calendar) to one ISO 3166-1 alpha-2 code.',
+          description: 'Filter the country-keyed datasets (fuel-prices, BIS DSR/property, economic calendar) to one ISO 3166-1 alpha-2 code. Country names and alpha-3 codes are accepted; unresolved inputs return Invalid params.',
         },
         limit: { type: 'number', description: 'Cap each list dataset (calendar, spending, earnings) to at most this many items (default 30, pass 0 for no cap).' },
       },
@@ -1384,7 +1472,7 @@ export const CACHE_TOOLS: ToolDef[] = [
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _postFilter: (data, params) => {
       data['china-macro'] = projectChinaMacroForMcp(data['china-macro']);
-      const countries = argStrList(params.country);
+      const countries = resolveCountryFilter(params.country, 'country');
       const limit = (argNum(params.limit) ?? DEFAULT_LIST_LIMIT);
       if (countries.length > 0) {
         narrowNested(data, 'fuel-prices', 'countries', (c) => matchesCode(c.code, countries));
@@ -1462,7 +1550,7 @@ export const CACHE_TOOLS: ToolDef[] = [
         countries: {
           type: 'array',
           items: { type: 'string' },
-          description: 'ISO 3166-1 alpha-2 country codes to keep across all four IMF datasets (e.g. ["US","DE","CN"]). Omit for all ~210 countries.',
+          description: 'ISO 3166-1 alpha-2 country codes to keep across all four IMF datasets (e.g. ["US","DE","CN"]). Omit for all ~210 countries. Country names and alpha-3 codes are accepted; unresolved inputs return Invalid params.',
         },
         limit: { type: 'integer', minimum: 0, description: 'Cap each IMF dataset country map to at most this many entries when no countries filter is supplied (default 30, pass 0 for no cap).' },
       },
@@ -1477,7 +1565,7 @@ export const CACHE_TOOLS: ToolDef[] = [
     }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _postFilter: (data, params) => {
-      const codes = argStrList(params.countries);
+      const codes = resolveCountryFilter(params.countries, 'countries');
       if (codes.length > 0) {
         for (const label of ['macro', 'growth', 'labor', 'external']) pickNestedMap(data, label, 'countries', codes);
         return data;
@@ -1510,7 +1598,7 @@ export const CACHE_TOOLS: ToolDef[] = [
         countries: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Eurostat geo codes to keep — ISO 3166-1 alpha-2, but "EL" for Greece, plus aggregates "EA20" and "EU27_2020". Omit for all.',
+          description: 'Eurostat geo codes to keep — ISO 3166-1 alpha-2, but "EL" for Greece, plus aggregates "EA20" and "EU27_2020". Omit for all. Country names and alpha-3 codes are accepted; unresolved inputs return Invalid params.',
         },
         limit: { type: 'integer', minimum: 0, description: 'Cap the country map to at most this many entries when no countries filter is supplied (default 30, pass 0 for no cap).' },
       },
@@ -1527,7 +1615,7 @@ export const CACHE_TOOLS: ToolDef[] = [
     }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _postFilter: (data, params) => {
-      const codes = argStrList(params.countries);
+      const codes = resolveEurostatCountryFilter(params.countries);
       if (codes.length > 0) {
         pickNestedMap(data, 'house-prices', 'countries', codes);
         return data;
@@ -1549,7 +1637,7 @@ export const CACHE_TOOLS: ToolDef[] = [
         countries: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Eurostat geo codes to keep — ISO 3166-1 alpha-2, but "EL" for Greece, plus aggregates "EA20" and "EU27_2020". Omit for all.',
+          description: 'Eurostat geo codes to keep — ISO 3166-1 alpha-2, but "EL" for Greece, plus aggregates "EA20" and "EU27_2020". Omit for all. Country names and alpha-3 codes are accepted; unresolved inputs return Invalid params.',
         },
         limit: { type: 'integer', minimum: 0, description: 'Cap the country map to at most this many entries when no countries filter is supplied (default 30, pass 0 for no cap).' },
       },
@@ -1566,7 +1654,7 @@ export const CACHE_TOOLS: ToolDef[] = [
     }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _postFilter: (data, params) => {
-      const codes = argStrList(params.countries);
+      const codes = resolveEurostatCountryFilter(params.countries);
       if (codes.length > 0) {
         pickNestedMap(data, 'gov-debt-q', 'countries', codes);
         return data;
@@ -1588,7 +1676,7 @@ export const CACHE_TOOLS: ToolDef[] = [
         countries: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Eurostat geo codes to keep — ISO 3166-1 alpha-2, but "EL" for Greece, plus aggregates "EA20" and "EU27_2020". Omit for all.',
+          description: 'Eurostat geo codes to keep — ISO 3166-1 alpha-2, but "EL" for Greece, plus aggregates "EA20" and "EU27_2020". Omit for all. Country names and alpha-3 codes are accepted; unresolved inputs return Invalid params.',
         },
         limit: { type: 'integer', minimum: 0, description: 'Cap the country map to at most this many entries when no countries filter is supplied (default 30, pass 0 for no cap).' },
       },
@@ -1605,7 +1693,7 @@ export const CACHE_TOOLS: ToolDef[] = [
     }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _postFilter: (data, params) => {
-      const codes = argStrList(params.countries);
+      const codes = resolveEurostatCountryFilter(params.countries);
       if (codes.length > 0) {
         pickNestedMap(data, 'industrial-production', 'countries', codes);
         return data;
@@ -1692,7 +1780,7 @@ export const CACHE_TOOLS: ToolDef[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        country: { type: 'string', description: 'Filter sanctioned entities and pressure scores to one ISO 3166-1 alpha-2 country code.' },
+        country: { type: 'string', description: 'Filter sanctioned entities and pressure scores to one ISO 3166-1 alpha-2 country code. Country names and alpha-3 codes are accepted; unresolved inputs return Invalid params.' },
         entity_type: { type: 'string', description: 'Filter to one entity type (case-insensitive substring, e.g. "vessel", "aircraft", "person", "entity").' },
         query: { type: 'string', description: 'Keep only sanctioned entities whose name contains this text (case-insensitive).' },
         limit: { type: 'number', description: 'Cap the entity list and recent pressure entries to at most this many items (default 30, pass 0 for no cap).' },
@@ -1706,7 +1794,8 @@ export const CACHE_TOOLS: ToolDef[] = [
       entities: {
         type: ['array', 'object', 'null'],
         items: { type: 'object', properties: {
-          name: { type: 'string' }, cc: { type: 'string' }, et: { type: 'string' },
+          // Up to three ISO country codes per entity (scripts/seed-sanctions-pressure.mjs).
+          name: { type: 'string' }, cc: { type: 'array', items: { type: 'string' } }, et: { type: 'string' },
           addr: { type: 'string' },
         } },
       },
@@ -1724,7 +1813,7 @@ export const CACHE_TOOLS: ToolDef[] = [
     }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _postFilter: (data, params) => {
-      const countries = argStrList(params.country);
+      const countries = resolveCountryFilter(params.country, 'country');
       const etype = argStr(params.entity_type);
       const query = argStr(params.query);
       const limit = (argNum(params.limit) ?? DEFAULT_LIST_LIMIT);
@@ -1759,7 +1848,7 @@ export const CACHE_TOOLS: ToolDef[] = [
         countries: {
           type: 'array',
           items: { type: 'string' },
-          description: 'ISO 3166-1 alpha-3 country codes to keep (e.g. ["SYR","UKR","AFG"]). Matches both per-country totals and origin/asylum flows. Omit for all.',
+          description: 'Country names, ISO alpha-2, or alpha-3 codes to keep (e.g. ["Syria","UA","AFG"]). Matches both per-country totals and origin/asylum flows. Omit for all. Unresolved inputs return Invalid params.',
         },
         limit: { type: 'number', description: 'Cap the per-country and top-flow lists to at most this many items (default 30, pass 0 for no cap).' },
       },
@@ -1780,7 +1869,8 @@ export const CACHE_TOOLS: ToolDef[] = [
     }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _postFilter: (data, params) => {
-      const codes = argStrList(params.countries);
+      const countries = resolveCountryFilter(params.countries, 'countries');
+      const codes = [...countries, ...compact(countries.map((code) => ISO2_TO_ISO3[code.toUpperCase()]?.toLowerCase()))];
       const limit = (argNum(params.limit) ?? DEFAULT_LIST_LIMIT);
       if (codes.length > 0) {
         narrowNested(data, 'summary', 'countries', (c) => matchesCode(c.code, codes));
@@ -1817,7 +1907,7 @@ export const CACHE_TOOLS: ToolDef[] = [
           items: { type: 'string', enum: ['outbreaks', 'air-quality'] },
           description: 'Restrict to disease outbreaks, air-quality stations, or both. Omit for both.',
         },
-        country: { type: 'string', description: 'Filter outbreaks and air-quality stations to one ISO 3166-1 alpha-2 country code.' },
+        country: { type: 'string', description: 'Filter outbreaks and air-quality stations to one ISO 3166-1 alpha-2 country code. Country names and alpha-3 codes are accepted; unresolved inputs return Invalid params.' },
         disease: { type: 'string', description: 'Keep only outbreaks whose disease name contains this text (case-insensitive).' },
         min_aqi: { type: 'number', description: 'Drop air-quality stations below this AQI value.' },
         limit: { type: 'number', description: 'Cap the outbreak and station lists to at most this many items (default 30, pass 0 for no cap).' },
@@ -1846,7 +1936,7 @@ export const CACHE_TOOLS: ToolDef[] = [
     }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _postFilter: (data, params) => {
-      const countries = argStrList(params.country);
+      const countries = resolveCountryFilter(params.country, 'country');
       const disease = argStr(params.disease);
       const minAqi = argNum(params.min_aqi);
       const limit = (argNum(params.limit) ?? DEFAULT_LIST_LIMIT);
@@ -1897,7 +1987,7 @@ export const CACHE_TOOLS: ToolDef[] = [
         },
         country: {
           type: 'string',
-          description: 'Filter the country-keyed datasets (Ember electricity mix, gas storage, fuel shortages, energy disruptions, fossil-share) to one ISO 3166-1 alpha-2 code.',
+          description: 'Filter the country-keyed datasets (Ember electricity mix, gas storage, fuel shortages, energy disruptions, fossil-share) to one ISO 3166-1 alpha-2 code. Country names and alpha-3 codes are accepted; unresolved inputs return Invalid params.',
         },
         limit: { type: 'number', description: 'Cap each list-bearing energy slice (crisis-policies, electricity regions, gas-storage countries, World Bank renewable history/regions) to at most this many items (default 30, pass 0 for no cap).' },
       },
@@ -1929,7 +2019,7 @@ export const CACHE_TOOLS: ToolDef[] = [
     }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _postFilter: (data, params) => {
-      const countries = argStrList(params.country);
+      const countries = resolveCountryFilter(params.country, 'country');
       if (countries.length > 0) {
         data._all = pickMapKeys(data._all, countries);
         pickNestedMap(data, 'fossil-electricity-share', 'countries', countries);
@@ -1976,7 +2066,7 @@ export const CACHE_TOOLS: ToolDef[] = [
     ],
     _freshnessChecks: [
       { key: 'seed-meta:energy:eia-petroleum',                  maxStaleMin: 4320 },   // daily bundle; 72h = 3× interval
-      { key: 'seed-meta:energy:electricity-prices',             maxStaleMin: 2880 },   // daily cron (14:00 UTC); 48h = 2× interval
+      { key: 'seed-meta:energy:electricity-prices',             maxStaleMin: 3000 },   // daily 14:00 UTC; two intervals + 2h completion margin
       { key: 'seed-meta:energy:ember',                          maxStaleMin: 2880 },   // daily cron (08:00 UTC); 48h = 2× interval
       { key: 'seed-meta:energy:gas-storage-countries',          maxStaleMin: 2880 },   // daily cron at 10:30 UTC; 48h = 2× interval
       { key: 'seed-meta:energy:fuel-shortages',                 maxStaleMin: 2880 },   // 2d — daily cron × 2 headroom
@@ -2009,7 +2099,7 @@ export const CACHE_TOOLS: ToolDef[] = [
         },
         country: {
           type: 'string',
-          description: 'Filter the country-tagged datasets (climate disasters, air-quality stations) to one ISO 3166-1 alpha-2 code.',
+          description: 'Filter the country-tagged datasets (climate disasters, air-quality stations) to one ISO 3166-1 alpha-2 code. Country names and alpha-3 codes are accepted; unresolved inputs return Invalid params.',
         },
         limit: { type: 'number', description: 'Cap each list dataset (anomalies, disasters, stations, news, alerts) to at most this many items (default 30, pass 0 for no cap).' },
       },
@@ -2030,7 +2120,7 @@ export const CACHE_TOOLS: ToolDef[] = [
     }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _postFilter: (data, params) => {
-      const countries = argStrList(params.country);
+      const countries = resolveCountryFilter(params.country, 'country');
       const limit = (argNum(params.limit) ?? DEFAULT_LIST_LIMIT);
       if (countries.length > 0) {
         narrowNested(data, 'disasters', 'disasters', (d) => matchesCode(d.countryCode, countries));
@@ -2049,7 +2139,7 @@ export const CACHE_TOOLS: ToolDef[] = [
       { key: 'seed-meta:climate:disasters', maxStaleMin: 720 },
       { key: 'seed-meta:climate:co2-monitoring', maxStaleMin: 2880 },
       { key: 'seed-meta:health:air-quality', maxStaleMin: 180 },
-      { key: 'seed-meta:climate:ocean-ice', maxStaleMin: 1440 },
+      { key: 'seed-meta:climate:ocean-ice', maxStaleMin: 2880 },
       { key: 'seed-meta:climate:news-intelligence', maxStaleMin: 90 },
       { key: 'seed-meta:weather:alerts', maxStaleMin: 45 },
     ],
@@ -2061,6 +2151,112 @@ export const CACHE_TOOLS: ToolDef[] = [
       "GET /api/climate/v1/list-climate-disasters",
       "GET /api/climate/v1/list-climate-news",
     ],
+  },
+  {
+    name: 'get_imd_cyclone_marine',
+    _outputBudgetBytes: 65536,
+    // IMD bulletins are reusable with attribution to the issuing office. The
+    // snapshot carries it inline; the rider keeps it attached when a caller
+    // projects only `cyclones` or `portWarnings`.
+    _attribution: 'data.imd_cyclone_marine.{attribution: attribution, sourceName: sourceName, sourceUrl: sourceUrl}',
+    description:
+      'Bounded India Meteorological Department cyclone tracks, forecast wind radii, cones of uncertainty, and official port / sea-area / coastal bulletins. ' +
+      'Not merged into weather:alerts:v1. Live fetch requires IMD_API_KEY plus IMD_API_EMAIL and IMD_API_PASSWORD to mint a short-lived JWT for each run. ' +
+      'Read coverageState on every call: disabled means the IMD credentials are missing or invalid, degraded is a partial product failure, unavailable means no usable IMD snapshot, and ok is live. ' +
+      'Empty lists with disabled, degraded, or unavailable coverage are not an India all-clear.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        dataset: {
+          type: 'array',
+          items: { type: 'string', enum: ['cyclone', 'port', 'marine'] },
+          description: 'Restrict to cyclone tracks/wind/cones, port warnings, or sea-area/coastal bulletins. Omit for the full snapshot. coverageState and per-product health are always returned.',
+        },
+        limit: { type: 'number', description: 'Cap each product list to at most this many items (default 30, pass 0 for no cap).' },
+      },
+      required: [],
+    },
+    outputSchema: cacheEnvelope({
+      imd_cyclone_marine: {
+        type: ['object', 'null'],
+        properties: {
+          coverageState: { type: 'string', enum: ['ok', 'disabled', 'degraded', 'unavailable'] },
+          skipReason: { type: ['string', 'null'] },
+          generatedAt: { type: 'number' },
+          products: { type: 'object', additionalProperties: { type: 'object', properties: {
+            status: { type: 'string' },
+            reason: { type: ['string', 'null'] },
+            recordCount: { type: 'number' },
+            warningCount: { type: 'number' },
+            carried: { type: 'boolean' },
+          } } },
+          failedProducts: { type: 'array', items: { type: 'string' } },
+          cycloneEvents: { type: 'array', items: { type: 'object' } },
+          portAlerts: { type: 'array', items: { type: 'object' } },
+          marineBulletins: { type: 'array', items: { type: 'object' } },
+          cyclones: { type: 'array', items: { type: 'object' } },
+          windRadii: { type: 'array', items: { type: 'object' } },
+          cones: { type: 'array', items: { type: 'object' } },
+          portWarnings: { type: 'array', items: { type: 'object' } },
+          seaBulletins: { type: 'array', items: { type: 'object' } },
+          coastalBulletins: { type: 'array', items: { type: 'object' } },
+          sourceName: { type: 'string' },
+          sourceUrl: { type: 'string' },
+          attribution: { type: 'string' },
+        },
+        required: ['coverageState'],
+      },
+    }),
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    _postFilter: (data, params) => {
+      let snapshot = data.imd_cyclone_marine;
+      // A legacy or corrupt cache value must not look like an India all-clear.
+      // The wire contract requires coverageState on every usable object, so
+      // replace an unexpected value with the explicit unavailable state.
+      if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) {
+        snapshot = { coverageState: 'unavailable', skipReason: 'IMD_CACHE_INVALID' };
+        data.imd_cyclone_marine = snapshot;
+      }
+      const rec = snapshot as Record<string, unknown>;
+      if (!['ok', 'disabled', 'degraded', 'unavailable'].includes(argStr(rec.coverageState))) {
+        rec.coverageState = 'unavailable';
+        rec.skipReason = 'IMD_CACHE_INVALID';
+      }
+      const limit = (argNum(params.limit) ?? DEFAULT_LIST_LIMIT);
+      const listKeys = [
+        'cyclones', 'windRadii', 'cones', 'portWarnings', 'seaBulletins',
+        'coastalBulletins', 'cycloneEvents', 'portAlerts', 'marineBulletins', 'records',
+      ] as const;
+      for (const key of listKeys) capNested(data, 'imd_cyclone_marine', key, limit);
+
+      const datasets = argStrList(params.dataset);
+      if (datasets.length > 0) {
+        const keep = new Set<string>();
+        if (datasets.includes('cyclone')) {
+          keep.add('cyclones');
+          keep.add('windRadii');
+          keep.add('cones');
+          keep.add('cycloneEvents');
+        }
+        if (datasets.includes('port')) {
+          keep.add('portWarnings');
+          keep.add('portAlerts');
+        }
+        if (datasets.includes('marine')) {
+          keep.add('seaBulletins');
+          keep.add('coastalBulletins');
+          keep.add('marineBulletins');
+        }
+        for (const key of listKeys) {
+          if (!keep.has(key) && Array.isArray(rec[key])) rec[key] = [];
+        }
+      }
+      return data;
+    },
+    _cacheKeys: ['weather:imd-cyclone-marine:v1'],
+    _cacheLabels: { 'weather:imd-cyclone-marine:v1': 'imd_cyclone_marine' },
+    _freshnessChecks: [{ key: 'seed-meta:weather:imd-cyclone-marine', maxStaleMin: 45 }],
+    _apiPaths: [],
   },
   {
     name: 'get_infrastructure_status',
@@ -2185,7 +2381,7 @@ export const CACHE_TOOLS: ToolDef[] = [
         },
         country: {
           type: 'string',
-          description: 'Filter the per-country datasets to one ISO 3166-1 alpha-2 country code (e.g. "US"). It is translated to alpha-3 internally for the national-debt dataset; passing an alpha-3 code directly also works.',
+          description: 'Filter the per-country datasets to one ISO 3166-1 alpha-2 country code (e.g. "US"). It is translated to alpha-3 internally for the national-debt dataset; passing an alpha-3 code directly also works. Country names and alpha-3 codes are accepted; unresolved inputs return Invalid params.',
         },
         limit: { type: 'number', description: 'Cap each list dataset (tariff datapoints, BigMac countries, debt entries) to at most this many items (default 30, pass 0 for no cap).' },
       },
@@ -2218,7 +2414,7 @@ export const CACHE_TOOLS: ToolDef[] = [
     }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _postFilter: (data, params) => {
-      const countries = argStrList(params.country);
+      const countries = resolveCountryFilter(params.country, 'country');
       const limit = (argNum(params.limit) ?? DEFAULT_LIST_LIMIT);
       if (countries.length > 0) {
         narrowNested(data, 'bigmac', 'countries', (c) => matchesCode(c.code, countries));
@@ -2301,8 +2497,13 @@ export const CACHE_TOOLS: ToolDef[] = [
             todayCargo: { type: ['number', 'null'] }, todayOther: { type: ['number', 'null'] },
             wowChangePct: { type: ['number', 'null'] }, riskLevel: { type: 'string' },
             incidentCount7d: { type: ['number', 'null'] }, disruptionPct: { type: ['number', 'null'] },
-            riskSummary: { type: 'string' }, riskReportAction: { type: 'string' },
+            riskSummary: { type: 'string', description: 'Generated prose is withheld as an empty string. This does not indicate low risk.' },
+            riskReportAction: { type: 'string', description: 'Operational advice is withheld as an empty string because it has no verified routing basis.' },
             anomaly: { type: 'object' }, dataAvailable: { type: 'boolean' },
+            // null todayTotal means the relay's 24h AIS window was empty --
+            // unsupplied, not a measured zero (#7457). dataAvailable is
+            // PortWatch history presence and says nothing about today's count.
+            todayCountsAvailable: { type: 'boolean' },
           } } },
           fetchedAt: { type: ['number', 'string'] },
         },
@@ -2310,7 +2511,14 @@ export const CACHE_TOOLS: ToolDef[] = [
       chokepoint_transits: {
         type: ['object', 'null'],
         properties: {
-          transits: { type: 'object', additionalProperties: { type: 'object' } },
+          // Same in-memory AIS window as transit-summaries, so the same caveat
+          // applies: `available: false` means the window was empty and the
+          // numeric counts are a zero fill, not a measurement.
+          transits: { type: 'object', additionalProperties: { type: 'object', properties: {
+            tanker: { type: 'number' }, cargo: { type: 'number' },
+            other: { type: 'number' }, total: { type: 'number' },
+            available: { type: 'boolean' },
+          } } },
           fetchedAt: { type: ['number', 'string'] },
         },
       },
@@ -2334,17 +2542,75 @@ export const CACHE_TOOLS: ToolDef[] = [
       },
       'chokepoint-flows': {
         type: ['object', 'null'],
-        additionalProperties: { type: 'object' },
+        additionalProperties: { type: 'object', properties: {
+          currentMbd: { type: ['number', 'null'] },
+          baselineMbd: { type: ['number', 'null'] },
+          flowRatio: { type: ['number', 'null'] },
+          disrupted: { type: 'boolean' },
+          // The closed taxonomy #6101 promoted on the REST path; served
+          // values are narrowed onto it in _postFilter below, so this enum
+          // is enforced, not aspirational (#6113).
+          source: { type: 'string', enum: [...FLOW_SOURCE_WIRE_VALUES] },
+          // Raw seeder value, NOT the closed hazard enum. Hand-authored JSON
+          // Schema COULD express it here today (#6113 says so explicitly; see
+          // the `source` enums on get_toronto_* above) — this is DEFERRED, not
+          // blocked: #6106 blocks the REST twin on sebuf codegen, and shipping
+          // the closed set on one surface only would recreate the very
+          // declare-vs-serve split this tool just closed for `source`.
+          //
+          // Nullability is likewise a DELIBERATE divergence from REST, not an
+          // oversight: get-chokepoint-status.ts coerces `null -> ''` because
+          // the proto field is non-nullable, a constraint this hand-authored
+          // schema does not have. Serving `null` keeps "no hazard nearby"
+          // distinguishable from "hazard with an empty name", which is the more
+          // useful answer for an agent. Declared as it is actually served.
+          hazardAlertLevel: { type: ['string', 'null'] },
+          hazardAlertName: { type: ['string', 'null'] },
+        } },
       },
     }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _postFilter: (data, params) => {
+      // Narrow BEFORE any filtering so the declared source enum above is a
+      // property of every served response, exactly as the REST boundary's
+      // narrowServedSources makes it (#6113). The blob is written by a seeder
+      // that deploys independently; an undeclared basis must read as
+      // FLOW_SOURCE_UNSPECIFIED, never leak verbatim.
+      //
+      // Deliberately NOT guarded on `'source' in entry`. This is about the
+      // CLOSED-ENUM field specifically: the schema above declares a closed set
+      // for `source`, and "absent" is not a member of it, so an entry omitting
+      // the key must read FLOW_SOURCE_UNSPECIFIED — the declared way to say
+      // "not one of the known bases". The REST twin resolves it the same way
+      // (`source: toFlowSource(...)`, built unconditionally), and
+      // tests/chokepoint-flow-source-taxonomy.test.mts pins that case there.
+      //
+      // Scope note: this is NOT a general "match REST field-for-field" rule.
+      // REST also defaults hazardAlertLevel/hazardAlertName (`?? ''`), and this
+      // surface deliberately does not — see the nullability comment on those
+      // two fields above. Closed enum here, raw passthrough there, on purpose.
+      const flows = data['chokepoint-flows'];
+      if (flows && typeof flows === 'object') {
+        for (const entry of Object.values(flows)) {
+          if (entry && typeof entry === 'object') {
+            (entry as { source: unknown }).source = narrowFlowSource((entry as { source: unknown }).source);
+          }
+        }
+      }
+      mapNested(data, 'transit-summaries', 'summaries', (summaries) => {
+        if (!summaries || typeof summaries !== 'object' || Array.isArray(summaries)) return summaries;
+        return Object.fromEntries(Object.entries(summaries).map(([id, entry]) => [id,
+          entry && typeof entry === 'object'
+            ? { ...entry, riskSummary: '', riskReportAction: '' }
+            : entry,
+        ]));
+      });
       const cp = argStr(params.chokepoint);
       if (cp) {
         mapNested(data, 'transit-summaries', 'summaries', (m) => pickMapKeysLike(m, cp));
         mapNested(data, 'chokepoint_transits', 'transits', (m) => pickMapKeysLike(m, cp));
         data['chokepoint-flows'] = pickMapKeysLike(data['chokepoint-flows'], cp);
-        narrowNested(data, 'chokepoint-baselines', 'chokepoints', (c) => ciIncludes(c.id, cp) || ciIncludes(c.relayId, cp) || ciIncludes(c.name, cp));
+        narrowNested(data, 'chokepoint-baselines', 'chokepoints', (c) => ciIncludes(c?.id, cp) || ciIncludes(c?.relayId, cp) || ciIncludes(c?.name, cp));
       }
       const limit = argNum(params.limit) ?? DEFAULT_LIST_LIMIT;
       capNested(data, 'chokepoint-baselines', 'chokepoints', limit);
@@ -2633,6 +2899,7 @@ export const CACHE_TOOLS: ToolDef[] = [
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _postFilter: (data, params) => {
       const sub = argStr(params.subreddit);
+      if (data.reddit != null) data.reddit = normalizeSocialVelocity(data.reddit);
       if (sub) narrowNested(data, 'reddit', 'posts', (p) => argStr(p.subreddit) === sub);
       capNested(data, 'reddit', 'posts', (argNum(params.limit) ?? DEFAULT_LIST_LIMIT));
       return data;
@@ -2710,7 +2977,9 @@ export const CACHE_TOOLS: ToolDef[] = [
     },
     _cacheKeys: ['temporal:anomalies:v1'],
     _cacheLabels: { 'temporal:anomalies:v1': 'snapshot' },
-    _freshnessChecks: [{ key: 'seed-meta:temporal:anomalies', maxStaleMin: 45 }],
+    // liveness 45min; content-age (newestItemAt vs maxContentAgeMin) is stamped
+    // on the same key and evaluated by evaluateFreshness via honorContentAge.
+    _freshnessChecks: [{ key: 'seed-meta:temporal:anomalies', maxStaleMin: 45, honorContentAge: true }],
     _apiPaths: [],
   },
 

@@ -18,29 +18,45 @@ export const PRO_TOKEN_ID = 'k57mcptokenid';
 export const PRO_BEARER = 'pro-bearer-uuid';
 export const HMAC_SECRET = 'test-secret-mcp-internal-32-bytes-1234';
 export const BASE_URL = 'https://worldmonitor.app/mcp';
+// The transport at BASE_URL challenges an unauthenticated `initialize`. A full
+// anonymous handshake is served on the machine-discovery alias (same handler).
+export const ANON_DISCOVERY_URL = 'https://worldmonitor.app/.well-known/mcp';
 
 /**
- * In-memory pipeline stub over Pro INCR / DECR / EXPIRE and the free-account
- * allowance's atomic three-key EVAL. The counter is the unit-under-test for
- * reservation semantics — read it after dispatch to assert the stored floor.
+ * In-memory pipeline stub over Pro INCR / DECR / EXPIRE, the Pro daily
+ * quota's atomic two-key EVAL, and the free-account allowance's atomic
+ * three-key EVAL. The counter is the unit-under-test for reservation
+ * semantics — read it after dispatch to assert the stored floor.
  *
  * Options:
- *   initialCount  pre-seed the counter (simulates prior calls today)
- *   throwOnIncr   make every pipeline containing an INCR reject (probe path)
- *   throwOnEval   make every pipeline containing an EVAL reject (atomic free
- *                 allowance path)
- *   decrFails     make every pipeline containing a DECR reject (rollback
- *                 failure path — overshoots the floor, never undershoots)
+ *   initialCount      pre-seed the counter (simulates prior calls today)
+ *   initialLimitFloor max successful limit already charged today, or -1
+ *                     after an unlimited reserve; omit for none
+ *   throwOnIncr       make every pipeline containing an INCR, or the 2-key
+ *                     reserveQuota EVAL, reject (Redis-unavailable path)
+ *   throwOnEval       make every pipeline containing an EVAL reject (atomic free
+ *                     allowance path)
+ *   decrFails         make every pipeline containing a DECR reject (rollback
+ *                     failure path — overshoots the floor, never undershoots)
  */
-export function makePipelineMock({ initialCount = 0, throwOnIncr = false, throwOnEval = false, decrFails = false } = {}) {
+export function makePipelineMock({
+  initialCount = 0,
+  initialLimitFloor = null,
+  throwOnIncr = false,
+  throwOnEval = false,
+  decrFails = false,
+} = {}) {
   let counter = initialCount;
+  let limitFloor = initialLimitFloor;
   let freeRequestCount = 0;
   let freeLastActivity = null;
   let freeLastActivityExpiresAt = null;
   const ops = [];
   const pipeline = async (commands) => {
     ops.push(commands);
-    if (throwOnIncr && commands.some((c) => c[0] === 'INCR')) {
+    if (throwOnIncr && commands.some((c) => (
+      c[0] === 'INCR' || (c[0] === 'EVAL' && Number(c[2]) === 2)
+    ))) {
       throw new Error('redis pipeline failed');
     }
     if (throwOnEval && commands.some((c) => c[0] === 'EVAL')) {
@@ -76,11 +92,47 @@ export function makePipelineMock({ initialCount = 0, throwOnIncr = false, throwO
               : Math.max(0, freeLastActivityExpiresAt - Date.now()),
           ],
         });
+      } else if (cmd[0] === 'EVAL' && Number(cmd[2]) === 2) {
+        // reserveQuota: INCR + owner-only reject/clamp in one turn, matching
+        // api/mcp/quota.ts RESERVE_QUOTA_SCRIPT. ARGV[1] empty = unlimited.
+        // limitFloor (-1 = unlimited seen) is the clamp floor.
+        const limitRaw = cmd[5];
+        const unlimited = limitRaw === '' || limitRaw === undefined || limitRaw === null;
+        const limit = unlimited ? null : Number(limitRaw);
+        // ARGV[3] is the per-tool weight. Mirror the script's INCRBY: charging 1
+        // here regardless made a weight-2 call look like it had reserved less
+        // than it charged, which reserveQuota reads as a Redis fault (503).
+        const weightRaw = Number(cmd[7]);
+        const weight = Number.isFinite(weightRaw) && weightRaw >= 1 ? weightRaw : 1;
+        counter += weight;
+        const reserved = counter;
+        if (unlimited) {
+          limitFloor = -1;
+          out.push({ result: [1, reserved] });
+        } else if (!Number.isFinite(limit) || limit < 0) {
+          counter = Math.max(0, counter - weight);
+          out.push({ result: [-1, 0] });
+        } else if (reserved <= limit) {
+          if (limitFloor !== -1 && (limitFloor === null || limit > limitFloor)) {
+            limitFloor = limit;
+          }
+          out.push({ result: [1, reserved] });
+        } else {
+          counter = Math.max(0, counter - weight);
+          if (limitFloor !== -1) {
+            const clampTo = limitFloor !== null && limitFloor > limit ? limitFloor : limit;
+            if (counter > clampTo) counter = clampTo;
+          }
+          out.push({ result: [0, counter] });
+        }
       } else if (cmd[0] === 'INCR') {
         counter += 1;
         out.push({ result: counter });
       } else if (cmd[0] === 'DECR') {
         counter = Math.max(0, counter - 1);
+        out.push({ result: counter });
+      } else if (cmd[0] === 'DECRBY') {
+        counter = Math.max(0, counter - Number(cmd[2] ?? 1));
         out.push({ result: counter });
       } else if (cmd[0] === 'EXPIRE') {
         out.push({ result: 1 });
@@ -94,6 +146,7 @@ export function makePipelineMock({ initialCount = 0, throwOnIncr = false, throwO
     pipeline,
     ops,
     get count() { return counter; },
+    get limitFloor() { return limitFloor; },
   };
 }
 

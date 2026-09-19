@@ -38,6 +38,7 @@ import {
   BUNDLE_COMPLETION_META_KEY_ENV,
   GRACEFUL_FETCH_FAILURE_EXIT_CODE,
   loadEnvFile,
+  PUBLISH_BLOCKED_EXIT_CODE,
 } from './_seed-utils.mjs';
 import { unwrapEnvelope } from './_seed-envelope-source.mjs';
 
@@ -77,6 +78,35 @@ async function readRedisKey(key) {
     return body.result ? JSON.parse(body.result) : null;
   } catch {
     return null;
+  }
+}
+
+export const SOURCE_RETRY_CLAIM_SCRIPT = [
+  "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end",
+  "redis.call('SET', KEYS[1], ARGV[2], 'XX', 'KEEPTTL')",
+  'return 1',
+].join('\n');
+
+async function claimSourceRetry(claim) {
+  if (!REDIS_URL || !REDIS_TOKEN) return false;
+  try {
+    const response = await fetch(REDIS_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${REDIS_TOKEN}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'worldmonitor-bundle-runner/1.0',
+      },
+      body: JSON.stringify([
+        'EVAL',
+        SOURCE_RETRY_CLAIM_SCRIPT,
+        1, claim.key, claim.previousValue, claim.nextValue,
+      ]),
+      signal: AbortSignal.timeout(REDIS_READ_TIMEOUT_MS),
+    });
+    return response.ok && (await response.json()).result === 1;
+  } catch {
+    return false;
   }
 }
 
@@ -129,7 +159,7 @@ async function writeBundleHeartbeat(label) {
 /**
  * Read section freshness for the interval gate.
  *
- * Returns `{ fetchedAt }` or null. A declared `freshnessMetaKey` is authoritative
+ * Returns `{ fetchedAt, retryAt?, retryClaim? }` or null. A declared `freshnessMetaKey` is authoritative
  * for sources whose canonical envelope may be republished from retained
  * last-good data. When `completionMetaKey` is also declared, its timestamp must
  * be at or after source transport success; an older completion belongs to a
@@ -148,6 +178,20 @@ async function writeBundleHeartbeat(label) {
  * mark them due on every tick — the #6806 failure this must not reintroduce.
  */
 export async function readSectionFreshness(section, readKey = readRedisKey) {
+  // Opt-in, per the invariant above: a section that declares no
+  // `expectedSourceVersion` keeps its pre-migration clock byte-for-byte,
+  // error markers included. The error-marker check exists only so a FAILED
+  // migration cannot claim success — seed-owid-energy-mix's failure path
+  // writes a fresh `fetchedAt` under the NEW sourceVersion, so without it the
+  // gate would pass on the very run it must reject. Applying that check to
+  // every section instead would strip the fresh-fetchedAt backoff that
+  // sections like Resilience-Static (90-day interval) rely on, making them due
+  // on every tick — the #6806 failure this docstring forbids.
+  const isErrorMarker = (meta) => meta?.status === 'error' || meta?.state === 'ERROR';
+  const acceptsVersion = (meta) => (
+    !section.expectedSourceVersion
+    || (!isErrorMarker(meta) && meta?.sourceVersion === section.expectedSourceVersion)
+  );
   if (section.freshnessMetaKey) {
     if (section.requireCanonical && section.canonicalKey) {
       const canonical = await readKey(section.canonicalKey);
@@ -155,7 +199,7 @@ export async function readSectionFreshness(section, readKey = readRedisKey) {
     }
     const raw = await readKey(section.freshnessMetaKey);
     const meta = unwrapEnvelope(raw).data;
-    if (!Number.isFinite(meta?.fetchedAt)) return null;
+    if (!Number.isFinite(meta?.fetchedAt) || !acceptsVersion(meta)) return null;
     if (!section.completionMetaKey) return { fetchedAt: meta.fetchedAt };
     const completionRaw = await readKey(section.completionMetaKey);
     const completion = unwrapEnvelope(completionRaw).data;
@@ -171,6 +215,7 @@ export async function readSectionFreshness(section, readKey = readRedisKey) {
     const raw = await readKey(section.canonicalKey);
     const { _seed } = unwrapEnvelope(raw);
     if (_seed?.fetchedAt) {
+      if (!acceptsVersion(_seed)) return null;
       if (!section.completionMetaKey) return { fetchedAt: _seed.fetchedAt };
       const completionRaw = await readKey(section.completionMetaKey);
       const completion = unwrapEnvelope(completionRaw).data;
@@ -191,7 +236,32 @@ export async function readSectionFreshness(section, readKey = readRedisKey) {
     // Legacy seed-meta is `{ fetchedAt, recordCount, sourceVersion }` at top
     // level. It has no `_seed` wrapper so unwrapEnvelope returns it as data.
     const meta = unwrapEnvelope(raw).data;
-    if (meta?.fetchedAt) return { fetchedAt: meta.fetchedAt };
+    if (meta?.fetchedAt && acceptsVersion(meta)) {
+      const freshness = { fetchedAt: meta.fetchedAt };
+      if (raw === meta && section.sourceRetryMetaKey && Number.isFinite(section.sourceRetryDelayMs) && section.sourceRetryDelayMs > 0) {
+        const source = unwrapEnvelope(await readKey(section.sourceRetryMetaKey)).data;
+        const firstAt = source?.firstSourceFailureAt;
+        if (
+          source?.sourceState === 'degraded' && source.stale === true
+          && Number.isInteger(source.recordCount) && source.recordCount > 0
+          && Number.isFinite(source.fetchedAt) && source.fetchedAt > 0
+          && Number.isFinite(firstAt) && firstAt > source.fetchedAt
+          && source.lastSourceAttemptAt === firstAt && source.consecutiveSourceFailures === 1
+          && typeof source.errorCode === 'string' && source.errorCode.length > 0
+          && source.lastSourceFailureCode === source.errorCode
+          && Number.isFinite(meta.fetchedAt) && firstAt <= meta.fetchedAt && meta.fetchedAt <= Date.now()
+          && meta.sourceRetryClaimedFor == null
+        ) {
+          freshness.retryAt = firstAt + section.sourceRetryDelayMs;
+          freshness.retryClaim = {
+            key: `seed-meta:${section.seedMetaKey}`,
+            previousValue: JSON.stringify(raw),
+            nextValue: JSON.stringify({ ...meta, sourceRetryClaimedFor: firstAt }),
+          };
+        }
+      }
+      return freshness;
+    }
   }
   return null;
 }
@@ -362,6 +432,17 @@ function spawnSeed(scriptPath, { timeoutMs, label, bundleStartedAtMs, completion
           status: 'GRACEFUL_FAIL',
           reason: `graceful fetch failure (exit ${GRACEFUL_FETCH_FAILURE_EXIT_CODE})`,
         });
+      } else if (code === PUBLISH_BLOCKED_EXIT_CODE) {
+        // #6396: exit 0 must mean "the keys were written". A member whose
+        // coverage gate refused to publish — after preserving the last-good
+        // TTL — signals it with this dedicated code so the summary can never
+        // report OK for a section that wrote no seed-meta.
+        settle({
+          elapsed,
+          ok: false,
+          status: 'PUBLISH_BLOCKED',
+          reason: `coverage gate refused to publish (exit ${PUBLISH_BLOCKED_EXIT_CODE})`,
+        });
       } else {
         settle({ elapsed, ok: false, reason: `exit ${code ?? 'null'}${signal ? ` (signal ${signal})` : ''}` });
       }
@@ -375,6 +456,8 @@ function spawnSeed(scriptPath, { timeoutMs, label, bundleStartedAtMs, completion
  *   label: string,
  *   script: string,
  *   seedMetaKey?: string,    // legacy (pre-contract); reads `seed-meta:<key>`
+ *   sourceRetryMetaKey?: string, // opt-in source-attempt meta for legacy completion gates
+ *   sourceRetryDelayMs?: number, // one early retry after the first failed attempt
  *   freshnessMetaKey?: string, // authoritative explicit seed-meta key
  *   canonicalKey?: string,   // PR 2+: reads envelope from the canonical data key
  *   completionMetaKey?: string, // full key written LAST by the run; must not
@@ -385,7 +468,7 @@ function spawnSeed(scriptPath, { timeoutMs, label, bundleStartedAtMs, completion
  *   dependsOn?: string[],    // labels that MUST run earlier in the array
  *   requiredEnv?: string[],  // deployment config required before any section runs
  * }>} sections
- * @param {{ maxBundleMs?: number, prefetchFreshness?: boolean }} [opts]
+ * @param {{ maxBundleMs?: number, prefetchFreshness?: boolean, onTerminalComplete?: () => Promise<void> | void }} [opts]
  */
 /**
  * Env var carrying the per-member kill switch for a bundle, e.g.
@@ -404,6 +487,9 @@ export function disabledMembersFromEnv(label, env = process.env) {
 }
 
 export async function runBundle(label, sections, opts = {}) {
+  if (opts.onTerminalComplete != null && typeof opts.onTerminalComplete !== 'function') {
+    throw new Error(`[Bundle:${label}] onTerminalComplete must be a function`);
+  }
   for (const section of sections) {
     if (
       section.canonicalKey
@@ -565,7 +651,7 @@ export async function runBundle(label, sections, opts = {}) {
     ))))
     : null;
 
-  let ran = 0, skipped = 0, deferred = 0, failed = 0, gracefulFailed = 0, stalled = 0;
+  let ran = 0, skipped = 0, deferred = 0, failed = 0, gracefulFailed = 0, stalled = 0, publishBlocked = 0;
 
   let disabled = 0;
   for (const section of sections) {
@@ -594,9 +680,13 @@ export async function runBundle(label, sections, opts = {}) {
     const freshness = freshnessByLabel
       ? freshnessByLabel.get(section.label) || null
       : await readSectionFreshness(section);
+    let earlyRetry = false;
     if (freshness?.fetchedAt) {
-      const elapsed = Date.now() - freshness.fetchedAt;
-      if (elapsed < section.intervalMs * 0.8) {
+      const now = Date.now();
+      const elapsed = now - freshness.fetchedAt;
+      const retryDue = Number.isFinite(freshness.retryAt) && now >= freshness.retryAt;
+      earlyRetry = elapsed < section.intervalMs * 0.8 && retryDue;
+      if (elapsed < section.intervalMs * 0.8 && !retryDue) {
         const agoMin = Math.round(elapsed / 60_000);
         const intervalMin = Math.round(section.intervalMs / 60_000);
         console.log(`  [${section.label}] Skipped, last seeded ${agoMin}min ago (interval: ${intervalMin}min)`);
@@ -610,7 +700,7 @@ export async function runBundle(label, sections, opts = {}) {
     // and need SIGKILL after grace). Admit only when the full worst-case fits.
     // Shared with the startup check so the two can never disagree about which
     // sections are admittable.
-    const worstCase = sectionWorstCaseMs(section);
+    const worstCase = sectionWorstCaseMs(section) + (earlyRetry ? REDIS_READ_TIMEOUT_MS : 0);
     if (elapsedBundle + worstCase > maxBundleMs) {
       const remainingSec = Math.max(0, Math.round((maxBundleMs - elapsedBundle) / 1000));
       const needSec = Math.round(worstCase / 1000);
@@ -630,6 +720,12 @@ export async function runBundle(label, sections, opts = {}) {
         );
         stalled++;
       }
+      continue;
+    }
+
+    if (earlyRetry && !await claimSourceRetry(freshness.retryClaim)) {
+      console.warn(`  [${section.label}] Early recovery not claimed; keeping normal admission`);
+      skipped++;
       continue;
     }
 
@@ -672,6 +768,7 @@ export async function runBundle(label, sections, opts = {}) {
       // "Deploy Crashed!") over a benign per-member skip. Track it separately so
       // only HARD failures gate the exit code; the skip stays fully logged above.
       if (status === 'GRACEFUL_FAIL') gracefulFailed++;
+      else if (status === 'PUBLISH_BLOCKED') publishBlocked++;
       else failed++;
     }
   }
@@ -683,7 +780,11 @@ export async function runBundle(label, sections, opts = {}) {
   // rides along at the tail for the same reason: it is the starvation signal
   // #6562 item 4 exists to surface.
   const disabledField = disabled > 0 ? ` disabled:${disabled}` : '';
-  console.log(`[Bundle:${label}] Finished in ${totalSec}s, ran:${ran} skipped:${skipped} deferred:${deferred}${disabledField} failed:${failed} graceful:${gracefulFailed} stalled:${stalled}`);
+  // publish_blocked appends ONLY when non-zero, like `disabled:` above, so
+  // the documented summary line stays byte-identical for bundles without gate
+  // refusals (#6396).
+  const publishBlockedField = publishBlocked > 0 ? ` publish_blocked:${publishBlocked}` : '';
+  console.log(`[Bundle:${label}] Finished in ${totalSec}s, ran:${ran} skipped:${skipped} deferred:${deferred}${disabledField} failed:${failed} graceful:${gracefulFailed} stalled:${stalled}${publishBlockedField}`);
   // A tick that completed no section while deferring a due one accomplished
   // nothing AND shed work. Deferral only pays for itself if the deferred
   // section runs on a later tick, so this state repeating is a stalled
@@ -707,6 +808,7 @@ export async function runBundle(label, sections, opts = {}) {
   // with a graceful skip, where real work published and one source blipped. A
   // tick that published NOTHING has no successful work to vouch for it.
   const starvedTick = ran === 0 && deferred > 0;
+  const exitsNonZero = failed > 0 || starvedTick || stalled > 0;
   if (starvedTick) {
     console.error(
       `[Bundle:${label}] ran:0 while ${deferred} due section(s) were deferred — this tick published nothing and shed work. `
@@ -728,5 +830,29 @@ export async function runBundle(label, sections, opts = {}) {
     // independently by the /api/health freshness monitor keyed on seed-meta TTL.
     console.log(`[Bundle:${label}] ${gracefulFailed} graceful fetch skip(s), no hard failures — no data lost, exiting 0 (not a crash)`);
   }
-  process.exit(failed > 0 || starvedTick || stalled > 0 ? 1 : 0);
+  if (!exitsNonZero && publishBlocked > 0) {
+    // #6396: a gate refusal is not a crash — the member verified preservation
+    // of the last-good snapshot before exiting, and the freshness monitor
+    // alarms if the refusal persists. What changed versus the old exit-0
+    // silence is that the per-section line and summary now say so.
+    console.log(`[Bundle:${label}] ${publishBlocked} publish-blocked section(s) preserved last-good and wrote no seed keys — exiting 0; the freshness monitor owns the alarm`);
+  }
+  let terminalHookFailed = false;
+  // Reaching this point means the tick completed and emitted its terminal
+  // summary, even when a child failed or due work was deferred. Scheduler
+  // cursors must advance for those completed invocations so a persistently
+  // failing lead member cannot monopolize the next tick. Early throws and
+  // interrupted processes never reach this hook, so their leased turn remains
+  // available for safe replay after expiry.
+  if (opts.onTerminalComplete) {
+    try {
+      await opts.onTerminalComplete();
+    } catch (error) {
+      terminalHookFailed = true;
+      console.error(
+        `[Bundle:${label}] terminal completion hook failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  process.exit(exitsNonZero || terminalHookFailed ? 1 : 0);
 }

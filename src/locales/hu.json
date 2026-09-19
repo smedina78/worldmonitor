@@ -188,7 +188,8 @@
       "activeSirens": "Aktív szirénák",
       "sirens24h": "Szirénák / 24h",
       "aviationDisruptions": "Repülési zavarok",
-      "gpsJammingZones": "GPS-zavar zónák"
+      "gpsJammingZones": "GPS-zavar zónák",
+      "temporalUnavailable": "Időbeli megfigyelések nem érhetők el"
     },
     "fallback": {
       "instabilityIndex": "**Instabilitási index: {{score}}/100** ({{level}}, {{trend}})",
@@ -261,7 +262,7 @@
       "decisionSignalsUnavailable": "Kína döntési jeleinek pillanatképe jelenleg nem érhető el."
     },
     "foodStocks": "Food stocks",
-    "foodStocksHelp": "USDA PSD commodity stocks-to-use by marketing year, with the world ratio alongside for context. FAOSTAT fills production only where PSD has no country coverage.",
+    "foodStocksHelp": "USDA PSD commodity stocks-to-use by marketing year, with the world ratio alongside for context. FAOSTAT Food Balances supplies production and domestic supply when PSD has no complete country balance.",
     "loadingFoodStocks": "Loading food stocks…",
     "foodStocksUnavailable": "Food stocks unavailable.",
     "foodStocksProLocked": "Upgrade to PRO for commodity stocks-to-use",
@@ -301,6 +302,71 @@
       "manufacturingShare": "Manufacturing employment",
       "source": "Sources: {{sources}}.",
       "retained": "{{stage}} data retained from the last successful refresh."
+    },
+    "fiveFactorScorecard": {
+      "title": "Öt tényezős ellenállóképesség-pontszám",
+      "help": "Fagyasztott v1 bizonyítékpontszámok élelmiszer, energia, demográfia, technológia és védelem terén. Bontsa ki a sort a bemenetek, az adatforrás eredete és a hiányzó adatok okainak megtekintéséhez.",
+      "loading": "Öt tényezős pontszám betöltése…",
+      "unavailable": "Öt tényezős pontszám nem érhető el.",
+      "proLocked": "Frissítsen PRO-ra az öt tényezős ellenállóképesség-pontszámért",
+      "insufficient": "Nem elegendő adat",
+      "notAvailable": "Nem érhető el",
+      "noEvidence": "Nincs elérhető bizonyíték erre a pillérre.",
+      "score": "{{score}}/5",
+      "coverage": "{{coverage}}% lefedettség",
+      "methodologyVersion": "Módszertan v{{version}}",
+      "methodologyLink": "Metodológia megtekintése",
+      "pillars": {
+        "food": "Élelmiszer",
+        "energy": "Energia",
+        "demographics": "Demográfia",
+        "technology": "Teknoloógia",
+        "defense": "Védelem"
+      },
+      "reasons": {
+        "source-unavailable": "Forrás nem érhető el",
+        "country-unavailable": "Ország nem érhető el",
+        "invalid-value": "Érvénytelen forrásérték",
+        "stale": "A bizonyíték elavult",
+        "coverage-below-floor": "A lefedettség a pontozási alsó határ alatt van",
+        "required-group-missing": "Kötelező bizonyítékcsoport hiányzik",
+        "missing-population": "Népesség nem érhető el",
+        "redistribution-blocked": "A forrás újraelosztása nem engedélyezett",
+        "pillar-unavailable": "Tartóoszlop nem érhető el"
+      },
+      "inputs": {
+        "population": "Population",
+        "food_productionBalance": "Előállítási egyensúly",
+        "food_stocksToUse": "Felhasználható készletek",
+        "food_waterSecurity": "Vízbiztonság",
+        "food_importDiversity": "Import diverzitás",
+        "energy_productionBalance": "Előállítási egyensúly",
+        "energy_lowCarbonShare": "Alacsony szén-dioxid-kibocsátású energia aránya",
+        "energy_gridEfficiency": "Hálózati hatékonyság",
+        "demographics_totalDependency": "Össz függőség",
+        "demographics_oldAgeDependency": "Öregségi függőség",
+        "demographics_workingAgeProjection": "Munkaképes korúak előrejelzése",
+        "demographics_tertiaryEnrollment": "Felsőfokú képzésben résztvevők aránya",
+        "demographics_researchersPerMillion": "Kutatók száma millió lakosra",
+        "demographics_stemGraduateShare": "STEM végzettségűek aránya",
+        "demographics_trainedIndustrialShare": "Képzett ipari munkatermelők aránya",
+        "demographics_manufacturingEmploymentShare": "Gyártási foglalkoztatottság aránya",
+        "technology_internetUse": "Internet-használat",
+        "technology_mobileSubscriptions": "Mobil-előfizetések",
+        "technology_fixedBroadband": "Rögzített szélessáv",
+        "technology_rdSpend": "Kutatási és fejlesztési kiadások",
+        "technology_researchersPerMillion": "Kutatók száma millió lakosra",
+        "technology_stemGraduateShare": "STEM végzettségűek aránya",
+        "technology_electricityAccess": "Áramellátás hozzáférhetősége",
+        "defense_expenditureUsd": "Katonai kiadások",
+        "defense_expenditurePctGdp": "Katonai teher",
+        "defense_personnel": "Fegyveres erők létszáma",
+        "defense_industrialBalance": "Védelmi ipari egyensúly",
+        "defense_supplierDiversity": "Fegyverbeszállítók sokszínűsége"
+      }
+    },
+    "defenseIndustrialBase": {
+      "proLocked": "Frissítsen PRO verzióra a fegyverszállító függőségek és katonai kapacitások megtekintéséhez"
     }
   },
   "header": {
@@ -599,6 +665,8 @@
       "recent": "Legutóbbi keresések",
       "empty": "Adatok keresése vagy parancsok futtatása",
       "noResults": "Nincs találat",
+      "resultAnnouncement_one": "{{count}} találat erre: {{query}}",
+      "resultAnnouncement_other": "{{count}} találat erre: {{query}}",
       "commands": "Parancsok",
       "results": "Eredmények",
       "seeAllCommands": "Összes parancs megtekintése",
@@ -857,7 +925,6 @@
   "components": {
     "webcams": {
       "paused": "Webkamerák szüneteltetve",
-      "pausedIdle": "Webkamerák szüneteltetve — mozgassa az egeret a folytatáshoz",
       "regions": {
         "all": "ÖSSZES",
         "mideast": "KÖZEL-KELET",
@@ -1016,7 +1083,8 @@
       "refineryStage": "Refine",
       "stageUnavailable": "No published figures for this stage",
       "withheldNote": "W withheld",
-      "productionCaption": "Country shares of actual production. The map deposits layer shows where resources sit; this table shows who mines or refines them."
+      "productionCaption": "Country shares of actual production. The map deposits layer shows where resources sit; this table shows who mines or refines them.",
+      "productionProLocked": "Frissítsen PRO verzióra a bányák és finomítók országonkénti részesedésének és koncentrációjának (HHI) megtekintéséhez szakaszonként"
     },
     "tradePolicy": {
       "overview": "Áttekintés",
@@ -1250,9 +1318,6 @@
       "datacenter": "Adatközpont",
       "base": "Bázis",
       "nuclear": "Nukleáris"
-    },
-    "community": {
-      "joinDiscussion": "Alakítsd meg a jövőt"
     },
     "threatLabels": {
       "critical": "KRI",
@@ -1563,7 +1628,10 @@
       "provenanceTitle": "Lefedettség eredete: hány feldolgozott történetből és különálló forrásból választotta ki ezt az összefoglalót",
       "compiledFrom": "{{stories}} történetből és {{sources}} forrásból összeállítva",
       "briefFreshness": "Generálva {{minutes}}m idővel ezelőtt · legfrissebb forrás {{hours}}ó régi",
-      "briefStoryDetails": "Story details ({{count}})"
+      "briefStoryDetails": "A hír részletei ({{count}})",
+      "streamIdleStopLabel": "Élő videó leállítása üresjárat során",
+      "streamIdleStopDesc": "Az Élő Hírek és Élő Webkamerák leállnak ennyi idő után inaktivitás esetén, és egy értesítés jelenik meg a panelen.",
+      "streamIdleStopNever": "Soha"
     },
     "settings": {
       "exportSettings": "Beállítások exportálása",
@@ -1892,6 +1960,16 @@
       "loading": "Csatlakozás a Telegram relé-hez...",
       "empty": "Nincsenek elérhető üzenetek",
       "disabled": "A Telegram relé nem aktív",
+      "watchlistPlaceholder": "Nyilvános csatorna hozzáadása @username alapján",
+      "resolving": "Csatorna keresése...",
+      "invalidUsername": "Nyilvános Telegram-@username szükséges",
+      "resolveFailed": "A csatorna nem található",
+      "watchlistLimit": "Legfeljebb {{count}} egyéni csatornát követhetsz",
+      "previewMembers": "{{count}} tag",
+      "addChannel": "Csatorna hozzáadása",
+      "added": "Hozzáadva",
+      "remove": "Eltávolítás",
+      "custom": "Egyéni",
       "filterAll": "Összes",
       "filterBreaking": "Friss hír",
       "filterConflict": "Konfliktus",
@@ -2039,6 +2117,22 @@
       "metals": {
         "gold": "Gold",
         "silver": "Silver"
+      },
+      "divergence": {
+        "compositeValue": "Fizikai stresszindex: {{value}} / 100",
+        "fiveDayTrend": "Öt kereskedési napos prémium trend",
+        "regimes": {
+          "normal": "Normál",
+          "elevated": "Emelt",
+          "stressed": "Stresszos",
+          "extreme": "Szélsőséges"
+        },
+        "states": {
+          "insufficientHistory": "Melegítés: {{count}} / {{required}} kereskedési pont",
+          "staleInput": "Fizikai benchmark elavult",
+          "missingInput": "Divergencia jel nem elérhető"
+        },
+        "twentyDayTrend": "Húsz kereskedési napos prémium trend"
       }
     },
     "crypto": {
@@ -2326,6 +2420,26 @@
         "failedToLoad": "Betöltés sikertelen"
       }
     },
+    "supplyVulnerability": {
+      "title": "Árupiaci sebezhetőség",
+      "help": "Az ország árunkénti kitettsége a beszállítói koncentráció, a tengeri tranzit és az elérhető stratégiai tartalékok alapján.",
+      "loading": "Árupiaci sebezhetőség betöltése…",
+      "unavailable": "Az árupiaci sebezhetőségi adatok nem érhetők el",
+      "noCoverage": "Nincs elegendő bizonyíték ehhez az országhoz",
+      "unknown": "Ismeretlen",
+      "concentration": "Koncentráció",
+      "transit": "Tranzit",
+      "buffer": "Tartalék",
+      "sources": "Források",
+      "methodology": "Módszertan",
+      "hormuzTitle": "Árufüggőségek",
+      "dependentCountries": "Függő országok",
+      "dependentCommodities": "Függő áruk",
+      "stateOk": "Aktuális",
+      "stateStale": "Elavult bemenet",
+      "stateInsufficient": "Elégtelen adat",
+      "proLocked": "Frissítsen PRO verzióra az árucikk-sebezhetőségi pontszám megtekintéséhez"
+    },
     "hormuzTracker": {
       "infoTooltip": "<strong>Hormuz Trade Tracker</strong> Élő AIS hajófigyelés a Hormuzi-szoroson keresztül, a világ legkritikusabb olajszűk keresztén. Figyelemmel kíséri a tartályhajó számát, szétszóródási eseményeket és heti áramlásváltozásokat. A globális olajkínálat hozzávetőleg 20%-a napi szinten érkezik itt.",
       "title": "Hormuz Trade Tracker",
@@ -2582,7 +2696,14 @@
       "signals_one": "{{count}} jel",
       "signals_other": "{{count}} jel",
       "analyzing": "Elemzés...",
-      "viewOnMap": "Megtekintés a térképen"
+      "viewOnMap": "Megtekintés a térképen",
+      "waiting": "Várakozás a következő adatfrissítésre. Ez a panel automatikusan frissül.",
+      "offline": "Várakozás a kapcsolatra. Ez a panel automatikusan frissül, amikor újra csatlakozik az internethez.",
+      "updated": "Frissítve {{time}}",
+      "saved": "Utolsó ismert frissítés {{time}} · Frissítések keresése",
+      "savedOffline": "Utolsó ismert frissítés {{time}} · Nincs kapcsolat",
+      "localSignals": "A betöltött irányítópult-jelzések alapján",
+      "emptySaved": "Az utolsó ismert frissítésben nem volt konvergencia."
     },
     "thermalEscalation": {
       "title": "Hőmérsékleti Eszkaláció",
@@ -2732,6 +2853,47 @@
       "rubBase": "Orosz jegybank — rubel 1 egységenként",
       "rubPerUnit": "Rubel egységenként",
       "sourceCbr": "Forrás: Orosz jegybank"
+    },
+    "passkeyOffer": {
+      "title": "Passkey mentése?",
+      "body": "Következő alkalommal ujjlenyomatoddal, arcod felismerésével vagy eszközöd PIN-kódjával jelentkezz be — nincs szükség jelszóra.",
+      "accept": "Passkey mentése",
+      "dismiss": "Később",
+      "close": "Bezárás",
+      "announce": "Mentsen egy passkey-t a gyorsabb bejelentkezéshez.",
+      "busy": "Az eszköz válaszára várakozás…",
+      "succeeded": "Passkey mentve. Használhatod a következő bejelentkezéskor.",
+      "retryable": "Ez nem fejeződött be. Megpróbálhatod újra.",
+      "failed": "Erre az eszközre nem sikerült passkey-t menteni."
+    },
+    "decisionBrief": {
+      "commodityTitle": "Árupiaci döntési összefoglaló",
+      "commodity": "Árucikk / termék",
+      "blockedChokepoint": "Feltételezetten lezárt szűkület",
+      "commodityCapture": "Áru-összehasonlítás rögzítése",
+      "title": "Döntési összefoglaló",
+      "fuel": "Tüzelőanyag",
+      "chokepoint": "Szűk keresztmetszet",
+      "baseline": "Alapeseti zavar",
+      "comparison": "Összehasonlító zavar",
+      "capture": "Mindkettő betöltése / frissítése",
+      "downloadHtml": "Összefoglaló letöltése HTML-ben",
+      "downloadJson": "Összefoglaló letöltése JSON-ban",
+      "back": "← Vissza az országjelentéshez",
+      "select": "Válasszon energiaellátási zavart, majd töltse be mindkét forgatókönyvet.",
+      "changed": "A kiválasztás módosult. Exportálás előtt töltse be mindkét forgatókönyvet.",
+      "loading": "Mindkét forgatókönyv betöltése…",
+      "captured": "Betöltve. Letöltés előtt ellenőrizze a megfigyelési dátumokat és a korlátokat.",
+      "failed": "Nem sikerült betölteni a forgatókönyveket. Ellenőrizze hozzáférését, és próbálja újra. Nincs exportálható eredmény.",
+      "locked": "A döntési összefoglaló Pro csomaggal érhető el."
+    },
+    "liveMedia": {
+      "idleStatus": "Szüneteltetve az inaktivitás miatt",
+      "idleBody": "Az élő videó leállítva {{duration}} után egér-, billentyűzet- vagy érintésaktivitás hiányában.",
+      "idleResume": "Folytatás",
+      "idleKeepPlaying": "Élő videó lejátszása üresjárat során",
+      "idleSettingsHint": "Ezt bármikor módosíthatja a Beállítások › Média menüben.",
+      "idleKeepPlayingToast": "Az élő videó üresjárat során is lejátszódik. Módosítása a Beállítások › Média menüben."
     }
   },
   "popups": {
@@ -2774,10 +2936,10 @@
       "highSeverity": "Magas súlyosság"
     },
     "gpsJamming": {
-      "title": "GPS/GNSS zavar",
-      "navPerformance": "Navigációs teljesítmény",
-      "samples": "ADS-B minták",
-      "aircraft": "Repülőgép",
+      "title": "GPS/GNSS-interferencia",
+      "navPerformance": "Érintett légijárművek",
+      "samples": "Érintett légijárművek száma",
+      "aircraft": "Az észlelt légijárművek teljes száma",
       "h3Hex": "H3 Hex"
     },
     "flight": {
@@ -3444,7 +3606,8 @@
   "auth": {
     "signIn": "Bejelentkezés",
     "createAccount": "Fiók létrehozása",
-    "settings": "Beállítások"
+    "settings": "Beállítások",
+    "passkeyOffer": {}
   },
   "mcp": {
     "connectPanel": "MCP csatlakoztatása",

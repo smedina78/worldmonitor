@@ -189,12 +189,6 @@ const stubSources: Record<string, string> = {
       fn({ addBreadcrumb: () => {}, captureMessage: () => {}, captureException: () => {} });
     }
   `,
-  'dodopayments-checkout': `
-    export const DodoPayments = {
-      Initialize() {},
-      Checkout: { isOpen: () => false, close: () => {}, open: () => {} },
-    };
-  `,
   // The one behavioural knob: which runtime the case is asserting. The real
   // detector has its own coverage in tests/desktop-external-handoff.test.mts,
   // which drives it from a synthesised Tauri window.
@@ -211,7 +205,9 @@ const stubSources: Record<string, string> = {
     export const openSignIn = () => {};
   `,
   './analytics': `
-    export const trackCheckoutStart = () => {};
+    export const trackCheckoutStart = (_productId, _authed, surface, _attribution, context) => (
+      context ?? { eventSurface: surface, origin: { kind: 'dashboard' } }
+    );
   `,
   './auth-state': `
     export const subscribeAuthState = () => () => {};
@@ -250,11 +246,6 @@ const stubSources: Record<string, string> = {
   `,
   './checkout-plan-names': `
     export const resolvePlanDisplayName = () => 'Pro';
-  `,
-  './entitlement-watchdog': `
-    export function createEntitlementWatchdog() {
-      return { start: () => {}, stop: () => {}, isActive: () => false };
-    }
   `,
 };
 
@@ -350,7 +341,10 @@ describe('startCheckout on desktop (#5911)', () => {
     const harness = globalThis.__desktopCheckoutHarness;
     assert.deepEqual(harness.assignedUrls, [], 'the app must not be replaced by /pro');
     assert.deepEqual(harness.invocations, [
-      { command: 'open_url', payload: { url: 'https://worldmonitor.app/pro' } },
+      {
+        command: 'open_url',
+        payload: { url: 'https://worldmonitor.app/pro?wm_checkout_handoff=desktop' },
+      },
     ]);
   });
 
@@ -365,7 +359,10 @@ describe('startCheckout on desktop (#5911)', () => {
     const harness = globalThis.__desktopCheckoutHarness;
     assert.deepEqual(harness.assignedUrls, []);
     assert.deepEqual(harness.invocations, [
-      { command: 'open_url', payload: { url: 'https://worldmonitor.app/pro' } },
+      {
+        command: 'open_url',
+        payload: { url: 'https://worldmonitor.app/pro?wm_checkout_handoff=desktop' },
+      },
     ]);
   });
 

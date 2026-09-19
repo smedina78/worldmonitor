@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { afterEach, describe, it } from 'node:test';
+import { afterEach, beforeEach, describe, it } from 'node:test';
 
 import { callLlm, callLlmReasoning, callLlmReasoningStream, getLlmAttemptTimeoutMs } from '../server/_shared/llm.ts';
 import { __testing__ as llmHealth, isModelUsable } from '../server/_shared/llm-health.ts';
@@ -42,6 +42,82 @@ afterEach(() => {
 
   if (originalLlmApiKey === undefined) delete process.env.LLM_API_KEY;
   else process.env.LLM_API_KEY = originalLlmApiKey;
+});
+
+describe('callLlmReasoningStream error bodies', () => {
+  beforeEach(() => {
+    process.env.OPENROUTER_API_KEY = 'or-test-key';
+    process.env.LLM_REASONING_PROVIDER = 'openrouter';
+    delete process.env.LLM_REASONING_MODEL;
+    delete process.env.GROQ_API_KEY;
+    delete process.env.OLLAMA_API_URL;
+    delete process.env.LLM_API_URL;
+    delete process.env.LLM_API_KEY;
+  });
+
+  for (const mode of ['oversized', 'stalled', 'cancelled'] as const) {
+    it(`bounds ${mode} provider error reads without losing fallback diagnostics`, async (t) => {
+      const originalWarn = console.warn;
+      const warnings: string[] = [];
+      console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+      t.after(() => { console.warn = originalWarn; });
+      let attempts = 0;
+      let cancelled = false;
+      let aborted = false;
+      let rescued = false;
+      let ready!: () => void;
+      const bodyStarted = new Promise<void>((resolve) => { ready = resolve; });
+      let rescueTimer: ReturnType<typeof setTimeout>;
+      t.after(() => { clearTimeout(rescueTimer); });
+      const diagnostic = `REGION_BLOCK ${'x'.repeat(4000)}`;
+
+      globalThis.fetch = async (_input, init) => {
+        if ((init?.method || 'GET') === 'GET') return new Response('');
+        attempts += 1;
+        if (attempts > 1) {
+          return new Response('data: {"choices":[{"delta":{"content":"fallback"}}]}\n\ndata: [DONE]\n\n');
+        }
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            if (mode === 'oversized') controller.enqueue(new TextEncoder().encode(diagnostic));
+            // Release a broken implementation so the regression fails instead of hanging.
+            rescueTimer = setTimeout(() => { rescued = true; controller.close(); }, 500);
+            init?.signal?.addEventListener('abort', () => {
+              aborted = true;
+              clearTimeout(rescueTimer);
+              controller.error(new DOMException('Aborted', 'AbortError'));
+            }, { once: true });
+            ready();
+          },
+          cancel() { cancelled = true; clearTimeout(rescueTimer); },
+        });
+        return new Response(body, { status: 503 });
+      };
+
+      const stream = callLlmReasoningStream({
+        messages: [{ role: 'user', content: 'synthetic prompt' }],
+        timeoutMs: mode === 'stalled' ? 20 : 2000,
+      });
+      if (mode === 'cancelled') {
+        await bodyStarted;
+        await stream.cancel();
+        await new Promise<void>((resolve) => { setImmediate(resolve); });
+        assert.equal(aborted, true, 'client cancellation must abort the provider body');
+        assert.equal(attempts, 1, 'client cancellation must not start a fallback');
+        return;
+      }
+      const output = await new Response(stream).text();
+      assert.equal(rescued, false, 'fallback must not wait for the safety release');
+      assert.equal(attempts, 2);
+      assert.match(output, /"delta":"fallback"/);
+      assert.match(output, /"done":true/);
+      if (mode === 'stalled') assert.equal(aborted, true, 'request timeout must cover the error body');
+      else {
+        assert.equal(cancelled, true, 'oversized body must be cancelled after the prefix');
+        assert.ok(warnings.some((line) => line.endsWith(`body=${diagnostic.slice(0, 300)}`)));
+      }
+    });
+  }
 });
 
 describe('callLlm', () => {
@@ -160,6 +236,39 @@ describe('callLlm', () => {
     ]);
     // Utility calls must not pay reasoning tokens on hybrid-reasoning models.
     assert.deepEqual(postBodies[0]?.reasoning, { enabled: false });
+  });
+
+  it('sends Groq reasoning effort only for compatible model overrides', async () => {
+    process.env.GROQ_API_KEY = 'groq-test-key';
+    delete process.env.OPENROUTER_API_KEY;
+    delete process.env.OLLAMA_API_URL;
+    delete process.env.LLM_API_URL;
+    delete process.env.LLM_API_KEY;
+
+    const postBodies: Array<Record<string, unknown>> = [];
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if ((init?.method || 'GET') === 'GET') return new Response('', { status: 200 });
+      postBodies.push(JSON.parse(String(init?.body || '{}')) as Record<string, unknown>);
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: 'groq response' } }],
+        usage: { total_tokens: 10 },
+      }), { status: 200 });
+    }) as typeof fetch;
+
+    await callLlm({
+      messages: [{ role: 'user', content: 'Use the default Groq model.' }],
+      providerOrder: ['groq'],
+    });
+    await callLlm({
+      messages: [{ role: 'user', content: 'Use a non-reasoning Groq model.' }],
+      providerOrder: ['groq'],
+      modelOverrides: { groq: 'llama-3.3-70b-versatile' },
+    });
+
+    assert.equal(postBodies[0]?.model, 'openai/gpt-oss-20b');
+    assert.equal(postBodies[0]?.reasoning_effort, 'low');
+    assert.equal(postBodies[1]?.model, 'llama-3.3-70b-versatile');
+    assert.equal('reasoning_effort' in (postBodies[1] ?? {}), false);
   });
 
   it('preserves the provider finish reason on non-streaming completions', async () => {
@@ -437,7 +546,7 @@ describe('callLlm', () => {
       }
       const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
       bodies.push(body);
-      const content = body.model === 'openai/gpt-oss-20b:free' ? 'backup answer' : '';
+      const content = body.model === 'minimax/minimax-m3:free' ? 'backup answer' : '';
       return new Response(JSON.stringify({
         choices: [{ message: { content } }],
         usage: { total_tokens: 5 },
@@ -447,11 +556,11 @@ describe('callLlm', () => {
     const result = await callLlm({ messages: [{ role: 'user', content: 'Answer briefly.' }] });
 
     assert.equal(result?.provider, 'openrouter-free-backup');
-    assert.equal(result?.model, 'openai/gpt-oss-20b:free');
+    assert.equal(result?.model, 'minimax/minimax-m3:free');
     assert.deepEqual(bodies.map(body => body.model), [
       'deepseek/deepseek-v4-flash',
       'google/gemma-4-26b-a4b-it:free',
-      'openai/gpt-oss-20b:free',
+      'minimax/minimax-m3:free',
     ]);
     for (const body of bodies) {
       assert.deepEqual(body.reasoning, { enabled: false });

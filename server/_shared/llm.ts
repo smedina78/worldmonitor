@@ -5,6 +5,7 @@ import { buildLlmCallEvent, deliverUsageEvents, type LlmCallEvent } from './usag
 import {
   DEEPSEEK_V4_FLASH_MODEL_PREFIX,
   GROQ_DEFAULT_MODEL,
+  GROQ_REASONING_EXTRA_BODY,
   getLlmAttemptTimeoutMs,
   OPENROUTER_FREE_BACKUP_MODEL,
   OPENROUTER_FREE_PRIMARY_MODEL,
@@ -109,13 +110,20 @@ export function getProviderCredentials(
   if (provider === 'groq') {
     const apiKey = process.env.GROQ_API_KEY;
     if (!apiKey) return null;
+    const model = overrides.model || GROQ_DEFAULT_MODEL;
     return {
       apiUrl: 'https://api.groq.com/openai/v1/chat/completions',
-      model: overrides.model || GROQ_DEFAULT_MODEL,
+      model,
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
       },
+      // Groq rejects reasoning_effort for models that do not support it.
+      // Profile model overrides can select any Groq model, so keep this
+      // GPT-OSS-specific instead of attaching it to the provider globally.
+      extraBody: model.startsWith('openai/gpt-oss-')
+        ? GROQ_REASONING_EXTRA_BODY
+        : undefined,
     };
   }
 
@@ -181,7 +189,7 @@ async function readBoundedErrorBody(resp: Response, cap: number): Promise<string
       out += decoder.decode(value, { stream: true });
     }
   } catch { /* best-effort diagnostics only */ } finally {
-    try { void reader.cancel(); } catch { /* already closed */ }
+    try { void reader.cancel().catch(() => {}); } catch { /* already closed */ }
   }
   return out.slice(0, cap);
 }
@@ -490,9 +498,9 @@ export function callLlmReasoningStream(opts: LlmStreamOptions): ReadableStream<U
           }
 
           if (!resp.ok || !resp.body) {
+            const errBody = await readBoundedErrorBody(resp, 300).catch(() => '');
             clearTimeout(timeoutId);
-            const errBody = resp.body ? await resp.text().catch(() => '') : '';
-            console.warn(`[llm-stream:${providerName}] HTTP ${resp.status} model=${creds.model} body=${errBody.slice(0, 300)}`);
+            console.warn(`[llm-stream:${providerName}] HTTP ${resp.status} model=${creds.model} body=${errBody}`);
             // The body already told us whether the MODEL was rejected; feeding
             // it back is what stops the next request re-sending the prompt.
             recordModelFailure(creds.apiUrl, creds.model, resp.status, errBody);

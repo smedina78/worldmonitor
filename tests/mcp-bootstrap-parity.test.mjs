@@ -63,6 +63,10 @@ const EXCLUDED_FROM_MCP = new Map([
     'ops surface: per-source procurement availability, freshness, and record count; consumed by api/health.js while tender content is exposed through the bounded MCP procurement tool, which proxies the paginated economic RPC.'],
   ['military:cross-strait-activity:v1:source:taiwan-mnd',
     'operational: Taiwan MND transport status, errors, and last-success time consumed by api/health.js; #5580 owns final MCP composition for the separately attributed official activity records.'],
+  ['maritime:ais-gaps:v1',
+    'intermediate: relay-published dark-ship count consumed server-side by the temporal-anomalies rebuild as the ais_gaps count source (COUNT_SOURCE_KEYS #7574); the signal surfaces through the temporal anomalies tool, not a standalone MCP slice.'],
+  ['gdelt:bulk:country-articles:v1',
+    'intermediate: rolling per-country GKG article index consumed by the search-gdelt-documents route\'s `country:<ISO2>` form for the weekly crawlable freeze (#7748); its rows reach agents through the prerendered country pages and their dataset downloads. Exposing the country form as an MCP tool input (and grounding get_country_brief on it) is the agent-native follow-up recorded on PR #7786, at which point this exclusion moves to that tool\'s _cacheKeys.'],
   ['military:cross-strait-activity:v1:source:japan-mod',
     'operational: Japan Joint Staff transport status, errors, and last-success time consumed by api/health.js; #5580 owns final MCP composition for the separately attributed reviewed activity records.'],
   ['market:china:stock-connect:v1',
@@ -86,6 +90,8 @@ const EXCLUDED_FROM_MCP = new Map([
     'dashboard-internal: Manitoba 511 events and alerts union onto the canadaRoads map layer (#6622); not a queryable MCP slice.'],
   ['infra:bc-open511:v1',
     'dashboard-internal: DriveBC Open511 events union onto the canadaRoads map layer (#6611); not a queryable MCP slice.'],
+  ['prediction:markets-country-index:v1',
+    'dashboard-internal: per-country projection read by the country-brief prediction RPC. The MCP get_prediction_markets tool exposes the canonical prediction:markets-bootstrap:v1 feed; adding this index to its _cacheKeys would return the complete country map and change the tool response envelope.'],
 
   // ===========================================================================
   // Intermediate / pipeline keys (data surfaces through a sibling tool)
@@ -181,25 +187,10 @@ const EXCLUDED_FROM_MCP = new Map([
   ['forecast:funnel:health:v1',
     'operational: funnel-diversity guardrail signal (#5233) written by seed-forecasts afterPublish. Internal health/ops metric surfaced via /api/health (collapse → SEED_ERROR); not a queryable user-facing slice, so no MCP tool.'],
 
-  // ===========================================================================
-  // Recovery pillar scorer inputs — no dedicated recovery-data MCP tool yet.
-  // ===========================================================================
-  ['resilience:recovery:fiscal-space:v1',
-    'deferred: recovery pillar scorer input. Future resilience tool will expose recovery dimensions.'],
-  ['resilience:recovery:reserve-adequacy:v1',
-    'deferred: recovery pillar scorer input. Future resilience tool will expose recovery dimensions.'],
-  ['resilience:recovery:external-debt:v1',
-    'deferred: recovery pillar scorer input. Future resilience tool will expose recovery dimensions.'],
-  ['resilience:recovery:import-hhi:v1',
-    'deferred: strict seeded recovery pillar scorer input. Future resilience tool will expose recovery dimensions.'],
-  // resilience:recovery:fuel-stocks:v1 exclusion removed alongside PR #3764
-  // (api/health.js probe removal). The seeder still runs and writes the key
-  // but scoreFuelStockDays does not read it, so the key is no longer in
-  // STANDALONE_KEYS and an MCP exclusion would be a dead entry.
-  ['resilience:recovery:reexport-share:v1',
-    'deferred: recovery pillar scorer input. Future resilience tool will expose recovery dimensions.'],
-  ['resilience:recovery:sovereign-wealth:v1',
-    'deferred: recovery pillar scorer input. Future resilience tool will expose recovery dimensions.'],
+  // Recovery and active resilience-indicator scorer inputs are covered by
+  // get_resilience_indicators. Ranking, interval, and health-only aggregate
+  // keys remain excluded below because that country-level tool does not expose
+  // those operational surfaces.
   // ===========================================================================
   // #5055 health-only seed probes added to strict /api/health monitoring.
   // ===========================================================================
@@ -253,12 +244,6 @@ const EXCLUDED_FROM_MCP = new Map([
     'deferred to a future resilience tool (FAO Phase 3+ aggregate, paired with resilience:static:index:v1).'],
   ['resilience:intervals:v11:US',
     'deferred to a future resilience tool (formula-tagged sensitivity bands on top of resilience:ranking:v28).'],
-  ['resilience:low-carbon-generation:v1',
-    'deferred to a future resilience tool. Companion data to fossil-electricity-share (already exposed via get_energy_intelligence).'],
-  ['resilience:power-losses:v1',
-    'deferred to a future resilience tool. Companion data to the resilience v2 energy bundle.'],
-  ['resilience:education-attainment:v1',
-    'deferred to a future resilience tool. Single-indicator input to the active education dimension; canonical resilience scores and dimensions remain available through the Resilience REST and agent-skill surfaces, while a raw-series MCP contract needs separate product design.'],
   ['product-catalog:v3',
     'deferred to a future product-catalog tool. Used by the dashboard to render product metadata, not a queryable data slice.'],
   ['climate:zone-normals:v1',
@@ -432,18 +417,6 @@ const EXCLUDED_FROM_MCP = new Map([
   ['infra:toronto-roads:v1',
     'dashboard-internal: City of Toronto CART v3 road restrictions overlay on the same canadaRoads map layer; not a queryable MCP slice (#6609).'],
 ]);
-
-const EDUCATION_EXCLUSION_REASON = EXCLUDED_FROM_MCP.get('resilience:education-attainment:v1');
-assert.match(
-  EDUCATION_EXCLUSION_REASON ?? '',
-  /active education dimension/,
-  'education MCP exclusion must describe the active construct, not the retired flag-dark state',
-);
-assert.doesNotMatch(
-  EDUCATION_EXCLUSION_REASON ?? '',
-  /flag-gated dark|does not yet score/i,
-  'education MCP exclusion must not retain pre-activation state',
-);
 
 // -----------------------------------------------------------------------------
 // Pure predicate helpers (no module-state coupling) — used by both the

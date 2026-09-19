@@ -1,4 +1,5 @@
 import { defineConfig, loadEnv, type Plugin } from 'vite';
+import { sentryVitePlugin } from '@sentry/vite-plugin';
 import { VitePWA } from 'vite-plugin-pwa';
 import type { OutputBundle } from 'rollup';
 import { resolve, dirname, extname } from 'path';
@@ -6,6 +7,7 @@ import { mkdir, readFile, writeFile } from 'fs/promises';
 import { brotliCompress } from 'zlib';
 import { promisify } from 'util';
 import pkg from './package.json';
+import { getSentryBuildMetadata } from './shared/sentry-build-metadata';
 import { VARIANT_META, type VariantMeta } from './src/config/variant-meta';
 import {
   WEB_DASHBOARD_VARIANTS,
@@ -19,6 +21,10 @@ import {
 import { isAllowedDomain } from './api/_rss-allowed-domain-match.js';
 import { rssFetchHeadersForHost } from './api/_rss-fetch-headers.js';
 import { validateGeneratedRequest } from './server/request-validator';
+import {
+  getChunkSizeWarning,
+  isExpectedEmptyRpcClientWarning,
+} from './scripts/vite-build-warning-policy.mts';
 
 // Env-dependent constants moved inside defineConfig function
 
@@ -105,6 +111,7 @@ const PANEL_CLUSTER: Record<string, PanelChunkName> = {
   MacroSignals: 'panels-markets', Market: 'panels-markets',
   MarketBreadth: 'panels-markets', MarketImplications: 'panels-markets',
   NewsMarketCorrelation: 'panels-markets',
+  NqCatalysts: 'panels-markets', NqPulse: 'panels-markets',
   Positioning: 'panels-markets', Stablecoin: 'panels-markets',
   StockAnalysis: 'panels-markets', StockBacktest: 'panels-markets',
   WsbTickerScanner: 'panels-markets', YieldCurve: 'panels-markets',
@@ -311,6 +318,25 @@ function dashboardHtmlOutputPlugin(): Plugin {
         dashboardHtml.source = deferDashboardStylesheetLinks(dashboardHtml.source, bundle);
       }
       bundle['dashboard.html'] = dashboardHtml;
+    },
+  };
+}
+
+function chunkSizeWarningPolicyPlugin(): Plugin {
+  return {
+    name: 'wm-chunk-size-warning-policy',
+    apply: 'build',
+    enforce: 'post',
+    generateBundle(_options, bundle) {
+      for (const output of Object.values(bundle)) {
+        if (output.type !== 'chunk') continue;
+        const warning = getChunkSizeWarning({
+          name: output.name,
+          fileName: output.fileName,
+          sizeBytes: Buffer.byteLength(output.code),
+        });
+        if (warning) this.warn(warning);
+      }
     },
   };
 }
@@ -686,13 +712,20 @@ function sebufApiPlugin(): Plugin {
           // Execute handler
           const response = await matchedHandler(webRequest);
 
-          // Write response
+          // Write response. HEAD is GET without a payload (#7275).
           res.statusCode = response.status;
           response.headers.forEach((value, key) => {
             res.setHeader(key, value);
           });
           for (const [key, value] of Object.entries(corsHeaders)) {
             res.setHeader(key, value);
+          }
+          if (req.method === 'HEAD') {
+            if (response.body) {
+              try { void response.body.cancel(); } catch { /* already consumed */ }
+            }
+            res.end();
+            return;
           }
           res.end(await response.text());
         } catch (err) {
@@ -893,6 +926,14 @@ export default defineConfig(({ mode }) => {
   const isDesktopBuild = process.env.VITE_DESKTOP_RUNTIME === '1';
   const activeVariant = process.env.VITE_VARIANT || 'full';
   const activeMeta = VARIANT_META[activeVariant] || VARIANT_META.full;
+  const emitPublicSourceMaps = process.env.WM_EMIT_SOURCEMAPS === '1'
+    || process.env.VERCEL_ENV === 'preview';
+  // Sentry source-map upload. Gated on the token so a build without it (local,
+  // fork, CI) behaves exactly as before rather than failing. Matching is by
+  // debug ID — the plugin stamps the same id into the bundle and its map.
+  const uploadSourceMapsToSentry = Boolean(process.env.SENTRY_AUTH_TOKEN);
+  const sentryBuild = getSentryBuildMetadata(pkg.version, process.env.VERCEL_GIT_COMMIT_SHA ?? 'dev');
+  const publishSentryRelease = process.env.VERCEL_ENV === 'production' && Boolean(sentryBuild.dist);
 
   return {
     html: {
@@ -910,6 +951,34 @@ export default defineConfig(({ mode }) => {
       __BUILD_HASH__: JSON.stringify(process.env.VERCEL_GIT_COMMIT_SHA ?? 'dev'),
     },
     plugins: [
+      // Ship readable dashboard stack traces to Sentry. Without this every
+      // browser frame arrives minified (`Rs.loadNews`, `BO`, `v`), which is why
+      // triage has had to infer call sites from Vite chunk names.
+      ...(uploadSourceMapsToSentry
+        ? [sentryVitePlugin({
+            org: 'elie-habib',
+            project: 'worldmonitor',
+            authToken: process.env.SENTRY_AUTH_TOKEN,
+            telemetry: false,
+            release: {
+              name: sentryBuild.release,
+              inject: false,
+              dist: sentryBuild.dist,
+              // Preview/local uploads must not resolve shared production issues.
+              create: publishSentryRelease,
+              finalize: publishSentryRelease,
+              // Preserve the plugin's Vercel-aware commit detection in production.
+              setCommits: publishSentryRelease ? undefined : false,
+              deploy: publishSentryRelease ? undefined : false,
+            },
+            sourcemaps: {
+              // Previews deliberately serve public maps (emitPublicSourceMaps);
+              // leave those in place and only sweep them when production built
+              // them solely to upload.
+              filesToDeleteAfterUpload: emitPublicSourceMaps ? [] : ['dist/**/*.map'],
+            },
+          })]
+        : []),
       // Emit dist/build-hash.txt with the deployed SHA so the running bundle
       // can fetch /build-hash.txt at tab-focus time and force-reload itself
       // if it's running an older bundle (see src/bootstrap/stale-bundle-check.ts).
@@ -927,6 +996,7 @@ export default defineConfig(({ mode }) => {
         },
       },
       htmlVariantPlugin(activeMeta, activeVariant, isDesktopBuild),
+      chunkSizeWarningPolicyPlugin(),
       !isDesktopBuild && dashboardHtmlOutputPlugin(),
       // Variant subdomain SEO pages only make sense on the web deployment,
       // which is always the 'full' build (variant selection is runtime by
@@ -1091,9 +1161,14 @@ export default defineConfig(({ mode }) => {
       format: 'es',
     },
     build: {
-      // Geospatial bundles (maplibre/deck) are expected to be large even when split.
-      // Raise warning threshold to reduce noisy false alarms in CI.
-      chunkSizeWarningLimit: 1200,
+      // Uploading requires the maps to exist. When they are not also being
+      // published deliberately, the Sentry plugin deletes them after upload so
+      // production keeps shipping no public maps.
+      sourcemap: emitPublicSourceMaps || uploadSourceMapsToSentry,
+      // Vite's global threshold accommodates the known lazy GlobeMap bundle.
+      // wm-chunk-size-warning-policy keeps the 1200 kB default for every other
+      // chunk so unrelated regressions between 1200 and 2000 kB remain visible.
+      chunkSizeWarningLimit: 2000,
       // Vite 6 hoists every dynamic chunk's STATIC deps into the entry HTML's
       // modulepreload list to avoid latency on the first dynamic import. For the
       // map stack that defeats the whole point of dynamic-importing MapContainer:
@@ -1118,6 +1193,16 @@ export default defineConfig(({ mode }) => {
             return;
           }
 
+          // The cyber client legitimately tree-shakes to nothing while its
+          // feature flag is off. Keep every other empty RPC chunk visible: an
+          // enabled client disappearing is a build regression, not noise.
+          if (isExpectedEmptyRpcClientWarning(
+            warning,
+            process.env.VITE_ENABLE_CYBER_LAYER === 'true',
+          )) {
+            return;
+          }
+
           warn(warning);
         },
         input: {
@@ -1138,6 +1223,24 @@ export default defineConfig(({ mode }) => {
           // DeckGLMap boundary.
           onlyExplicitManualChunks: true,
           manualChunks(id) {
+            // Keep the existing secondary-flow chunk stable when standalone
+            // entries stop sharing panel dependencies with the dashboard.
+            if (id.endsWith('/src/services/checkout.ts')) {
+              return 'checkout';
+            }
+            // Give the layered dashboard stylesheet a CSS-only chunk. Vite folds a
+            // CSS-only chunk into each importing entry's own CSS, so dashboard.html
+            // links it. Left inside a shared JavaScript chunk it inherited that
+            // chunk's name (debugbear-rum-*.css) and could lose its link: Vite 6
+            // caches each chunk's CSS list across HTML entries, and the main entry
+            // chunk is also imported by App and live-channels, so the cached list
+            // can omit CSS another entry reached first. The preload helper then
+            // fetched the stylesheet for import('./App'), and a failed download
+            // aborted the dashboard boot (WORLDMONITOR-XT). Guarded by
+            // tests/dashboard-critical-css.test.mjs.
+            if (id.endsWith('/src/styles/base-layer.css')) {
+              return 'dashboard-styles';
+            }
             if (id.includes('node_modules')) {
               if (id.includes('/@xenova/transformers/')) {
                 return 'transformers';

@@ -121,7 +121,7 @@ describe('buildContentFreshnessReport', () => {
   });
 
   // The cold-fetch cap is 30 countries per run on a 12h cron, so a full
-  // 174-country sweep takes ~6 runs = ~72h BY DESIGN, and served-stale
+  // 174-country sweep takes ~6 runs = ~3d BY DESIGN, and served-stale
   // payloads are retained for up to 7 days. Gating on "any country past
   // budget" would therefore be permanently true — a warning nobody can clear
   // and nobody would act on. Only the countries the China corridor adapter
@@ -262,7 +262,7 @@ describe('buildContentFreshnessReport', () => {
 
 // The seeder reserves the first cold-fetch slots for CN/HK instead of letting
 // them follow the fleet rotation: MAX_COLD_FETCH_PER_RUN caps refreshes at 30
-// of 174 per run on a 12h cron, so a full sweep is ceil(174/30) = 6 runs = 72h,
+// of 174 per run on a 12h cron, so a nominal sweep is ceil(174/30) = 6 runs = 3d,
 // comfortably inside the 240h content budget. CN and HK feed the China
 // corridor adapter and the activity-nowcast's maritime family, so they must be
 // refreshed every run they are due, not once per fleet sweep.
@@ -335,6 +335,21 @@ describe('content clock survives a refetch that returns unchanged upstream data'
       frozenSince,
       'a refetch returning the same upstream date must not reset the clock',
     );
+  });
+
+  it('carries the prior content clock forward when a fallback refresh cannot observe max(date)', () => {
+    const frozenSince = NOW - 120 * HOUR_MS;
+    for (const bad of [null, undefined, '', 'not-a-date', 42]) {
+      assert.equal(
+        contentClockFor(
+          { asof: '2026-07-24', contentAsOfChangedAt: frozenSince },
+          bad,
+          NOW,
+        ),
+        frozenSince,
+        'upstreamMaxDate=' + String(bad),
+      );
+    }
   });
 
   it('resets the clock when the upstream date actually advances', () => {

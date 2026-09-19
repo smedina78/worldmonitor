@@ -7,68 +7,8 @@ import { MapboxOverlay } from '@deck.gl/mapbox';
 import type { Layer, LayersList, PickingInfo } from '@deck.gl/core';
 import { GeoJsonLayer, ScatterplotLayer, PathLayer, IconLayer, TextLayer, PolygonLayer } from '@deck.gl/layers';
 import * as maplibregl from 'maplibre-gl';
-import type { StyleSpecification } from 'maplibre-gl';
-// maplibre-gl v6 construye la URL de su worker EN RUNTIME a partir de
-// `import.meta.url` (`new URL('./maplibre-gl-worker.mjs', moduleUrl)`), y eso no
-// hay bundler que lo detecte de forma estática: el optimizer de Vite
-// pre-bundlea el paquete en `.vite/deps/maplibre-gl.js` y busca ahí el hermano
-// `maplibre-gl-worker.mjs`, que no existe (404 medido el 2026-09-12), y en el
-// build el asset tampoco se emite (`dist/assets/maplibre-gl-worker.mjs` -> 404).
-// Con el worker roto, maplibre no puede parsear tiles: el mapa queda sin basemap
-// sin lanzar un error de página, que es la peor forma de romperse.
-//
-// `setWorkerUrl()` es la salida oficial de v6 (`config.WORKER_URL`). El
-// `?worker&url` hace que Vite emita el worker como entry propio — arrastrando su
-// import de `maplibre-gl-shared.mjs`, que es la razón por la que copiar el
-// archivo a mano no alcanza — y devuelve su URL servible en dev y en build.
-// Debe correr antes de crear la primera instancia de Map (este módulo es el que
-// las crea, y se importa de forma perezosa con MapContainer).
 import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
-
-maplibregl.setWorkerUrl(maplibreWorkerUrl);
-
-/**
- * maplibre-gl 6 retiró `map.transform` de su superficie pública (medido el
- * 2026-09-12: no está ni en la instancia ni en el prototipo), pero
- * `@deck.gl/mapbox` lo lee en `getViewport()` para escalar el near/far plane:
- * `viewState.nearZ = nearZ / map.transform.height`. Está igual en 9.2.11 y en
- * 9.4.0 (mismo código), así que subir deck no lo arregla.
- *
- * Sin esto, cada frame de la capa interleaved tira "Cannot read properties of
- * undefined (reading 'height')" (27 errores en 1 s, medidos) y el mapa queda sin
- * basemap ni capas de deck.
- *
- * Ojo con el orden de descubrimiento: el worker de v6 roto (ver arriba) TAPABA
- * este problema — sin worker, maplibre nunca llegaba a renderizar la capa custom,
- * así que el smoke del repo pasaba en verde con el mapa roto.
- *
- * Se expone sólo lo que deck usa, con getters para que siga el tamaño del canvas.
- * `_nearZ`/`_farZ` quedan fuera a propósito: v6 ya pasa `nearZ`/`farZ` en
- * `renderParameters`, y si algún día no lo hace, deck cae a su cálculo por
- * `nearZMultiplier` (`Number.isFinite(undefined)` es false) en vez de romper.
- *
- * Es un puente, no el arreglo: el fix real pertenece a deck.gl. Se define sólo si
- * falta, así que si deck deja de necesitarlo (o maplibre lo devuelve) no interfiere.
- */
-function exposeMapTransformForDeckGl(map: maplibregl.Map): void {
-  if ('transform' in map) return;
-  const canvas = map.getCanvas();
-  const shim = {
-    get height() {
-      return canvas.clientHeight || canvas.height;
-    },
-    get width() {
-      return canvas.clientWidth || canvas.width;
-    },
-    get elevation() {
-      return 0;
-    },
-  };
-  Object.defineProperty(map, 'transform', {
-    get: () => shim,
-    configurable: true,
-  });
-}
+import type { StyleSpecification } from 'maplibre-gl';
 import { FALLBACK_DARK_STYLE, FALLBACK_LIGHT_STYLE, getMapProvider, getMapTheme, isLightMapTheme } from '@/config/basemap';
 import { getStyleForProvider } from '@/config/basemap-styles';
 import Supercluster from 'supercluster';
@@ -98,6 +38,7 @@ import type {
   CyberThreat,
   CableHealthRecord,
   MilitaryBaseEnriched,
+  NuclearFacility,
 } from '@/types';
 import { fetchMilitaryBases, type MilitaryBaseCluster as ServerBaseCluster } from '@/services/military-bases';
 import type { AirportDelayAlert, PositionSample } from '@/services/aviation';
@@ -233,6 +174,8 @@ import { fetchWebcamImage } from '@/services/webcams';
 import { setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
 import { summarizeRenderTiming, formatRenderTiming } from '@/components/map/render-timing';
 import { DeferredHeavyCommit } from '@/components/map/deferred-layer-commit';
+import { ZoomHintGuard } from '@/components/map/zoom-hint-guard';
+import { dispatchWebcamLayerClick, resolveWebcamStreamUrl, type WebcamLeafLike } from '@/components/map/webcam-click';
 import {
   type BBox,
   type BoundedFeature,
@@ -274,6 +217,12 @@ interface DeckMapState {
 
 interface DeckGLMapOptions {
   chrome?: boolean;
+  /**
+   * Fired when MapLibre cannot be (re)constructed after the initial ready
+   * handshake — e.g. WebGL2 lost mid-session while recreating the fallback
+   * basemap. MapContainer uses this to degrade to the SVG renderer.
+   */
+  onFatalError?: (error: unknown) => void;
 }
 
 interface HotspotWithBreaking extends Hotspot {
@@ -576,6 +525,12 @@ function stableTradeRoutePhase(routeId: string): number {
 // or recreateWithFallback rebuilds the map.
 let __deckInterleavedRaceFilterInstalled = false;
 
+// deck.gl 9.x still reads map.transform for interleaved projection/terrain.
+// Remove this bridge when @deck.gl/mapbox supports MapLibre 6's camera API.
+class DeckCompatibleMap extends maplibregl.Map {
+  get transform() { return this._camera.transform; }
+}
+
 const DECK_INTERLEAVED_RACE_MESSAGE_RE = /Cannot read properties of null \(reading 'id'\)|null is not an object \(evaluating '[\w.]+\.id'\)/;
 const DECK_INTERLEAVED_RACE_SOURCE_RE = /(?:^|[/(])deck-stack-[A-Za-z0-9_-]+\.js/;
 
@@ -697,6 +652,10 @@ export class DeckGLMap {
   private tradeAnimationTime = 0;
   private tradeAnimationFrame: number | null = null;
   private tradeAnimationFrameCount = 0;
+  // Guards updateZoomHints() so the trade-animation's every-other-frame
+  // updateLayers() pass skips the toggle-DOM scan when zoom, layer flags,
+  // and row nodes are unchanged (#7776).
+  private readonly zoomHintGuard = new ZoomHintGuard();
   private tradeReducedMotionMedia: MediaQueryList | null = null;
   private storedChokepointData: GetChokepointStatusResponse | null = null;
   private highlightedRouteIds: Set<string> = new Set();
@@ -852,6 +811,7 @@ export class DeckGLMap {
   private destroyed = false;
   private usedFallbackStyle = false;
   private readonly chrome: boolean;
+  private readonly onFatalError: ((error: unknown) => void) | null;
   private initPromise: Promise<void> = Promise.resolve();
   private styleLoadTimeoutId: ReturnType<typeof setTimeout> | null = null;
   private tileMonitorGeneration = 0;
@@ -889,6 +849,15 @@ export class DeckGLMap {
   private lastCableHighlightSignature = '';
   private lastCableHealthSignature = '';
   private lastPipelineHighlightSignature = '';
+  // Static facility catalogs filtered once per map instance (#7777). The
+  // nuclear and data-center builders run on every render; a fresh .filter()
+  // per render hands deck.gl a new data container each time, so the
+  // instance attributes are rebuilt even when nothing changed. The
+  // highlight Sets are mutated in place, so the same arrays must stay
+  // referentially stable while a sorted-content signature (never the Set
+  // object) drives updateTriggers.getSize/getColor.
+  private activeNuclearFacilities: NuclearFacility[] | null = null;
+  private activeDatacenters: AIDataCenter[] | null = null;
   private debouncedRebuildLayers: (() => void) & { cancel(): void };
   private debouncedFetchBases: (() => void) & { cancel(): void };
   private debouncedFetchAircraft: (() => void) & { cancel(): void };
@@ -921,6 +890,7 @@ export class DeckGLMap {
   constructor(container: HTMLElement, initialState: DeckMapState, options: DeckGLMapOptions = {}) {
     this.container = container;
     this.chrome = options.chrome ?? true;
+    this.onFatalError = options.onFatalError ?? null;
     this.state = {
       ...initialState,
       pan: { ...initialState.pan },
@@ -1120,12 +1090,12 @@ export class DeckGLMap {
   }
 
   private async initMapLibre(): Promise<void> {
-    if (maplibregl.getRTLTextPluginStatus() === 'unavailable') {
-      maplibregl.setRTLTextPlugin(
-        '/mapbox-gl-rtl-text.min.js',
-        true,
-      );
-    }
+    maplibregl.setWorkerUrl(maplibreWorkerUrl);
+    // No `setRTLTextPlugin` here: MapLibre 6 shapes Arabic and reorders
+    // bidirectional text itself and deprecates the plugin. Registering the
+    // self-hosted plugin after the 6.x upgrade also broke RTL labels outright —
+    // the v6 worker loads a non-`.mjs` plugin URL with `globalThis.eval`, which
+    // the dashboard CSP blocks (WORLDMONITOR-12T; tests/map-locale.test.mts).
 
     const { mapTheme: initialMapTheme, style: primaryStyle } = await this.resolveInitialBasemapStyle();
     // The component can be torn down (renderer switch) while the style import
@@ -1144,7 +1114,7 @@ export class DeckGLMap {
     const basemapEl = document.getElementById('deckgl-basemap');
     if (!basemapEl) return;
 
-    this.maplibreMap = new maplibregl.Map({
+    this.maplibreMap = new DeckCompatibleMap({
       container: basemapEl,
       style: primaryStyle,
       center: [preset.longitude, preset.latitude],
@@ -1166,38 +1136,84 @@ export class DeckGLMap {
         }
         : {}),
     });
-    exposeMapTransformForDeckGl(this.maplibreMap);
+
+    const reportFatalBasemapFailure = (error: unknown, center = this.getCenter()): void => {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn('[DeckGLMap] Basemap fallback unavailable — handing off to SVG:', message);
+      this.pendingCenter = center;
+      // Defer so we never destroy() while still inside MapLibre construction /
+      // a style-load timer callback (Sentry WORLDMONITOR-133).
+      queueMicrotask(() => {
+        if (this.destroyed) return;
+        try {
+          this.onFatalError?.(error);
+        } catch (callbackError) {
+          console.warn('[DeckGLMap] Fatal-error callback failed:', callbackError);
+        }
+      });
+    };
 
     const recreateWithFallback = () => {
-      if (this.usedFallbackStyle) return;
+      if (this.usedFallbackStyle || this.destroyed) return;
+      const center = this.getCenter();
+      this.state.zoom = this.maplibreMap?.getZoom() ?? this.state.zoom;
+      // Style-load timeout still fires after webglcontextlost. Rebuilding
+      // MapLibre without WebGL2 throws GPUInitializationError as an uncaught
+      // window.onerror (Sentry WORLDMONITOR-133). Skip recreate and degrade.
+      if (this.webglLost) {
+        this.usedFallbackStyle = true;
+        if (this.styleLoadTimeoutId) {
+          clearTimeout(this.styleLoadTimeoutId);
+          this.styleLoadTimeoutId = null;
+        }
+        reportFatalBasemapFailure(
+          new Error('WebGL context lost during primary basemap fallback recreate'),
+        );
+        return;
+      }
       this.usedFallbackStyle = true;
       const fallback = isLightMapTheme(initialMapTheme) ? FALLBACK_LIGHT_STYLE : FALLBACK_DARK_STYLE;
       console.warn(`[DeckGLMap] Primary basemap failed, recreating with fallback: ${fallback}`);
       const attr = this.container.querySelector('.map-attribution');
       if (attr) setTrustedHtml(attr, trustedHtml('© <a href="https://openfreemap.org" target="_blank" rel="noopener">OpenFreeMap</a> © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>', "legacy direct innerHTML migration"));
       this.detachMapLibreInteractionHandlers();
-      this.maplibreMap?.remove();
+      try {
+        this.maplibreMap?.remove();
+      } catch (error) {
+        console.warn('[DeckGLMap] Failed to remove primary basemap before fallback:', error instanceof Error ? error.message : error);
+      }
+      this.maplibreMap = null;
       const fallbackEl = document.getElementById('deckgl-basemap');
-      if (!fallbackEl) return;
-      this.maplibreMap = new maplibregl.Map({
-        container: fallbackEl,
-        style: fallback,
-        center: [preset.longitude, preset.latitude],
-        zoom: preset.zoom,
-        renderWorldCopies: false,
-        attributionControl: false,
-        interactive: true,
-        canvasContextAttributes: { powerPreference: 'high-performance' },
-        ...(MAP_INTERACTION_MODE === 'flat'
-          ? {
-            maxPitch: 0,
-            pitchWithRotate: false,
-            dragRotate: false,
-            touchPitch: false,
-          }
-          : {}),
-      });
-      exposeMapTransformForDeckGl(this.maplibreMap);
+      if (!fallbackEl) {
+        reportFatalBasemapFailure(new Error('Missing #deckgl-basemap during fallback recreate'), center);
+        return;
+      }
+      try {
+        this.maplibreMap = new DeckCompatibleMap({
+          container: fallbackEl,
+          style: fallback,
+          center: center ? [center.lon, center.lat] : [preset.longitude, preset.latitude],
+          zoom: this.state.zoom,
+          renderWorldCopies: false,
+          attributionControl: false,
+          interactive: true,
+          canvasContextAttributes: { powerPreference: 'high-performance' },
+          ...(MAP_INTERACTION_MODE === 'flat'
+            ? {
+              maxPitch: 0,
+              pitchWithRotate: false,
+              dragRotate: false,
+              touchPitch: false,
+            }
+            : {}),
+        });
+      } catch (error) {
+        // MapLibre throws GPUInitializationError synchronously when WebGL2 is
+        // gone (lost context, software renderer revoked, etc.). Catch it so it
+        // never reaches window.onerror; MapContainer falls back to SVG.
+        reportFatalBasemapFailure(error, center);
+        return;
+      }
       this.maplibreMap.on('load', () => {
         this.attachMapLibreInteractionHandlers();
         localizeMapLabels(this.maplibreMap);
@@ -1419,6 +1435,16 @@ export class DeckGLMap {
 
   private getSetSignature(set: Set<string>): string {
     return [...set].sort().join('|');
+  }
+
+  private getActiveNuclearFacilities(): NuclearFacility[] {
+    this.activeNuclearFacilities ??= NUCLEAR_FACILITIES.filter(f => f.status !== 'decommissioned');
+    return this.activeNuclearFacilities;
+  }
+
+  private getActiveDatacenters(): AIDataCenter[] {
+    this.activeDatacenters ??= AI_DATA_CENTERS.filter(dc => dc.status !== 'decommissioned');
+    return this.activeDatacenters;
   }
 
   private hasRecentNews(now = Date.now()): boolean {
@@ -1643,7 +1669,9 @@ export class DeckGLMap {
   }
 
   private rebuildDatacenterSupercluster(): void {
-    const activeDCs = AI_DATA_CENTERS.filter(dc => dc.status !== 'decommissioned');
+    // Share the stable detail-layer array (#7777) so cluster leaf indexes
+    // resolve against the same records detail picking/tooltips identify.
+    const activeDCs = this.getActiveDatacenters();
     this.datacenterSCSource = activeDCs;
     const points = activeDCs.map((dc, i) => ({
       type: 'Feature' as const,
@@ -2356,6 +2384,9 @@ export class DeckGLMap {
         getFillColor: (d) => ('count' in d ? [0, 212, 255, 180] : [255, 215, 0, 200]) as [number, number, number, number],
         radiusUnits: 'pixels',
         pickable: true,
+        // Consume the pick (return true) so MapboxOverlay onClick → handleClick
+        // does not double-fire. Cluster vs leaf is routed in handleWebcamLayerClick.
+        onClick: (info) => this.handleWebcamLayerClick(info),
       }));
     }
 
@@ -3056,7 +3087,12 @@ export class DeckGLMap {
 
   private createNuclearLayer(): IconLayer {
     const highlightedNuclear = this.highlightedAssets.nuclear;
-    const data = NUCLEAR_FACILITIES.filter(f => f.status !== 'decommissioned');
+    // Stable catalog array (#7777): same reference across unchanged renders
+    // so deck.gl skips instance-attribute rebuilds; the sorted-content
+    // signature below (never the in-place-mutated Set) invalidates the
+    // highlight-dependent attributes.
+    const data = this.getActiveNuclearFacilities();
+    const highlightSignature = this.getSetSignature(highlightedNuclear);
 
     // Nuclear: HEXAGON icons - yellow/orange color, semi-transparent
     return new IconLayer({
@@ -3080,6 +3116,7 @@ export class DeckGLMap {
       sizeMinPixels: 6,
       sizeMaxPixels: 15,
       pickable: true,
+      updateTriggers: { getSize: highlightSignature, getColor: highlightSignature },
     });
   }
 
@@ -3221,7 +3258,12 @@ export class DeckGLMap {
 
   private createDatacentersLayer(): IconLayer {
     const highlightedDC = this.highlightedAssets.datacenter;
-    const data = AI_DATA_CENTERS.filter(dc => dc.status !== 'decommissioned');
+    // Stable catalog array (#7777): same reference across unchanged renders
+    // so deck.gl skips instance-attribute rebuilds; the sorted-content
+    // signature below (never the in-place-mutated Set) invalidates the
+    // highlight-dependent attributes.
+    const data = this.getActiveDatacenters();
+    const highlightSignature = this.getSetSignature(highlightedDC);
 
     // Datacenters: SQUARE icons - purple color, semi-transparent for layering
     return new IconLayer({
@@ -3245,6 +3287,7 @@ export class DeckGLMap {
       sizeMinPixels: 6,
       sizeMaxPixels: 14,
       pickable: true,
+      updateTriggers: { getSize: highlightSignature, getColor: highlightSignature },
     });
   }
 
@@ -3305,6 +3348,40 @@ export class DeckGLMap {
         getPolygon: (d: { polygon: number[][] }) => d.polygon,
         getFillColor: [255, 255, 255, 30],
         getLineColor: [255, 255, 255, 80],
+        lineWidthMinPixels: 1,
+        pickable: true,
+      }));
+    }
+
+    const windRadiiData: { polygon: number[][]; thresholdKt: number; stormName: string; _event: NaturalEvent }[] = [];
+    for (const e of cyclones) {
+      for (const band of e.windRadii || []) {
+        if (band.geometryKind && band.geometryKind !== 'forecast-wind-radii') continue;
+        for (const polygon of band.polygons || []) {
+          const ring = polygon[0];
+          if (ring?.length) {
+            windRadiiData.push({
+              polygon: ring,
+              thresholdKt: band.thresholdKt || 0,
+              stormName: e.stormName || e.title,
+              _event: e,
+            });
+          }
+        }
+      }
+    }
+    if (windRadiiData.length > 0) {
+      layers.push(new PolygonLayer({
+        id: 'storm-imd-wind-radii-layer',
+        data: windRadiiData,
+        getPolygon: (d: { polygon: number[][] }) => d.polygon,
+        getFillColor: (d: { thresholdKt: number }) => {
+          if (d.thresholdKt >= 64) return [180, 0, 0, 40] as [number, number, number, number];
+          if (d.thresholdKt >= 50) return [220, 80, 0, 36] as [number, number, number, number];
+          if (d.thresholdKt >= 34) return [220, 160, 0, 32] as [number, number, number, number];
+          return [200, 200, 0, 28] as [number, number, number, number];
+        },
+        getLineColor: [255, 180, 0, 120],
         lineWidthMinPixels: 1,
         pickable: true,
       }));
@@ -4771,7 +4848,7 @@ export class DeckGLMap {
         const code = feature.properties?.['ISO3166-1-Alpha-2'] as string | undefined;
         return (code && this.affectedIso2Set.has(code) ? [220, 60, 40, 80] : [0, 0, 0, 0]) as [number, number, number, number];
       },
-      updateTriggers: { getFillColor: [this.scenarioState?.scenarioId ?? null] },
+      updateTriggers: { getFillColor: [this.scenarioState?.scenarioId ?? null, this.getSetSignature(this.affectedIso2Set)] },
     });
   }
 
@@ -4859,19 +4936,24 @@ export class DeckGLMap {
     const obj = info.object as any;
     const text = (value: unknown): string => escapeHtml(String(value ?? ''));
 
+    const numericLabel = (value: unknown, digits?: number): string => {
+      const number = value == null || value === '' ? NaN : Number(value);
+      return Number.isFinite(number) ? text(digits == null ? number.toLocaleString() : number.toFixed(digits)) : '—';
+    };
+
     switch (layerId) {
       case 'hotspots-layer':
         return { html: `<div class="deckgl-tooltip"><strong>${text(obj.name)}</strong><br/>${text(obj.subtext)}</div>` };
       case 'earthquakes-layer':
-        return { html: `<div class="deckgl-tooltip"><strong>M${(obj.magnitude || 0).toFixed(1)} ${t('components.deckgl.tooltip.earthquake')}</strong><br/>${text(obj.place)}</div>` };
+        return { html: `<div class="deckgl-tooltip"><strong>M${numericLabel(obj.magnitude, 1)} ${t('components.deckgl.tooltip.earthquake')}</strong><br/>${text(obj.place)}</div>` };
       case 'military-vessels-layer':
         return { html: renderMilitaryVesselTooltipHtml(obj, t) };
       case 'military-flights-layer':
         return { html: `<div class="deckgl-tooltip"><strong>${text(obj.callsign || obj.registration || t('components.deckgl.tooltip.militaryAircraft'))}</strong><br/>${text(obj.type)}</div>` };
       case 'military-vessel-clusters-layer':
-        return { html: `<div class="deckgl-tooltip"><strong>${text(obj.name || t('components.deckgl.tooltip.vesselCluster'))}</strong><br/>${obj.vesselCount || 0} ${t('components.deckgl.tooltip.vessels')}<br/>${text(obj.activityType)}</div>` };
+        return { html: `<div class="deckgl-tooltip"><strong>${text(obj.name || t('components.deckgl.tooltip.vesselCluster'))}</strong><br/>${numericLabel(obj.vesselCount)} ${t('components.deckgl.tooltip.vessels')}<br/>${text(obj.activityType)}</div>` };
       case 'military-flight-clusters-layer':
-        return { html: `<div class="deckgl-tooltip"><strong>${text(obj.name || t('components.deckgl.tooltip.flightCluster'))}</strong><br/>${obj.flightCount || 0} ${t('components.deckgl.tooltip.aircraft')}<br/>${text(obj.activityType)}</div>` };
+        return { html: `<div class="deckgl-tooltip"><strong>${text(obj.name || t('components.deckgl.tooltip.flightCluster'))}</strong><br/>${numericLabel(obj.flightCount)} ${t('components.deckgl.tooltip.aircraft')}<br/>${text(obj.activityType)}</div>` };
       case 'protests-layer':
         return { html: `<div class="deckgl-tooltip"><strong>${text(obj.title)}</strong><br/>${text(obj.country)}</div>` };
       case 'protest-clusters-layer':
@@ -4879,29 +4961,29 @@ export class DeckGLMap {
           const item = obj.items?.[0];
           return { html: `<div class="deckgl-tooltip"><strong>${text(item?.title || t('components.deckgl.tooltip.protest'))}</strong><br/>${text(item?.city || item?.country || '')}</div>` };
         }
-        return { html: `<div class="deckgl-tooltip"><strong>${t('components.deckgl.tooltip.protestsCount', { count: String(obj.count) })}</strong><br/>${text(obj.country)}</div>` };
+        return { html: `<div class="deckgl-tooltip"><strong>${text(t('components.deckgl.tooltip.protestsCount', { count: numericLabel(obj.count) }))}</strong><br/>${text(obj.country)}</div>` };
       case 'tech-hq-clusters-layer':
         if (obj.count === 1) {
           const hq = obj.items?.[0];
           return { html: `<div class="deckgl-tooltip"><strong>${text(hq?.company || '')}</strong><br/>${text(hq?.city || '')}</div>` };
         }
-        return { html: `<div class="deckgl-tooltip"><strong>${t('components.deckgl.tooltip.techHQsCount', { count: String(obj.count) })}</strong><br/>${text(obj.city)}</div>` };
+        return { html: `<div class="deckgl-tooltip"><strong>${text(t('components.deckgl.tooltip.techHQsCount', { count: numericLabel(obj.count) }))}</strong><br/>${text(obj.city)}</div>` };
       case 'tech-event-clusters-layer':
         if (obj.count === 1) {
           const ev = obj.items?.[0];
           return { html: `<div class="deckgl-tooltip"><strong>${text(ev?.title || '')}</strong><br/>${text(ev?.location || '')}</div>` };
         }
-        return { html: `<div class="deckgl-tooltip"><strong>${t('components.deckgl.tooltip.techEventsCount', { count: String(obj.count) })}</strong><br/>${text(obj.location)}</div>` };
+        return { html: `<div class="deckgl-tooltip"><strong>${text(t('components.deckgl.tooltip.techEventsCount', { count: numericLabel(obj.count) }))}</strong><br/>${text(obj.location)}</div>` };
       case 'datacenter-clusters-layer':
         if (obj.count === 1) {
           const dc = obj.items?.[0];
           return { html: `<div class="deckgl-tooltip"><strong>${text(dc?.name || '')}</strong><br/>${text(dc?.owner || '')}</div>` };
         }
-        return { html: `<div class="deckgl-tooltip"><strong>${t('components.deckgl.tooltip.dataCentersCount', { count: String(obj.count) })}</strong><br/>${text(obj.country)}</div>` };
+        return { html: `<div class="deckgl-tooltip"><strong>${text(t('components.deckgl.tooltip.dataCentersCount', { count: numericLabel(obj.count) }))}</strong><br/>${text(obj.country)}</div>` };
       case 'bases-layer':
         return { html: `<div class="deckgl-tooltip"><strong>${text(obj.name)}</strong><br/>${text(obj.country)}${obj.kind ? ` · ${text(obj.kind)}` : ''}</div>` };
       case 'bases-cluster-layer':
-        return { html: `<div class="deckgl-tooltip"><strong>${obj.count} bases</strong></div>` };
+        return { html: `<div class="deckgl-tooltip"><strong>${numericLabel(obj.count)} bases</strong></div>` };
       case 'nuclear-layer':
         return { html: `<div class="deckgl-tooltip"><strong>${text(obj.name)}</strong><br/>${text(obj.type)}</div>` };
       case 'datacenters-layer':
@@ -4949,13 +5031,15 @@ export class DeckGLMap {
       case 'natural-events-layer':
         return { html: `<div class="deckgl-tooltip"><strong>${text(obj.title)}</strong><br/>${text(obj.category || t('components.deckgl.tooltip.naturalEvent'))}</div>` };
       case 'storm-centers-layer':
-        return { html: `<div class="deckgl-tooltip"><strong>${text(obj.stormName || obj.title)}</strong><br/>${text(obj.classification || '')} ${obj.windKt ? obj.windKt + ` kt${obj.windAveragingPeriodMinutes ? ` (${obj.windAveragingPeriodMinutes}-minute mean)` : ''}` : ''}</div>` };
+        return { html: `<div class="deckgl-tooltip"><strong>${text(obj.stormName || obj.title)}</strong><br/>${text(obj.classification || '')} ${obj.windKt ? numericLabel(obj.windKt) + ` kt${obj.windAveragingPeriodMinutes ? ` (${numericLabel(obj.windAveragingPeriodMinutes)}-minute mean)` : ''}` : ''}</div>` };
       case 'storm-forecast-track-layer':
         return { html: `<div class="deckgl-tooltip"><strong>${text(obj.stormName)}</strong><br/>${t('popups.naturalEvent.classification')}: Forecast Track</div>` };
       case 'storm-past-track-layer':
-        return { html: `<div class="deckgl-tooltip"><strong>${text(obj.stormName)}</strong><br/>Past Track (${obj.windKt} kt)</div>` };
+        return { html: `<div class="deckgl-tooltip"><strong>${text(obj.stormName)}</strong><br/>Past Track (${numericLabel(obj.windKt)} kt)</div>` };
       case 'storm-cone-layer':
-        return { html: `<div class="deckgl-tooltip"><strong>${text(obj.stormName)}</strong><br/>Forecast Cone</div>` };
+        return { html: `<div class="deckgl-tooltip"><strong>${text(obj.stormName)}</strong><br/>Forecast cone of uncertainty<br/><small>Not an observed storm footprint</small></div>` };
+      case 'storm-imd-wind-radii-layer':
+        return { html: `<div class="deckgl-tooltip"><strong>${text(obj.stormName || 'IMD cyclone')}</strong><br/>Forecast wind radii ${text(String(obj.thresholdKt || ''))} kt<br/><small>India Meteorological Department · not an observed footprint</small></div>` };
       case 'ais-density-layer':
         return { html: `<div class="deckgl-tooltip"><strong>${t('components.deckgl.layers.shipTraffic')}</strong><br/>${t('popups.intensity')}: ${text(obj.intensity)}</div>` };
       case 'waterways-layer':
@@ -5010,7 +5094,7 @@ export class DeckGLMap {
       case 'notam-overlay-layer':
         return { html: `<div class="deckgl-tooltip"><strong style="color:#ff2828;">&#9888; NOTAM CLOSURE</strong><br/>${text(obj.name)} (${text(obj.iata)})<br/><span style="opacity:.7">${text((obj.reason || '').slice(0, 100))}</span></div>` };
       case 'aircraft-positions-layer':
-        return { html: `<div class="deckgl-tooltip"><strong>${text(obj.callsign || obj.icao24)}</strong><br/>${obj.altitudeFt?.toLocaleString() ?? 0} ft · ${obj.groundSpeedKts ?? 0} kts · ${Math.round(obj.trackDeg ?? 0)}°</div>` };
+        return { html: `<div class="deckgl-tooltip"><strong>${text(obj.callsign || obj.icao24)}</strong><br/>${numericLabel(obj.altitudeFt)} ft · ${numericLabel(obj.groundSpeedKts)} kts · ${numericLabel(obj.trackDeg, 0)}°</div>` };
       case 'apt-groups-layer':
         return { html: `<div class="deckgl-tooltip"><strong>${text(obj.name)}</strong><br/>${text(obj.aka)}<br/>${t('popups.sponsor')}: ${text(obj.sponsor)}</div>` };
       case 'minerals-layer':
@@ -5034,7 +5118,7 @@ export class DeckGLMap {
       case 'ais-disruptions-layer':
         return { html: `<div class="deckgl-tooltip"><strong>AIS ${text(obj.type || t('components.deckgl.tooltip.disruption'))}</strong><br/>${text(obj.severity)} ${t('popups.severity')}<br/>${text(obj.description)}</div>` };
       case 'gps-jamming-layer':
-        return { html: `<div class="deckgl-tooltip"><strong>GPS Jamming</strong><br/>${text(obj.level)} · aircraft affected: ${Number(obj.pct).toFixed(1)}%<br/>H3: ${text(obj.h3)}</div>` };
+        return { html: `<div class="deckgl-tooltip"><strong>GPS Jamming</strong><br/>${text(obj.level)} · aircraft affected: ${numericLabel(obj.pct, 1)}%<br/>H3: ${text(obj.h3)}</div>` };
       case 'cable-advisories-layer': {
         const cableName = UNDERSEA_CABLES.find(c => c.id === obj.cableId)?.name || obj.cableId;
         return { html: `<div class="deckgl-tooltip"><strong>${text(cableName)}</strong><br/>${text(obj.severity || t('components.deckgl.tooltip.advisory'))}<br/>${text(obj.description)}</div>` };
@@ -5044,7 +5128,11 @@ export class DeckGLMap {
       case 'weather-layer': {
         const areaDesc = typeof obj.areaDesc === 'string' ? obj.areaDesc : '';
         const area = areaDesc ? `<br/><small>${text(areaDesc.slice(0, 50))}${areaDesc.length > 50 ? '...' : ''}</small>` : '';
-        return { html: `<div class="deckgl-tooltip"><strong>${text(obj.event || t('components.deckgl.layers.weatherAlerts'))}</strong><br/>${text(obj.severity)}${area}</div>` };
+        const issuedBy = typeof obj.issuedBy === 'string' && obj.issuedBy ? `<br/>${text(obj.issuedBy)}` : '';
+        const marine = [obj.wind, obj.seaState, obj.visibility].filter((value) => typeof value === 'string' && value).join(' · ');
+        const marineLine = marine ? `<br/><small>${text(marine)}</small>` : '';
+        const sourceLine = obj.sourceUrl ? `<br/><small>${text(String(obj.sourceUrl))}</small>` : '';
+        return { html: `<div class="deckgl-tooltip"><strong>${text(obj.event || t('components.deckgl.layers.weatherAlerts'))}</strong><br/>${text(obj.severity)}${issuedBy}${area}${marineLine}${sourceLine}</div>` };
       }
       case 'canada-roads-layer':
       case 'canada-roads-paths-layer': {
@@ -5070,7 +5158,7 @@ export class DeckGLMap {
       case 'traffic-anomalies-layer':
         return { html: `<div class="deckgl-tooltip"><strong>${text(obj.type || 'Traffic Anomaly')}</strong><br/>${text(obj.locationName || obj.asnName || '')}</div>` };
       case 'ddos-locations-layer':
-        return { html: `<div class="deckgl-tooltip"><strong>DDoS: ${text(obj.countryName)}</strong><br/>${text(obj.percentage ? obj.percentage.toFixed(1) + '%' : '')}</div>` };
+        return { html: `<div class="deckgl-tooltip"><strong>DDoS: ${text(obj.countryName)}</strong><br/>${text(obj.percentage ? numericLabel(obj.percentage, 1) + '%' : '')}</div>` };
       case 'cyber-threats-layer':
         return { html: `<div class="deckgl-tooltip"><strong>${t('popups.cyberThreat.title')}</strong><br/>${text(obj.severity || t('components.deckgl.tooltip.medium'))} · ${text(obj.country || t('popups.unknown'))}</div>` };
       case 'iran-events-layer':
@@ -5079,7 +5167,7 @@ export class DeckGLMap {
         return { html: `<div class="deckgl-tooltip"><strong>📰 ${t('components.deckgl.tooltip.news')}</strong><br/>${text(obj.title?.slice(0, 80) || '')}</div>` };
       case 'positive-events-layer': {
         const catLabel = obj.category ? obj.category.replace(/-/g, ' & ') : 'Positive Event';
-        const countInfo = obj.count > 1 ? `<br/><span style="opacity:.7">${obj.count} sources reporting</span>` : '';
+        const countInfo = obj.count > 1 ? `<br/><span style="opacity:.7">${numericLabel(obj.count)} sources reporting</span>` : '';
         return { html: `<div class="deckgl-tooltip"><strong>${text(obj.name)}</strong><br/><span style="text-transform:capitalize">${text(catLabel)}</span>${countInfo}</div>` };
       }
       case 'kindness-layer':
@@ -5088,8 +5176,8 @@ export class DeckGLMap {
         const hcName = obj.properties?.name ?? 'Unknown';
         const hcCode = obj.properties?.['ISO3166-1-Alpha-2'];
         const hcScore = hcCode ? this.happinessScores.get(hcCode as string) : undefined;
-        const hcScoreStr = hcScore != null ? hcScore.toFixed(1) : 'No data';
-        return { html: `<div class="deckgl-tooltip"><strong>${text(hcName)}</strong><br/>Happiness: ${hcScoreStr}/10${hcScore != null ? `<br/><span style="opacity:.7">${text(this.happinessSource)} (${this.happinessYear})</span>` : ''}</div>` };
+        const hcScoreStr = hcScore != null ? numericLabel(hcScore, 1) : 'No data';
+        return { html: `<div class="deckgl-tooltip"><strong>${text(hcName)}</strong><br/>Happiness: ${hcScoreStr}/10${hcScore != null ? `<br/><span style="opacity:.7">${text(this.happinessSource)} (${numericLabel(this.happinessYear, 0)})</span>` : ''}</div>` };
       }
       case 'cii-choropleth-layer': {
         const ciiName = obj.properties?.name ?? 'Unknown';
@@ -5097,7 +5185,7 @@ export class DeckGLMap {
         const ciiEntry = ciiCode ? this.ciiScoresMap.get(ciiCode as string) : undefined;
         if (!ciiEntry) return { html: `<div class="deckgl-tooltip"><strong>${text(ciiName)}</strong><br/><span style="opacity:.7">No CII data</span></div>` };
         const levelColor = DeckGLMap.CII_LEVEL_HEX[ciiEntry.level] ?? '#888';
-        return { html: `<div class="deckgl-tooltip"><strong>${text(ciiName)}</strong><br/>CII: <span style="color:${levelColor};font-weight:600">${ciiEntry.score}/100</span><br/><span style="text-transform:capitalize;opacity:.7">${text(ciiEntry.level)}</span></div>` };
+        return { html: `<div class="deckgl-tooltip"><strong>${text(ciiName)}</strong><br/>CII: <span style="color:${levelColor};font-weight:600">${numericLabel(ciiEntry.score)}/100</span><br/><span style="text-transform:capitalize;opacity:.7">${text(ciiEntry.level)}</span></div>` };
       }
       case 'resilience-choropleth-layer': {
         const resilienceName = obj.properties?.name ?? 'Unknown';
@@ -5119,7 +5207,7 @@ export class DeckGLMap {
             ? '<br/><span style="opacity:.7">Outside headline ranking</span>'
             : '';
         return {
-          html: `<div class="deckgl-tooltip"><strong>${text(resilienceName)}</strong><br/>Resilience: <span style="color:${levelColor};font-weight:600">${resilienceEntry.overallScore.toFixed(1)}/100</span><br/><span style="text-transform:capitalize;opacity:.7">Visual band: ${text(visualBand)}</span><br/><span style="text-transform:capitalize;opacity:.7">API level: ${text(serverLevel)}</span>${confidenceNote}</div>`,
+          html: `<div class="deckgl-tooltip"><strong>${text(resilienceName)}</strong><br/>Resilience: <span style="color:${levelColor};font-weight:600">${numericLabel(resilienceEntry.overallScore, 1)}/100</span><br/><span style="text-transform:capitalize;opacity:.7">Visual band: ${text(visualBand)}</span><br/><span style="text-transform:capitalize;opacity:.7">API level: ${text(serverLevel)}</span>${confidenceNote}</div>`,
         };
       }
       case 'species-recovery-layer': {
@@ -5127,13 +5215,13 @@ export class DeckGLMap {
       }
       case 'renewable-installations-layer': {
         const riTypeLabel = obj.type ? String(obj.type).charAt(0).toUpperCase() + String(obj.type).slice(1) : 'Renewable';
-        return { html: `<div class="deckgl-tooltip"><strong>${text(obj.name)}</strong><br/>${riTypeLabel} &middot; ${obj.capacityMW?.toLocaleString() ?? '?'} MW<br/><span style="opacity:.7">${text(obj.country)} &middot; ${obj.year}</span></div>` };
+        return { html: `<div class="deckgl-tooltip"><strong>${text(obj.name)}</strong><br/>${text(riTypeLabel)} &middot; ${numericLabel(obj.capacityMW)} MW<br/><span style="opacity:.7">${text(obj.country)} &middot; ${numericLabel(obj.year, 0)}</span></div>` };
       }
       case 'gulf-investments-layer': {
         const inv = obj as GulfInvestment;
         const flag = inv.investingCountry === 'SA' ? '🇸🇦' : '🇦🇪';
         const usd = inv.investmentUSD != null
-          ? (inv.investmentUSD >= 1000 ? `$${(inv.investmentUSD / 1000).toFixed(1)}B` : `$${inv.investmentUSD}M`)
+          ? (inv.investmentUSD >= 1000 ? `$${(inv.investmentUSD / 1000).toFixed(1)}B` : `$${numericLabel(inv.investmentUSD)}M`)
           : t('components.deckgl.tooltip.undisclosed');
         const stake = inv.stakePercent != null ? `<br/>${text(String(inv.stakePercent))}% ${t('components.deckgl.tooltip.stake')}` : '';
         return {
@@ -5147,7 +5235,7 @@ export class DeckGLMap {
         };
       }
       case 'satellite-imagery-layer': {
-        let imgHtml = `<div class="deckgl-tooltip"><strong>&#128752; ${text(obj.satellite)}</strong><br/>${text(obj.datetime)}<br/>Res: ${Number(obj.resolutionM)}m \u00B7 ${text(obj.mode)}`;
+        let imgHtml = `<div class="deckgl-tooltip"><strong>&#128752; ${text(obj.satellite)}</strong><br/>${text(obj.datetime)}<br/>Res: ${numericLabel(obj.resolutionM)}m \u00B7 ${text(obj.mode)}`;
         if (isAllowedPreviewUrl(obj.previewUrl)) {
           const safeHref = escapeHtml(new URL(obj.previewUrl).href);
           imgHtml += `<br><img src="${safeHref}" referrerpolicy="no-referrer" style="max-width:180px;max-height:120px;margin-top:4px;border-radius:4px;" class="imagery-preview" alt="">`;
@@ -5157,7 +5245,7 @@ export class DeckGLMap {
       }
       case 'webcam-layer': {
         const label = 'count' in obj
-          ? `${obj.count} webcams`
+          ? `${numericLabel(obj.count)} webcams`
           : (obj.title || obj.name || 'Webcam');
         return { html: `<div class="deckgl-tooltip"><strong>${text(label)}</strong></div>` };
       }
@@ -5348,8 +5436,8 @@ export class DeckGLMap {
       return;
     }
 
-    if (layerId === 'webcam-layer' && !('count' in info.object)) {
-      this.showWebcamClickPopup(info.object as WebcamEntry, info.x, info.y);
+    if (layerId === 'webcam-layer') {
+      this.handleWebcamLayerClick(info);
       return;
     }
 
@@ -5391,6 +5479,7 @@ export class DeckGLMap {
       'storm-forecast-track-layer': 'natEvent',
       'storm-past-track-layer': 'natEvent',
       'storm-cone-layer': 'natEvent',
+      'storm-imd-wind-radii-layer': 'natEvent',
       'waterways-layer': 'waterway',
       'economic-centers-layer': 'economic',
       'stock-exchanges-layer': 'stockExchange',
@@ -5469,7 +5558,24 @@ export class DeckGLMap {
     }
   }
 
-  private async showWebcamClickPopup(webcam: WebcamEntry, x: number, y: number): Promise<void> {
+  /**
+   * Layer-level webcam pick. Returns true so deck.gl consumes the event and the
+   * global MapboxOverlay handler does not run a second time (#3877 / #4230).
+   * Clusters zoom in instead of opening a tab per camera.
+   */
+  private handleWebcamLayerClick(info: PickingInfo): boolean {
+    return dispatchWebcamLayerClick(info.object, {
+      onLeaf: (webcam) => {
+        this.showWebcamClickPopup(webcam, info.x, info.y);
+      },
+      onCluster: (cluster) => {
+        const currentZoom = this.maplibreMap?.getZoom() ?? this.state.zoom;
+        this.setCenter(cluster.lat, cluster.lng, Math.min(currentZoom + 2, 14));
+      },
+    });
+  }
+
+  private async showWebcamClickPopup(webcam: WebcamLeafLike, x: number, y: number): Promise<void> {
     // Remove any existing popup
     this.container.querySelector('.deckgl-webcam-popup')?.remove();
 
@@ -5491,12 +5597,20 @@ export class DeckGLMap {
     popup.appendChild(locationEl);
 
     const id = webcam.webcamId;
-
-    // Fetch playerUrl for when user pins
-    const imageData = await fetchWebcamImage(id).catch(() => null);
+    const streamUrl = resolveWebcamStreamUrl(webcam);
+    if (streamUrl) {
+      const link = document.createElement('a');
+      link.className = 'deckgl-webcam-popup-link';
+      link.href = streamUrl;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.textContent = 'Open on Windy \u2197';
+      popup.appendChild(link);
+    }
 
     const pinBtn = document.createElement('button');
     pinBtn.className = 'webcam-pin-btn';
+    let imageData: Awaited<ReturnType<typeof fetchWebcamImage>> | null = null;
     if (isPinned(id)) {
       pinBtn.classList.add('webcam-pin-btn--pinned');
       pinBtn.textContent = '\u{1F4CC} Pinned';
@@ -5532,7 +5646,16 @@ export class DeckGLMap {
     const autoDismiss = setTimeout(cleanup, 8000);
     setTimeout(() => document.addEventListener('click', closeHandler), 0);
 
+    // Show immediately so a slow image fetch cannot look like a dead click.
     this.container.appendChild(popup);
+
+    imageData = await fetchWebcamImage(id).catch(() => null);
+    if (!popup.isConnected) return;
+
+    if (imageData?.windyUrl) {
+      const existing = popup.querySelector<HTMLAnchorElement>('.deckgl-webcam-popup-link');
+      if (existing) existing.href = imageData.windyUrl;
+    }
   }
 
   // Utility methods
@@ -6198,12 +6321,19 @@ export class DeckGLMap {
   private updateZoomHints(): void {
     const toggleList = this.container.querySelector('.deckgl-layer-toggles .toggle-list');
     if (!toggleList) return;
+    // Mirror isLayerVisible()'s zoom source exactly so the guard key can
+    // never disagree with the visibility computation it protects.
+    const zoom = this.maplibreMap?.getZoom() || 2;
+    // Skip the full toggle-DOM scan when neither the visibility inputs
+    // (zoom, layer flags) nor the row nodes changed (#7776).
+    if (!this.zoomHintGuard.shouldScan({ zoom, layers: this.state.layers }, toggleList)) return;
     for (const [key, enabled] of Object.entries(this.state.layers)) {
       const toggle = toggleList.querySelector(`.layer-toggle[data-layer="${key}"]`) as HTMLElement | null;
       if (!toggle) continue;
       const zoomHidden = !!enabled && !this.isLayerVisible(key as keyof MapLayers);
       toggle.classList.toggle('zoom-hidden', zoomHidden);
     }
+    this.zoomHintGuard.markScanned({ zoom, layers: this.state.layers }, toggleList);
   }
 
   private markViewportMoving(target: { lat: number; lon: number; zoom: number }, fallbackMs: number): number {
@@ -8217,6 +8347,8 @@ export class DeckGLMap {
 
 
     this.layerCache.clear();
+    this.activeNuclearFacilities = null;
+    this.activeDatacenters = null;
 
     this.deckOverlay?.finalize();
     this.deckOverlay = null;

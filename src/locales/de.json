@@ -129,7 +129,8 @@
       "activeSirens": "Aktive Sirenen",
       "sirens24h": "Sirenen / 24h",
       "aviationDisruptions": "Luftfahrtstörungen",
-      "gpsJammingZones": "GPS-Störzonen"
+      "gpsJammingZones": "GPS-Störzonen",
+      "temporalUnavailable": "Zeitliche Beobachtungen nicht verfügbar"
     },
     "countryFacts": "Länderfakten",
     "loadingFacts": "Länderfakten werden geladen...",
@@ -192,7 +193,7 @@
       "decisionSignalsUnavailable": "Der China-Entscheidungssignal-Snapshot ist derzeit nicht verfügbar."
     },
     "foodStocks": "Food stocks",
-    "foodStocksHelp": "USDA PSD commodity stocks-to-use by marketing year, with the world ratio alongside for context. FAOSTAT fills production only where PSD has no country coverage.",
+    "foodStocksHelp": "USDA PSD commodity stocks-to-use by marketing year, with the world ratio alongside for context. FAOSTAT Food Balances supplies production and domestic supply when PSD has no complete country balance.",
     "loadingFoodStocks": "Loading food stocks…",
     "foodStocksUnavailable": "Food stocks unavailable.",
     "foodStocksProLocked": "Upgrade to PRO for commodity stocks-to-use",
@@ -232,6 +233,71 @@
       "manufacturingShare": "Manufacturing employment",
       "source": "Sources: {{sources}}.",
       "retained": "{{stage}} data retained from the last successful refresh."
+    },
+    "fiveFactorScorecard": {
+      "title": "Fünf-Faktor-Resilienz-Scorecard",
+      "help": "Frozen v1 Evidenzwerte für Nahrung, Energie, Demografie, Technologie und Verteidigung. Erweitern Sie eine Zeile, um Eingaben, Quellenherkunft und Gründe für fehlende Daten zu prüfen.",
+      "loading": "Lade die fünf-Faktor-Scorecard…",
+      "unavailable": "Fünf-Faktor-Scorecard nicht verfügbar.",
+      "proLocked": "Upgrade auf PRO für die fünf-Faktor-Resilienz-Scorecard",
+      "insufficient": "Nicht genügend Daten",
+      "notAvailable": "Nicht verfügbar",
+      "noEvidence": "Keine Evidenz für diese Säule verfügbar.",
+      "score": "{{score}}/5",
+      "coverage": "{{coverage}}% Abdeckung",
+      "methodologyVersion": "Methodologie v{{version}}",
+      "methodologyLink": "Methodologie ansehen",
+      "pillars": {
+        "food": "Nahrung",
+        "energy": "Energie",
+        "demographics": "Demografie",
+        "technology": "Technologie",
+        "defense": "Verteidigung"
+      },
+      "reasons": {
+        "source-unavailable": "Quelle nicht verfügbar",
+        "country-unavailable": "Land nicht verfügbar",
+        "invalid-value": "Ungültiger Quellenwert",
+        "stale": "Evidenz veraltet",
+        "coverage-below-floor": "Abdeckung unter dem Bewertungsboden",
+        "required-group-missing": "Erforderliche Evidenzgruppe fehlt",
+        "missing-population": "Bevölkerung nicht verfügbar",
+        "redistribution-blocked": "Quellenumverteilung nicht erlaubt",
+        "pillar-unavailable": "Säule nicht verfügbar"
+      },
+      "inputs": {
+        "population": "Bevölkerung",
+        "food_productionBalance": "Produktionsbilanz",
+        "food_stocksToUse": "Lagerbestände zur Nutzung",
+        "food_waterSecurity": "Wassersicherheit",
+        "food_importDiversity": "Importdiversität",
+        "energy_productionBalance": "Produktionsbilanz",
+        "energy_lowCarbonShare": "Anteil erneuerbarer Energie",
+        "energy_gridEfficiency": "Netzwerkeffizienz",
+        "demographics_totalDependency": "Gesamte Abhängigkeit",
+        "demographics_oldAgeDependency": "Altersabhängigkeit",
+        "demographics_workingAgeProjection": "Prognose Erwerbsbevölkerung",
+        "demographics_tertiaryEnrollment": "Drittstufenschulbesuch",
+        "demographics_researchersPerMillion": "Forscher pro Million",
+        "demographics_stemGraduateShare": "Anteil STEM-Absolventen",
+        "demographics_trainedIndustrialShare": "Anteil ausgebildeter Industriearbeiter",
+        "demographics_manufacturingEmploymentShare": "Anteil Beschäftigung in der Industrie",
+        "technology_internetUse": "Internetnutzung",
+        "technology_mobileSubscriptions": "Mobilabonnements",
+        "technology_fixedBroadband": "Feste Breitbandverbindung",
+        "technology_rdSpend": "Forschung und Entwicklungsausgaben",
+        "technology_researchersPerMillion": "Forscher pro Million",
+        "technology_stemGraduateShare": "Anteil STEM-Absolventen",
+        "technology_electricityAccess": "Energiezugang",
+        "defense_expenditureUsd": "Militärausgaben",
+        "defense_expenditurePctGdp": "Militärlast",
+        "defense_personnel": "Personal der Streitkräfte",
+        "defense_industrialBalance": "Verteidigungsindustrielle Bilanz",
+        "defense_supplierDiversity": "Waffenlieferanten-Diversität"
+      }
+    },
+    "defenseIndustrialBase": {
+      "proLocked": "Upgraden Sie auf PRO für Waffenlieferanten-Abhängigkeiten und militärische Kapazität"
     }
   },
   "header": {
@@ -528,6 +594,8 @@
       "recent": "Aktuelle Suchanfragen",
       "empty": "Daten durchsuchen oder Befehle ausführen",
       "noResults": "Keine Ergebnisse",
+      "resultAnnouncement_one": "{{count}} Ergebnis für {{query}}",
+      "resultAnnouncement_other": "{{count}} Ergebnisse für {{query}}",
       "navigate": "navigieren",
       "select": "wählen",
       "close": "schließen",
@@ -805,7 +873,6 @@
         "space": "WELTRAUM"
       },
       "paused": "Webcams pausiert",
-      "pausedIdle": "Webcams pausiert — Maus bewegen zum Fortsetzen",
       "play": "Abspielen",
       "previewStatus": "Live-Vorschau"
     },
@@ -903,7 +970,8 @@
       "refineryStage": "Refine",
       "stageUnavailable": "No published figures for this stage",
       "withheldNote": "W withheld",
-      "productionCaption": "Country shares of actual production. The map deposits layer shows where resources sit; this table shows who mines or refines them."
+      "productionCaption": "Country shares of actual production. The map deposits layer shows where resources sit; this table shows who mines or refines them.",
+      "productionProLocked": "Upgraden Sie auf PRO für Anteile von Bergbau- und Raffinerieländern mit Konzentration (HHI) nach Stufe"
     },
     "tradePolicy": {
       "tariffs": "Zölle",
@@ -1226,9 +1294,6 @@
       "datacenter": "Rechenzentrum",
       "base": "Basis",
       "nuclear": "Nuklear"
-    },
-    "community": {
-      "joinDiscussion": "Gestalten Sie mit, was als Nächstes kommt"
     },
     "threatLabels": {
       "critical": "KRIT",
@@ -1562,6 +1627,16 @@
       "loading": "Verbindung zum Telegram-Relay wird hergestellt...",
       "empty": "Keine Nachrichten verfügbar",
       "disabled": "Telegram-Relay nicht aktiv",
+      "watchlistPlaceholder": "Öffentlichen Kanal per @username hinzufügen",
+      "resolving": "Kanal wird geprüft...",
+      "invalidUsername": "Verwende einen öffentlichen Telegram-@username",
+      "resolveFailed": "Kanal konnte nicht gefunden werden",
+      "watchlistLimit": "Du kannst bis zu {{count}} eigene Kanäle verfolgen",
+      "previewMembers": "{{count}} Mitglieder",
+      "addChannel": "Kanal hinzufügen",
+      "added": "Hinzugefügt",
+      "remove": "Entfernen",
+      "custom": "Eigener Kanal",
       "filterAll": "Alle",
       "filterBreaking": "Eilmeldung",
       "filterConflict": "Konflikte",
@@ -1760,7 +1835,10 @@
       "provenanceTitle": "Herkunft der Berichterstattung: Anzahl der erfassten Meldungen und unterschiedlichen Quellen, aus denen dieser Lagebericht ausgewählt wurde",
       "compiledFrom": "Zusammengestellt aus {{stories}} Meldungen aus {{sources}} Quellen",
       "briefFreshness": "Generiert vor {{minutes}}m · neueste Quelle {{hours}}h alt",
-      "briefStoryDetails": "Story-Details ({{count}})"
+      "briefStoryDetails": "Details zur Meldung ({{count}})",
+      "streamIdleStopLabel": "Live-Video bei Inaktivität stoppen",
+      "streamIdleStopDesc": "Stoppt Live News und Live Webcams nach dieser Zeit ohne Aktivität und zeigt einen Hinweis im Panel an.",
+      "streamIdleStopNever": "Nie"
     },
     "etfFlows": {
       "unavailable": "ETF-Daten vorübergehend nicht verfügbar",
@@ -1962,6 +2040,22 @@
       "metals": {
         "gold": "Gold",
         "silver": "Silver"
+      },
+      "divergence": {
+        "compositeValue": "Physischer Stressindex: {{value}} / 100",
+        "fiveDayTrend": "Fünf-Handelstage-Prämientrend",
+        "regimes": {
+          "normal": "Normal",
+          "elevated": "Erhöht",
+          "stressed": "Angespannt",
+          "extreme": "Extrem"
+        },
+        "states": {
+          "insufficientHistory": "Wird aufgewärmt: {{count}} / {{required}} Handelspunkte",
+          "staleInput": "Physische Benchmark ist veraltet",
+          "missingInput": "Divergenzsignal nicht verfügbar"
+        },
+        "twentyDayTrend": "Aufschlag-Trend über 20 Handelstage"
       }
     },
     "crypto": {
@@ -2118,6 +2212,26 @@
         "failedToLoad": "Fehler beim Laden"
       },
       "cissStale": "EZB hat keinen neueren Wert veröffentlicht – dieser Messwert könnte veraltet sein."
+    },
+    "supplyVulnerability": {
+      "title": "Rohstoffverwundbarkeit",
+      "help": "Länderexposition nach Rohstoff, abgeleitet aus Lieferantenkonzentration, Seetransit und verfügbaren strategischen Reserven.",
+      "loading": "Rohstoffverwundbarkeit wird geladen…",
+      "unavailable": "Daten zur Rohstoffverwundbarkeit sind nicht verfügbar",
+      "noCoverage": "Unzureichende Nachweise für dieses Land",
+      "unknown": "Unbekannt",
+      "concentration": "Konzentration",
+      "transit": "Transitverkehr",
+      "buffer": "Reserve",
+      "sources": "Quellen",
+      "methodology": "Methodik",
+      "hormuzTitle": "Rohstoffabhängigkeiten",
+      "dependentCountries": "Abhängige Länder",
+      "dependentCommodities": "Abhängige Rohstoffe",
+      "stateOk": "Aktuell",
+      "stateStale": "Veraltete Eingabe",
+      "stateInsufficient": "Unzureichende Daten",
+      "proLocked": "Upgraden Sie auf PRO für Rohstoff-Anfälligkeitsbewertung"
     },
     "hormuzTracker": {
       "infoTooltip": "<strong>Hormuz-Handelstracker</strong> AIS-Schiffsverfolgung in Echtzeit durch die Straße von Hormuz, den kritischsten Öl-Engpass der Welt. Überwacht Tankeranzahl, Störungsereignisse und wöchentliche Flussänderungen. Etwa 20 % der globalen Ölversorgung passiert hier täglich.",
@@ -2513,7 +2627,14 @@
       "signals_one": "{{count}} Signal",
       "signals_other": "{{count}} Signale",
       "analyzing": "Wird analysiert...",
-      "viewOnMap": "Auf Karte anzeigen"
+      "viewOnMap": "Auf Karte anzeigen",
+      "waiting": "Warten auf die nächste Datenaktualisierung. Dieses Panel wird automatisch aktualisiert.",
+      "offline": "Warten auf eine Verbindung. Dieses Panel wird automatisch aktualisiert, sobald Sie wieder online sind.",
+      "updated": "Aktualisiert {{time}}",
+      "saved": "Letzte bekannte Aktualisierung {{time}} · Suche nach Aktualisierungen",
+      "savedOffline": "Letzte bekannte Aktualisierung {{time}} · Offline",
+      "localSignals": "Basierend auf geladenen Dashboard-Signalen",
+      "emptySaved": "Keine Konvergenz in der letzten bekannten Aktualisierung."
     },
     "thermalEscalation": {
       "title": "Thermische Eskalation",
@@ -2663,6 +2784,47 @@
       "rubBase": "Russische Zentralbank — Rubel pro 1 Einheit",
       "rubPerUnit": "Rubel pro Einheit",
       "sourceCbr": "Quelle: Russische Zentralbank"
+    },
+    "passkeyOffer": {
+      "title": "Passkey speichern?",
+      "body": "Melden Sie sich beim nächsten Mal mit Ihrem Fingerabdruck, Gesicht oder der Geräte-PIN an — kein Passwort zum Merken.",
+      "accept": "Passkey speichern",
+      "dismiss": "Später",
+      "close": "Schließen",
+      "announce": "Speichern Sie einen Passkey, um sich beim nächsten Anmelden schneller anzumelden.",
+      "busy": "Gerät wird vorbereitet…",
+      "succeeded": "Passkey gespeichert. Sie können ihn beim nächsten Anmelden verwenden.",
+      "retryable": "Das konnte nicht abgeschlossen werden. Sie können es erneut versuchen.",
+      "failed": "Wir konnten keinen Passkey auf diesem Gerät speichern."
+    },
+    "decisionBrief": {
+      "commodityTitle": "Entscheidungsvorlage für Rohstoffe",
+      "commodity": "Rohstoff / Produkt",
+      "blockedChokepoint": "Als blockiert angenommener Engpass",
+      "commodityCapture": "Rohstoffvergleich erfassen",
+      "title": "Entscheidungsbrief",
+      "fuel": "Brennstoff",
+      "chokepoint": "Engpass",
+      "baseline": "Unterbrechung im Ausgangsszenario",
+      "comparison": "Unterbrechung im Vergleichsszenario",
+      "capture": "Beide erfassen / aktualisieren",
+      "downloadHtml": "Entscheidungsbrief als HTML herunterladen",
+      "downloadJson": "Entscheidungsbrief als JSON herunterladen",
+      "back": "← Zurück zum Länderbrief",
+      "select": "Wählen Sie eine Energieunterbrechung und erfassen Sie dann beide Szenarien.",
+      "changed": "Auswahl geändert. Erfassen Sie vor dem Export beide Szenarien.",
+      "loading": "Beide Szenarien werden erfasst…",
+      "captured": "Erfasst. Prüfen Sie vor dem Download die Beobachtungsdaten und Einschränkungen.",
+      "failed": "Die Szenarien konnten nicht erfasst werden. Prüfen Sie Ihren Zugang und versuchen Sie es erneut. Es ist kein Ergebnis zum Exportieren verfügbar.",
+      "locked": "Der Entscheidungsbrief ist mit Pro verfügbar."
+    },
+    "liveMedia": {
+      "idleStatus": "Wegen Inaktivität angehalten",
+      "idleBody": "Live-Video nach {{duration}} ohne Maus-, Tastatur- oder Touch-Aktivität gestoppt.",
+      "idleResume": "Fortsetzen",
+      "idleKeepPlaying": "Live-Video bei Inaktivität weiterspielen",
+      "idleSettingsHint": "Dies können Sie jederzeit unter Einstellungen › Medien ändern.",
+      "idleKeepPlayingToast": "Live-Video wird bei Inaktivität weitergespielt. Ändern Sie dies unter Einstellungen › Medien."
     }
   },
   "popups": {
@@ -3444,7 +3606,8 @@
   "auth": {
     "signIn": "Anmelden",
     "createAccount": "Konto erstellen",
-    "settings": "Einstellungen"
+    "settings": "Einstellungen",
+    "passkeyOffer": {}
   },
   "mcp": {
     "connectPanel": "MCP verbinden",

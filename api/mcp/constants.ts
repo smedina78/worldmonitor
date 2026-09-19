@@ -303,9 +303,41 @@ export const SERVER_NAME = 'worldmonitor';
 //     worldmonitor://account/mcp-allowance without spending a quota slot. The
 //     resource reports the enforcement counters, remaining calls, UTC reset,
 //     and free-account request-window state.
+// Bumped 1.17.0 → 1.18.0 (2026-08-30) reflecting:
+//   - Two subscription tools expose the country commodity-vulnerability
+//     portfolio and the single-pass chokepoint dependency inverse index.
+//   - Provider-restricted mineral evidence remains display-only and fails
+//     closed on verified MCP redistribution paths.
+// Bumped 1.18.0 → 1.19.0 (2026-09-05) reflecting a wire-visible capability
+// change, even though the published registry manifest is unaffected (its
+// payload is server.json's fields plus the tool count, and the count is still
+// 74):
+//   - `jmespath` is now universal. Three tools that never advertised it gained
+//     the input property, so `tools/list` genuinely differs.
+//   - A projected response from a licence-bearing tool is a NEW wire shape,
+//     {data, _attribution}, and initialize.instructions now says so.
+// Leaving the version at 1.18.0 would let one version string describe two
+// different tool surfaces, which is exactly what discovery scanners read it to
+// rule out.
+// Bumped 1.19.0 → 1.20.0 (2026-09-07) reflecting one new subscription tool:
+//   - get_country_coverage serves the country panel's own coverage timeline —
+//     clustered news incidents reconciled against first-party records, with
+//     per-producer freshness — so an agent stops rebuilding country matching,
+//     expiry and de-duplication out of the raw news tools. Tool count 74 → 75.
+// Bumped 1.20.0 → 1.21.0 (2026-09-18) reflecting a wire-visible contract fix (#8328):
+//   - Every successful `tools/call` now returns `structuredContent` beside
+//     `content[0].text`. A strict client (the official SDK, Grok Bot's host)
+//     rejected EVERY call with -32600 because each tool advertises an
+//     `outputSchema` and none returned structured content.
+//   - The advertised `outputSchema` is now `{ type: 'object', anyOf: [<the
+//     documented shape, unchanged>, <reshaped payload>, <rider-wrapped
+//     projection>, <_budget_exceeded>, <_jmespath_error>] }`, because the same
+//     client also validates `structuredContent` against it (-32602) and those
+//     responses are not the documented shape. `content[0].text` is
+//     byte-identical to before. See api/mcp/structured-content.ts.
 // Keep aligned with public/.well-known/mcp/server-card.json::serverInfo.version
 // — discovery scanners cross-check both values.
-export const SERVER_VERSION = '1.17.0';
+export const SERVER_VERSION = '1.21.0';
 
 // MCP logging capability — valid severity levels per the 2025-03-26 spec
 // (RFC 5424 subset). Stateless HTTP transport: we ACK the level but do not
@@ -332,6 +364,13 @@ export const MCP_LOG_LEVELS: ReadonlySet<string> = new Set([
 export const JMESPATH_MAX_EXPR_BYTES = 1024;
 export const JMESPATH_MAX_OUTPUT_BYTES = 256 * 1024;
 
+// Re-export so existing `api/mcp.ts` / test imports keep working. Definition
+// lives in `./body-limits` so Edge facades can import the cap without the
+// MCP upgrade/attribution module graph. Imported (not just re-exported) because
+// a bare `export ... from` creates no local binding for SERVER_INSTRUCTIONS.
+import { MAX_JSON_RPC_BODY_BYTES } from './body-limits';
+export { MAX_JSON_RPC_BODY_BYTES };
+
 // tools/list tool-description compression cap (v1.5.0). Defined here
 // rather than near `compressDescription` so SERVER_INSTRUCTIONS can
 // quote it without a temporal-dead-zone error. The compressDescription
@@ -348,18 +387,22 @@ export const TOOL_DESCRIPTION_MAX_BYTES = 120;
 // docs/mcp-jmespath.mdx, docs/mcp-error-catalog.mdx, and
 // docs/mcp-tools-reference.mdx, fetched on demand instead of amortising
 // ~550 bytes per session.
+const JMESPATH_SPEC_URL = 'https://jmespath.org/specification.html';
+
 export const SERVER_INSTRUCTIONS = [
-  'Every tool accepts an optional `jmespath` string. Server-side projection applied AFTER per-tool filter/summary; typical 80-95% token reduction. Grammar: https://jmespath.org/specification.html. Guide + 12 worked examples: https://www.worldmonitor.app/docs/mcp-jmespath.',
+  `Every tool accepts optional \`jmespath\`. Server-side projection is applied AFTER per-tool filter/summary. Typical 80-95% token reduction. A projected response from a tool whose data is licensed for reuse with attribution comes back as {data, _attribution} — keep the _attribution block with the values if you redistribute them. Grammar: ${JMESPATH_SPEC_URL}. Guide + 12 worked examples: https://www.worldmonitor.app/docs/mcp-jmespath.`,
   '',
-  `Limits: expr ≤ ${JMESPATH_MAX_EXPR_BYTES}B, output ≤ ${JMESPATH_MAX_OUTPUT_BYTES}B. Bad expressions soft-fail via {_jmespath_error, original_keys} envelope (consumes one daily quota unit on retry when that quota path applies — self-correct from original_keys). Full envelope reference: https://www.worldmonitor.app/docs/mcp-error-catalog.`,
+  `Limits: request body ≤ ${MAX_JSON_RPC_BODY_BYTES}B (over-cap POSTs are rejected before parsing with HTTP 413 + -32600 and error.data.reason 'body-too-large'; shrink the payload, do not retry it), expr ≤ ${JMESPATH_MAX_EXPR_BYTES}B, output ≤ ${JMESPATH_MAX_OUTPUT_BYTES}B. Bad expressions soft-fail via {_jmespath_error, original_keys} envelope (consumes one daily quota unit on retry when that quota path applies — self-correct from original_keys). Full envelope reference: https://www.worldmonitor.app/docs/mcp-error-catalog.`,
   '',
   `tools/list ships compressed tool descriptions (≤${TOOL_DESCRIPTION_MAX_BYTES}B). Call describe_tool({tool_name}) for the full uncompressed definition — quota-exempt (still counts toward the 60/min rate limit), so use freely while exploring. describe_tool({tool_name: 'nonexistent'}) returns {error: 'unknown_tool', available: [...]} so you can self-correct. Full reference: https://www.worldmonitor.app/docs/mcp-tools-reference.`,
   '',
-  `get_sources is the sole credential-free data tool and consumes no daily quota. It has a separate fail-closed ceiling of 10 unauthenticated calls/minute/IP. Signed-in accounts without a subscription get a free taste of CACHED-data tools (3 request windows/day, 5 calls/day); live-fetch tools stay Pro-only. Structured account-access denials carry \`error.data\` = {reason, nextStep, upgradeUrl}: -32001/401 reason=no-account, -32029/429 reason=allowance-exhausted, and -32002/403 reason=upgrade-required or lapsed-subscription. Other rate-limit and service errors may omit those fields; branch on the JSON-RPC code and HTTP status. Read each tool's \`_meta["worldmonitor/access"]\`: \`free\` is anonymous and quota-free, \`free-account\` is available to signed-in free accounts (cache-backed data calls spend the allowance; describe_tool does not), and \`subscription\` requires Pro. Upgrade: ${MCP_UPGRADE_URL}.`,
+  `get_sources is the sole credential-free data tool and consumes no daily quota. It has a separate fail-closed ceiling of 10 unauthenticated calls/minute/IP. Signed-in accounts without a subscription get a free taste of CACHED-data tools (3 request windows/day, 5 calls/day); live-fetch tools stay Pro-only. Structured account-access denials carry \`error.data\` = {reason, nextStep, upgradeUrl}: -32001/401 reason=no-account, -32029/429 reason=allowance-exhausted, and -32002/403 reason=upgrade-required or lapsed-subscription. Other rate-limit and service errors may omit those fields; branch on the JSON-RPC code and HTTP status. Read each tool's \`_meta["worldmonitor/access"]\`: \`free\` is anonymous and quota-free, \`free-account\` is available to signed-in free accounts (cache-backed data calls spend the allowance; describe_tool does not), and \`subscription\` requires Pro. Each tool also carries \`_meta["worldmonitor/weight"]\`: what one call COSTS, in REST-request units. It is charged only on an API plan, whose MCP calls and REST requests draw one daily budget (1 for a cache-backed read, 2 for a live downstream fetch, 3 for the two that fetch twice); Pro and Pro Business meter one unit per call on their own counter whatever the weight says. Budget before you call: the allowance resource reports \`sharedWithRestApi\` so you can tell whether \`used\` also counts REST traffic. Upgrade: ${MCP_UPGRADE_URL}.`,
   '',
   'Issue prompts/list to discover pre-built workflow templates (country-briefing, energy-shock-watch, market-open-prep, conflict-pulse, route-risk-check, freshness-audit). Each prompt pre-bakes a JMESPath projection per step so the first execution lands on the right shape. prompts/list + prompts/get are quota-exempt (per-minute limit only).',
   '',
   'Issue resources/list for concrete read-only resources (v1: seed-meta freshness — anonymous + quota-free) and resources/templates/list for parameterised URI templates (country risk, chokepoint status, market quote). Substitute the template placeholder, then resources/read the concrete URI; a template read is metered IDENTICALLY to the equivalent tools/call — same `_meta["worldmonitor/access"]` rules, spending the free-account allowance or the Pro daily quota according to the caller. There is no unmetered path around the cap via those resources.',
+  '',
+  'Agent Skills: when the `io.modelcontextprotocol/skills` extension is available, issue `skills/list` to discover skills, `skills/get` for one skill, then `resources/read` for each advertised `skill://` resource. Treat the returned `sha256` digest and byte `size` as the integrity contract; text resources use `text` and binary resources use base64 `blob` content.',
   '',
   // Content safety (#5743). This stanza is the ONLY delivery channel that
   // reliably reaches the model: hosts compress the tool description to its

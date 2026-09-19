@@ -28,6 +28,7 @@ import {
 } from '@/components/unified-settings-interactions';
 import type { MapProvider } from '@/config/basemap';
 import { escapeHtml } from '@/utils/sanitize';
+import { safeStorageRemove, safeStorageSet } from '@/utils/safe-storage';
 import type { PanelConfig } from '@/types';
 import { renderPreferences } from '@/services/preferences-content';
 import { renderNotificationsSettings, type NotificationsSettingsResult } from '@/services/notifications-settings';
@@ -36,6 +37,7 @@ import { track, trackApiAction } from '@/services/analytics';
 import {
   getEntitlementState,
   getEntitlementVerificationStatus,
+  hasEmbedAccessForAccount,
   hasFeature,
   isEntitled,
   onEntitlementChange,
@@ -44,8 +46,14 @@ import {
 import { hasPremiumAccess } from '@/services/panel-gating';
 import { getSubscription, isSubscriptionLoaded, onSubscriptionChange, openBillingPortal, prereserveBillingPortalTab } from '@/services/billing';
 import { BusinessSeatsSection } from '@/components/BusinessSeatsSection';
-import { deriveBillingUxState, getReactivationHref } from '@/services/billing-state';
+import {
+  deriveBillingUxState,
+  getReactivationHref,
+  getSubscriptionStatusTone,
+  type BillingStatusTone,
+} from '@/services/billing-state';
 import { createApiKey, listApiKeys, revokeApiKey, type ApiKeyInfo } from '@/services/api-keys';
+import { createEmbedKey, listEmbedKeys, revokeEmbedKey, type EmbedKeyInfo } from '@/services/embed-keys';
 import { listMcpClients, revokeMcpClient, fetchMcpQuota, type McpClientInfo, type McpQuota } from '@/services/mcp-clients';
 import {
   acknowledgePlanLimitNotice,
@@ -66,17 +74,7 @@ import {
   fontScaleLabel,
   parseFontScale,
 } from '@/services/font-scale-settings';
-
-
-function showToast(msg: string): void {
-  document.querySelector('.toast-notification')?.remove();
-  const el = document.createElement('div');
-  el.className = 'toast-notification';
-  el.textContent = msg;
-  document.body.appendChild(el);
-  requestAnimationFrame(() => el.classList.add('visible'));
-  setTimeout(() => { el.classList.remove('visible'); setTimeout(() => el.remove(), 300); }, 4000);
-}
+import { showToast } from '@/utils/toast';
 
 export interface UnifiedSettingsConfig {
   getPanelSettings: () => Record<string, PanelConfig>;
@@ -110,6 +108,23 @@ export interface UnifiedSettingsConfig {
 type TabId = UnifiedSettingsTabId;
 type AccountRequest = { userId: string; generation: number };
 
+/**
+ * Plan-card palette per billing status tone (#7315).
+ *
+ * The tone comes from the shared coverage predicate in billing-state.ts, never
+ * from a status string compared here — a cancelled plan still inside its paid
+ * window is a paying customer and must not be painted like a dead account.
+ *
+ * `unknown` (a provider status this client does not model) is deliberately the
+ * neutral grey, not red: we are inside the isEntitled() branch, so claiming a
+ * problem we have not established would repeat the bug in a new colour.
+ *
+ * Colours live on `--billing-tone-*` in main.css so [data-theme="light"] can
+ * raise every tone to WCAG AA for the 13px-bold plan name. The card only
+ * stamps `data-billing-tone`; it must not inline hex, or those overrides
+ * never apply. The status sentence stays on theme-aware var(--text-dim).
+ */
+
 export class UnifiedSettings {
   private overlay: HTMLElement;
   private focusTrap: FocusTrap;
@@ -142,6 +157,12 @@ export class UnifiedSettings {
   private apiKeysLoading = false;
   private apiKeysError = '';
   private newlyCreatedKey: string | null = null;
+  // ---- Embeds tab (partner-embed `wme_` keys) ----
+  private embedKeys: EmbedKeyInfo[] = [];
+  private embedKeysLoading = false;
+  private embedKeyCreating = false;
+  private embedKeysError = '';
+  private newlyCreatedEmbedKey: string | null = null;
   private planLimitNotices: ApiPlanLimitNotice[] = [];
   private planLimitNoticesLoading = false;
   private planLimitNoticesError = '';
@@ -220,7 +241,7 @@ export class UnifiedSettings {
           }
           if (result.outcome === 'no-customer') {
             showToast(
-              'Subscription is managed outside Dodo. Email support@worldmonitor.app for help.',
+              'Billing portal unavailable. Email support@worldmonitor.app for help.',
             );
           }
         });
@@ -247,7 +268,7 @@ export class UnifiedSettings {
           }
           if (result.outcome === 'no-customer') {
             showToast(
-              'Subscription is managed outside Dodo. Email support@worldmonitor.app for help.',
+              'Billing portal unavailable. Email support@worldmonitor.app for help.',
             );
           }
         });
@@ -385,6 +406,28 @@ export class UnifiedSettings {
         return;
       }
 
+      if (target.closest('.embed-keys-create-btn')) {
+        void this.handleCreateEmbedKey();
+        return;
+      }
+
+      const embedRevokeBtn = target.closest<HTMLElement>('.embed-keys-revoke-btn');
+      if (embedRevokeBtn?.dataset.keyId) {
+        void this.handleRevokeEmbedKey(embedRevokeBtn.dataset.keyId);
+        return;
+      }
+
+      if (target.closest('.embed-keys-copy-btn')) {
+        const key = this.newlyCreatedEmbedKey;
+        if (key) {
+          void navigator.clipboard.writeText(key).then(() => {
+            const btn = this.overlay.querySelector<HTMLElement>('.embed-keys-copy-btn');
+            if (btn) { btn.textContent = 'Copied!'; setTimeout(() => { btn.textContent = 'Copy'; }, 1500); }
+          });
+        }
+        return;
+      }
+
       const mcpRevokeBtn = target.closest<HTMLElement>('.mcp-clients-revoke-btn');
       if (mcpRevokeBtn?.dataset.tokenId) {
         void this.handleRevokeMcpClient(mcpRevokeBtn.dataset.tokenId);
@@ -482,6 +525,11 @@ export class UnifiedSettings {
     this.apiKeysLoading = false;
     this.apiKeysError = '';
     this.newlyCreatedKey = null;
+    this.embedKeys = [];
+    this.embedKeysLoading = false;
+    this.embedKeyCreating = false;
+    this.embedKeysError = '';
+    this.newlyCreatedEmbedKey = null;
     this.planLimitNotices = [];
     this.planLimitNoticesLoading = false;
     this.planLimitNoticesError = '';
@@ -513,9 +561,10 @@ export class UnifiedSettings {
 
   public open(tab?: TabId, replaceOverlayId?: OverlayId): void {
     const requestedTab = tab ?? this.activeTab;
-    this.activeTab = requestedTab === 'mcp-clients' && !hasFeature('mcpAccess')
-      ? 'settings'
-      : requestedTab;
+    const unavailable =
+      (requestedTab === 'mcp-clients' && !hasFeature('mcpAccess')) ||
+      (requestedTab === 'embeds' && !hasEmbedAccessForAccount(getAuthState().user?.role));
+    this.activeTab = unavailable ? 'settings' : requestedTab;
     this.resetPanelDraft();
     // Only on a FRESH session. open() is re-entrant on an overlay that is
     // already up (the deep-dive "Notify me about this country" jump to the
@@ -534,7 +583,7 @@ export class UnifiedSettings {
       if (replaceOverlayId) overlayHistory.replace(replaceOverlayId, 'settings', close);
       else overlayHistory.open('settings', close);
     }
-    localStorage.setItem('wm-settings-open', '1');
+    safeStorageSet('wm-settings-open', '1');
     document.addEventListener('keydown', this.escapeHandler);
     (this.overlay.querySelector('.unified-settings-tabs') as HTMLElement)?.addEventListener('keydown', (e: KeyboardEvent) => this.handleKeyDown(e));
     track('settings-open', { tab: tab ?? 'default' });
@@ -555,10 +604,15 @@ export class UnifiedSettings {
       }
 
       const hasMcpClientsTab = this.overlay.querySelector('[data-tab="mcp-clients"]') !== null;
-      if (hasMcpClientsTab !== hasFeature('mcpAccess')) {
+      const hasEmbedsTab = this.overlay.querySelector('[data-tab="embeds"]') !== null;
+      if (
+        hasMcpClientsTab !== hasFeature('mcpAccess') ||
+        hasEmbedsTab !== hasEmbedAccessForAccount(getAuthState().user?.role)
+      ) {
         // Entitlements can legitimately progress from a free/default snapshot
         // to Pro after the account handoff's first non-null emission. Rebuild
-        // the tab shape whenever MCP capability changes in either direction.
+        // the tab shape whenever MCP or embed capability changes in either
+        // direction.
         this.render();
         return;
       }
@@ -571,6 +625,14 @@ export class UnifiedSettings {
           void this.loadApiKeys();
         }
       }
+      const embedsPanel = this.overlay.querySelector<HTMLElement>('[data-panel-id="embeds"]');
+      if (embedsPanel) {
+        setTrustedHtml(embedsPanel, trustedHtml(this.renderEmbedKeysContent(), "legacy direct innerHTML migration"));
+        this.attachEmbedKeysHandlers();
+        if (this.activeTab === 'embeds' && getAuthState().user && hasEmbedAccessForAccount(getAuthState().user?.role)) {
+          void this.loadEmbedKeys();
+        }
+      }
       this.replaceUpgradeSection();
     });
     this.unsubscribeEntitlementVerification?.();
@@ -580,13 +642,16 @@ export class UnifiedSettings {
     this.unsubscribeSubscription?.();
     this.unsubscribeSubscription = onSubscriptionChange(() => {
       this.replaceUpgradeSection();
-      const sub = getSubscription();
-      if (sub?.planKey === 'api_business' && sub?.status === 'active') {
+      // Ask for seats whenever the account has ANY subscription row, and let
+      // the server decide who owns seats. Filtering here on the display row's
+      // plan/status would miss an owner whose Business row is outranked by
+      // another subscription (see BusinessSeatsSection.businessSubscriptionId);
+      // free accounts have no row at all, so they still never query.
+      if (getSubscription() !== null) {
         void this.businessSeatsSection.load();
       }
     });
-    const sub = getSubscription();
-    if (sub?.planKey === 'api_business' && sub?.status === 'active') {
+    if (getSubscription() !== null) {
       void this.businessSeatsSection.load();
     }
   }
@@ -649,7 +714,7 @@ export class UnifiedSettings {
     this.unsubscribeSubscription = null;
     this.stopMcpQuotaPolling();
     this.resetPanelDraft();
-    localStorage.removeItem('wm-settings-open');
+    safeStorageRemove('wm-settings-open');
     document.removeEventListener('keydown', this.escapeHandler);
     // Last: the host reloads data in response, and the overlay covering the
     // dashboard has to be gone before that lands for the user to see it.
@@ -748,6 +813,7 @@ export class UnifiedSettings {
     const prefs = renderPreferences({
       isDesktopApp: this.config.isDesktopApp,
       onMapProviderChange: this.config.onMapProviderChange,
+      onSettingSaved: () => showToast(t('modals.settingsWindow.saved')),
       isSignedIn,
     });
     const showNotificationsTab = !this.config.isDesktopApp;
@@ -755,6 +821,12 @@ export class UnifiedSettings {
       ? renderNotificationsSettings({ isSignedIn })
       : null;
     const showMcpClientsTab = hasFeature('mcpAccess');
+    // Gated on `embedAccess`, NOT `apiAccess`, for the same reason MCP Clients
+    // is gated on `mcpAccess`: both Pro tiers are `apiAccess: false`, so an
+    // apiAccess gate would hide embed keys from most of the customers who
+    // bought embedding. A tab of its own rather than a section of API Keys so
+    // the two credential classes never look interchangeable.
+    const showEmbedsTab = hasEmbedAccessForAccount(getAuthState().user?.role);
     const availableTabs: TabId[] = [
       'settings',
       ...(isSignedIn ? ['billing' as const] : []),
@@ -762,6 +834,7 @@ export class UnifiedSettings {
       'sources',
       ...(showNotificationsTab ? ['notifications' as const] : []),
       'api-keys',
+      ...(showEmbedsTab ? ['embeds' as const] : []),
       ...(showMcpClientsTab ? ['mcp-clients' as const] : []),
     ];
     this.activeTab = normalizeSettingsTab(this.activeTab, availableTabs);
@@ -781,6 +854,7 @@ export class UnifiedSettings {
           <button class="${tabClass('sources')}" tabindex="${this.activeTab === 'sources' ? 0 : -1}" data-tab="sources" role="tab" aria-selected="${this.activeTab === 'sources'}" id="us-tab-sources" aria-controls="us-tab-panel-sources">${t('header.tabSources')}</button>
           ${showNotificationsTab ? `<button class="${tabClass('notifications')}" tabindex="${this.activeTab === 'notifications' ? 0 : -1}" data-tab="notifications" role="tab" aria-selected="${this.activeTab === 'notifications'}" id="us-tab-notifications" aria-controls="us-tab-panel-notifications">${t('header.tabNotifications')}</button>` : ''}
           <button class="${tabClass('api-keys')}" tabindex="${this.activeTab === 'api-keys' ? 0 : -1}" data-tab="api-keys" role="tab" aria-selected="${this.activeTab === 'api-keys'}" id="us-tab-api-keys" aria-controls="us-tab-panel-api-keys">API Keys <span class="panel-pro-badge">PRO</span></button>
+          ${showEmbedsTab ? `<button class="${tabClass('embeds')}" tabindex="${this.activeTab === 'embeds' ? 0 : -1}" data-tab="embeds" role="tab" aria-selected="${this.activeTab === 'embeds'}" id="us-tab-embeds" aria-controls="us-tab-panel-embeds">Embeds <span class="panel-pro-badge">PRO</span></button>` : ''}
           ${showMcpClientsTab ? `<button class="${tabClass('mcp-clients')}" tabindex="${this.activeTab === 'mcp-clients' ? 0 : -1}" data-tab="mcp-clients" role="tab" aria-selected="${this.activeTab === 'mcp-clients'}" id="us-tab-mcp-clients" aria-controls="us-tab-panel-mcp-clients">MCP Clients <span class="panel-pro-badge">PRO</span></button>` : ''}
         </div>
         <div class="unified-settings-tab-panel${this.activeTab === 'settings' ? ' active' : ''}" data-panel-id="settings" id="us-tab-panel-settings" role="tabpanel" aria-labelledby="us-tab-settings">
@@ -839,6 +913,11 @@ export class UnifiedSettings {
         <div class="unified-settings-tab-panel${this.activeTab === 'api-keys' ? ' active' : ''}" data-panel-id="api-keys" id="us-tab-panel-api-keys" role="tabpanel" aria-labelledby="us-tab-api-keys">
           ${this.renderApiKeysContent()}
         </div>
+        ${showEmbedsTab ? `
+        <div class="unified-settings-tab-panel${this.activeTab === 'embeds' ? ' active' : ''}" data-panel-id="embeds" id="us-tab-panel-embeds" role="tabpanel" aria-labelledby="us-tab-embeds">
+          ${this.renderEmbedKeysContent()}
+        </div>
+        ` : ''}
         ${showMcpClientsTab ? `
         <div class="unified-settings-tab-panel${this.activeTab === 'mcp-clients' ? ' active' : ''}" data-panel-id="mcp-clients" id="us-tab-panel-mcp-clients" role="tabpanel" aria-labelledby="us-tab-mcp-clients">
           ${this.renderMcpClientsContent()}
@@ -876,12 +955,16 @@ export class UnifiedSettings {
     this.updateSourcesCounter();
 
     this.attachApiKeysHandlers();
+    this.attachEmbedKeysHandlers();
     if (loadAccountData) {
       if (this.activeTab === 'api-keys' || this.activeTab === 'mcp-clients') {
         void this.loadPlanLimitNotices();
       }
       if (this.activeTab === 'api-keys' && getAuthState().user && hasFeature('apiAccess')) {
         void this.loadApiKeys();
+      }
+      if (this.activeTab === 'embeds' && getAuthState().user && hasEmbedAccessForAccount(getAuthState().user?.role)) {
+        void this.loadEmbedKeys();
       }
       if (this.activeTab === 'mcp-clients' && getAuthState().user && hasFeature('mcpAccess')) {
         void this.loadMcpClients();
@@ -924,6 +1007,10 @@ export class UnifiedSettings {
     if (tab === 'api-keys' && getAuthState().user && hasFeature('apiAccess')) {
       void this.loadPlanLimitNotices();
       void this.loadApiKeys();
+    }
+
+    if (tab === 'embeds' && getAuthState().user && hasEmbedAccessForAccount(getAuthState().user?.role)) {
+      void this.loadEmbedKeys();
     }
 
     if (tab === 'mcp-clients' && getAuthState().user && hasFeature('mcpAccess')) {
@@ -1013,15 +1100,13 @@ export class UnifiedSettings {
         return this.renderPlanCheckingState();
       }
       const planName = sub?.displayName ?? 'Pro';
+      const now = Date.now();
       // A Business Pro grant invitee has no own subscription row (sub === null)
-      // but IS entitled (we're inside the isEntitled() branch) — treat that as
-      // 'active' rather than falling through to the red "problem" color, which
-      // the ternaries below would otherwise do for every status value that
-      // isn't literally 'active'/'on_hold'.
-      const effectiveStatus = sub?.status ?? 'active';
-      const statusColor = effectiveStatus === 'active' ? '#22c55e' : effectiveStatus === 'on_hold' ? '#eab308' : '#ef4444';
-      const statusBorderColor = effectiveStatus === 'active' ? '#22c55e33' : effectiveStatus === 'on_hold' ? '#eab30833' : '#ef444433';
-      const statusBgColor = effectiveStatus === 'active' ? '#22c55e0a' : effectiveStatus === 'on_hold' ? '#eab3080a' : '#ef44440a';
+      // but IS entitled (we're inside the isEntitled() branch) — they hold a
+      // grant that is working, so paint them like an active plan.
+      const tone: BillingStatusTone = sub === null
+        ? 'active'
+        : getSubscriptionStatusTone(sub, now);
 
       let statusLine = '';
       if (sub?.currentPeriodEnd) {
@@ -1034,6 +1119,12 @@ export class UnifiedSettings {
           statusLine = `Cancelled -- access until ${dateStr}`;
         } else if (sub.status === 'expired') {
           statusLine = 'Expired';
+        } else {
+          // A status this client does not model yet. We are inside the
+          // isEntitled() branch, so access is working — say only that, and
+          // point at the billing portal rather than leaving the `unknown`
+          // tone as a bare grey dot with no sentence at all.
+          statusLine = 'See Manage Billing for your current plan details.';
         }
       }
 
@@ -1047,16 +1138,16 @@ export class UnifiedSettings {
       }
 
       return `
-        <div class="upgrade-pro-section upgrade-pro-active" style="margin-top:16px;padding:14px 16px;border:1px solid ${statusBorderColor};border-radius:6px;background:${statusBgColor};">
+        <div class="upgrade-pro-section upgrade-pro-active" data-billing-tone="${tone}">
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:${statusLine ? '8' : '0'}px;">
-            <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${statusColor};flex-shrink:0;"></span>
-            <span style="color:${statusColor};font-weight:600;font-size:calc(13px * var(--wm-panel-effective-scale, 1));">${escapeHtml(planName)}</span>
+            <span class="upgrade-pro-tone-dot"></span>
+            <span class="upgrade-pro-plan-name">${escapeHtml(planName)}</span>
           </div>
           ${statusLine ? `<div class="upgrade-pro-status-line">${escapeHtml(statusLine)}</div>` : ''}
           ${sub?.planKey === 'api_starter' ? `<button class="upgrade-to-business-btn" style="margin-right:8px;">Upgrade to Business</button>` : ''}
           ${hasOwnSubscription ? `<button class="manage-billing-btn">Manage Billing</button>` : ''}
         </div>
-        ${sub?.planKey === 'api_business' && sub?.status === 'active' ? `<div id="usBusinessSeats">${this.businessSeatsSection.renderContent()}</div>` : ''}
+        ${hasOwnSubscription ? `<div id="usBusinessSeats">${this.businessSeatsSection.renderContent()}</div>` : ''}
       `;
     }
 
@@ -1104,7 +1195,7 @@ export class UnifiedSettings {
         }
         if (result.outcome === 'no-customer') {
           showToast(
-            'Subscription is managed outside Dodo. Email support@worldmonitor.app for help.',
+            'Billing portal unavailable. Email support@worldmonitor.app for help.',
           );
         }
       });
@@ -1585,7 +1676,7 @@ export class UnifiedSettings {
           return;
         }
         if (result.outcome === 'no-customer') {
-          showToast('Subscription is managed outside Dodo. Email support@worldmonitor.app for help.');
+          showToast('Billing portal unavailable. Email support@worldmonitor.app for help.');
         }
       });
       return;
@@ -1609,7 +1700,7 @@ export class UnifiedSettings {
             return;
           }
           if (result.outcome === 'no-customer') {
-            showToast('Subscription is managed outside Dodo. Email support@worldmonitor.app for help.');
+            showToast('Billing portal unavailable. Email support@worldmonitor.app for help.');
           }
         });
         return;
@@ -1857,6 +1948,233 @@ export class UnifiedSettings {
 
     setTrustedHtml(container, trustedHtml(active.map(renderKey).join('')
       + (revoked.length > 0 ? `<div class="api-keys-revoked-section"><div class="api-keys-revoked-label">Revoked</div>${revoked.map(renderKey).join('')}</div>` : ''), "legacy direct innerHTML migration"));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Embeds tab — partner-embed keys (`wme_…`)
+  //
+  // Gated on `embedAccess`, never `apiAccess`: both Pro tiers sell embedding
+  // without REST access, and the API Keys tab above would hide embed keys from
+  // exactly the customers this feature exists for. Same split, same reason as
+  // the MCP Clients tab below.
+  //
+  // A separate tab rather than a second list inside API Keys, because the two
+  // credentials have opposite handling rules and must never read as
+  // interchangeable: an embed key is MEANT to be published in the partner's
+  // page HTML; a `wm_` key there hands over the account's whole REST allowance.
+  // ---------------------------------------------------------------------------
+
+  private attachEmbedKeysHandlers(): void {
+    const input = this.overlay.querySelector<HTMLInputElement>('.embed-keys-name-input');
+    if (!input) return;
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') void this.handleCreateEmbedKey();
+    });
+  }
+
+  private renderEmbedKeysContent(): string {
+    const authState = getAuthState();
+
+    if (!authState.user) {
+      const lockIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>`;
+      return `
+        <div class="panel-locked-state">
+          <div class="panel-locked-icon">${lockIcon}</div>
+          <div class="panel-locked-desc">Sign in to manage embed keys</div>
+        </div>`;
+    }
+
+    if (!hasEmbedAccessForAccount(authState.user?.role)) {
+      // Defensive — the tab is hidden entirely without embedAccess, so this
+      // only shows if the subscription lapsed while the modal was open.
+      const upgradeIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="16 12 12 8 8 12"/><line x1="12" y1="16" x2="12" y2="8"/></svg>`;
+      return `
+        <div class="panel-locked-state">
+          <div class="panel-locked-icon">${upgradeIcon}</div>
+          <div class="panel-locked-desc">Put World Monitor panels on your own site with a scoped embed key.</div>
+        </div>`;
+    }
+
+    return `
+      <div class="embed-keys-section">
+        <div class="embed-keys-header">
+          <p class="embed-keys-desc">Embed keys authorise World Monitor panels on your site and nothing else, and each one is shown once at creation. Paste it into the <code>data-key</code> attribute of the <a class="embed-keys-docs-link" ${LEGAL_LINK_ATTR} href="${escapeHtml(`${WEB_APP_ORIGIN}/docs/embed-live-map`)}" target="_blank" rel="noopener noreferrer">embed loader</a>.</p>
+        </div>
+        <div class="embed-keys-note">
+          <strong>These are meant to be public.</strong> An embed key sits in your page's HTML where anyone can read it — that is the point, and it is why it exists as its own credential. Never put an API key (<code>wm_…</code>) there instead: that one carries your whole REST allowance. New reads with a revoked key are denied within about a minute. Already rendered paid-only panels remain visible until reload. A live map already showing its paid tier holds a session grant for up to 30 more minutes, then drops to the free tier.
+        </div>
+        <div class="embed-keys-create-form">
+          <input type="text" class="embed-keys-name-input" placeholder="Key name (e.g. marketing-site)" aria-label="Embed key name" maxlength="64" />
+          <button class="btn btn-primary embed-keys-create-btn" ${this.embedKeyCreating ? 'disabled' : ''}>${this.embedKeyCreating ? 'Creating...' : 'Create Embed Key'}</button>
+        </div>
+        <div class="embed-keys-created-banner" id="usEmbedKeysBanner" style="display:none;"></div>
+        <div class="embed-keys-error" id="usEmbedKeysError" style="display:none;"></div>
+        <div class="embed-keys-list" id="usEmbedKeysList">
+          <div class="embed-keys-loading">Loading...</div>
+        </div>
+      </div>`;
+  }
+
+  private async loadEmbedKeys(): Promise<void> {
+    const request = this.captureAccountRequest();
+    if (!request || this.embedKeysLoading) return;
+    this.embedKeysLoading = true;
+    this.embedKeysError = '';
+    this.renderEmbedKeysList();
+
+    try {
+      const keys = await listEmbedKeys();
+      if (!this.isAccountRequestCurrent(request)) return;
+      this.embedKeys = keys;
+    } catch (err) {
+      if (!this.isAccountRequestCurrent(request)) return;
+      this.embedKeysError = err instanceof Error ? err.message : 'Failed to load embed keys';
+    } finally {
+      if (this.isAccountRequestCurrent(request)) {
+        this.embedKeysLoading = false;
+        this.renderEmbedKeysList();
+      }
+    }
+  }
+
+  private async handleCreateEmbedKey(): Promise<void> {
+    if (this.embedKeyCreating) return;
+    const input = this.overlay.querySelector<HTMLInputElement>('.embed-keys-name-input');
+    const btn = this.overlay.querySelector<HTMLButtonElement>('.embed-keys-create-btn');
+    const name = input?.value.trim();
+    if (!name || !input || !btn) return;
+    const request = this.captureAccountRequest();
+    if (!request) return;
+
+    this.embedKeyCreating = true;
+    btn.disabled = true;
+    btn.textContent = 'Creating...';
+    this.embedKeysError = '';
+    this.newlyCreatedEmbedKey = null;
+    this.hideEmbedKeysBanner();
+
+    try {
+      const result = await createEmbedKey(name);
+      if (!this.isAccountRequestCurrent(request)) return;
+      this.newlyCreatedEmbedKey = result.key;
+      const currentInput = this.overlay.querySelector<HTMLInputElement>('.embed-keys-name-input');
+      if (currentInput) currentInput.value = '';
+      this.showEmbedKeysCreatedBanner(result.key);
+      await this.loadEmbedKeys();
+    } catch (err) {
+      if (!this.isAccountRequestCurrent(request)) return;
+      const msg = err instanceof Error ? err.message : 'Failed to create embed key';
+      this.embedKeysError = msg.includes('KEY_LIMIT_REACHED')
+        ? 'Maximum of 5 active embed keys reached. Revoke an existing key first.'
+        : msg.includes('EMBED_ACCESS_REQUIRED')
+        ? 'Embed keys require an active paid plan.'
+        : msg;
+      this.renderEmbedKeysError();
+    } finally {
+      if (this.isAccountRequestCurrent(request)) {
+        this.embedKeyCreating = false;
+        const currentBtn = this.overlay.querySelector<HTMLButtonElement>('.embed-keys-create-btn');
+        if (currentBtn) {
+          currentBtn.disabled = false;
+          currentBtn.textContent = 'Create Embed Key';
+        }
+      }
+    }
+  }
+
+  private async handleRevokeEmbedKey(keyId: string): Promise<void> {
+    const request = this.captureAccountRequest();
+    if (!request) return;
+    const keyInfo = this.embedKeys.find(k => k.id === keyId);
+    const keyName = keyInfo?.name ?? 'this key';
+    if (!confirm(`Revoke "${keyName}"? This cannot be undone. New reads with this key will be denied within about a minute. Already rendered paid-only panels remain visible until reload. A live map can retain its paid tier for up to 30 more minutes.`)) return;
+
+    try {
+      await revokeEmbedKey(keyId);
+      if (!this.isAccountRequestCurrent(request)) return;
+      await this.loadEmbedKeys();
+    } catch (err) {
+      if (!this.isAccountRequestCurrent(request)) return;
+      this.embedKeysError = err instanceof Error ? err.message : 'Failed to revoke embed key';
+      this.renderEmbedKeysError();
+    }
+  }
+
+  private showEmbedKeysCreatedBanner(key: string): void {
+    const banner = this.overlay.querySelector<HTMLElement>('#usEmbedKeysBanner');
+    if (!banner) return;
+
+    banner.style.display = 'block';
+    setTrustedHtml(banner, trustedHtml(`
+      <div class="embed-keys-banner-title">Embed key created — copy it now, it won't be shown again</div>
+      <div class="embed-keys-banner-key">
+        <code class="embed-keys-key-value">${escapeHtml(key)}</code>
+        <button class="btn btn-secondary embed-keys-copy-btn">Copy</button>
+      </div>
+    `, "legacy direct innerHTML migration"));
+  }
+
+  private hideEmbedKeysBanner(): void {
+    const banner = this.overlay.querySelector<HTMLElement>('#usEmbedKeysBanner');
+    if (banner) {
+      banner.style.display = 'none';
+      setTrustedHtml(banner, trustedHtml('', "legacy direct innerHTML migration"));
+    }
+  }
+
+  private renderEmbedKeysError(): void {
+    const el = this.overlay.querySelector<HTMLElement>('#usEmbedKeysError');
+    if (!el) return;
+    if (this.embedKeysError) {
+      el.style.display = 'block';
+      el.textContent = this.embedKeysError;
+    } else {
+      el.style.display = 'none';
+      el.textContent = '';
+    }
+  }
+
+  private renderEmbedKeysList(): void {
+    const container = this.overlay.querySelector('#usEmbedKeysList');
+    if (!container) return;
+
+    if (this.embedKeysLoading && this.embedKeys.length === 0) {
+      setTrustedHtml(container, trustedHtml('<div class="embed-keys-loading">Loading...</div>', "legacy direct innerHTML migration"));
+      return;
+    }
+
+    this.renderEmbedKeysError();
+
+    const active = this.embedKeys.filter(k => !k.revokedAt);
+    const revoked = this.embedKeys.filter(k => k.revokedAt);
+
+    if (active.length === 0 && revoked.length === 0) {
+      setTrustedHtml(container, trustedHtml('<div class="embed-keys-empty">No embed keys yet. Create one above, then paste it into the loader snippet from the Embed button on the map.</div>', "legacy direct innerHTML migration"));
+      return;
+    }
+
+    const formatDate = (ts: number) => new Date(ts).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+
+    const renderKey = (k: EmbedKeyInfo) => {
+      const isRevoked = !!k.revokedAt;
+      return `
+        <div class="embed-keys-item${isRevoked ? ' revoked' : ''}">
+          <div class="embed-keys-item-main">
+            <span class="embed-keys-item-name">${escapeHtml(k.name)}</span>
+            <code class="embed-keys-item-prefix">${escapeHtml(k.keyPrefix)}${'*'.repeat(8)}</code>
+          </div>
+          <div class="embed-keys-item-meta">
+            <span>Created ${formatDate(k.createdAt)}</span>
+            ${k.lastUsedAt ? `<span>Last used ${formatDate(k.lastUsedAt)}</span>` : ''}
+            ${isRevoked ? `<span class="embed-keys-item-revoked-badge">Revoked ${formatDate(k.revokedAt!)}</span>` : ''}
+          </div>
+          ${!isRevoked ? `<button class="btn btn-ghost embed-keys-revoke-btn" data-key-id="${escapeHtml(k.id)}">Revoke</button>` : ''}
+        </div>
+      `;
+    };
+
+    setTrustedHtml(container, trustedHtml(active.map(renderKey).join('')
+      + (revoked.length > 0 ? `<div class="embed-keys-revoked-section"><div class="embed-keys-revoked-label">Revoked</div>${revoked.map(renderKey).join('')}</div>` : ''), "legacy direct innerHTML migration"));
   }
 
   // ---------------------------------------------------------------------------

@@ -15,15 +15,17 @@
  *   - singleton family ids are namespaced (`label:<name>`) so they can never
  *     collide with a curated family id.
  *
- * Cross-publisher syndication (#6430): the server ingest parser now carries
- * the RSS `<source>` element — the originating publisher Google News stamps
- * per item — as `originPublisher`, and the digest's corroboration counts
- * resolve THAT through this map when present, falling back to the feed
- * label. To let an origin NAME ("Reuters", "Associated Press") land in the
- * same family as the feed labels it syndicates through, each curated
- * family's `publisher` name is indexed alongside its labels. An unknown
- * origin name stays its own singleton family — same fail-closed direction
- * as an unmapped label.
+ * Cross-publisher syndication (#6430): the server ingest parser may carry the
+ * RSS `<source>` element — the originating publisher Google News stamps per
+ * item — as `originPublisher`. Corroboration consumers must call
+ * `publisherFamilyForItem`, which accepts that origin only when the parser
+ * marked the feed as an explicitly configured trusted aggregator. Ordinary
+ * feeds fall back to their server-configured label, so upstream text cannot
+ * manufacture independent families. To let a trusted origin NAME ("Reuters",
+ * "Associated Press") land in the same family as the feed labels it
+ * syndicates through, each curated family's `publisher` name is indexed
+ * alongside its labels. An unknown origin name stays its own singleton family
+ * — same fail-closed direction as an unmapped label.
  *
  * REMAINING LIMIT — origin names outside the curated set. "BBC News" from a
  * Google News <source> does not fold into the 'bbc' family unless curated
@@ -87,7 +89,7 @@ const PUBLISHER_FAMILY_DATA = {
   'eia': { publisher: "US Energy Information Administration", labels: ["EIA Press Room", "EIA Reports"] },
   'fao': { publisher: "UN Food and Agriculture Organization", labels: ["FAO GIEWS", "FAO News"] },
   'financial-times': { publisher: "Financial Times", labels: ["FT Energy", "Financial Times"] },
-  'france-24': { publisher: "France 24", labels: ["France 24", "France 24 LatAm"] },
+  'france-24': { publisher: "France 24", labels: ["France 24", "France 24 Africa", "France 24 Asia Pacific", "France 24 LatAm"] },
   'good-news-network': {
     publisher: "Good News Network",
     labels: [
@@ -103,9 +105,12 @@ const PUBLISHER_FAMILY_DATA = {
   'guardian': {
     publisher: "The Guardian",
     labels: [
+      "Guardian Africa",
       "Guardian Americas",
       "Guardian Australia",
+      "Guardian Caribbean",
       "Guardian ME",
+      "Guardian Pacific",
       "Guardian World",
     ],
   },
@@ -138,6 +143,7 @@ const PUBLISHER_FAMILY_DATA = {
       "Reuters India",
       "Reuters LatAm",
       "Reuters Markets",
+      "Reuters Nasdaq Futures",
       "Reuters US",
       "Reuters World",
     ],
@@ -178,6 +184,80 @@ const PUBLISHER_FAMILY_DATA = {
 };
 
 export const PUBLISHER_FAMILIES = Object.freeze(PUBLISHER_FAMILY_DATA);
+
+/**
+ * Curated family -> the registrable domains that newsroom publishes on.
+ *
+ * Feed labels identify a publisher on the digest path; an article that
+ * arrives by URL alone (the per-country GDELT index, #7748) carries only its
+ * domain, so "BBC World" and bbc.co.uk would otherwise count as two
+ * newsrooms for any "N independent publishers" rule. Exact registrable
+ * domains only, no fuzzy matching (same fail-closed direction as labels): an
+ * unlisted domain stays its own singleton family. Multi-tenant hosts
+ * (yahoo.com, ycombinator.com) are deliberately absent because a domain
+ * that several publishers share cannot name one.
+ */
+const PUBLISHER_FAMILY_DOMAINS = Object.freeze({
+  'a16z': ['a16z.com'],
+  'ap-news': ['apnews.com'],
+  'arxiv': ['arxiv.org'],
+  'bbc': ['bbc.com', 'bbc.co.uk'],
+  'bloomberg': ['bloomberg.com'],
+  'brookings': ['brookings.edu'],
+  'cb-insights': ['cbinsights.com'],
+  'chatham-house': ['chathamhouse.org'],
+  'cnbc': ['cnbc.com'],
+  'csis': ['csis.org'],
+  'dw': ['dw.com'],
+  'eia': ['eia.gov'],
+  'fao': ['fao.org'],
+  'financial-times': ['ft.com'],
+  'france-24': ['france24.com'],
+  'good-news-network': ['goodnewsnetwork.org'],
+  'guardian': ['theguardian.com'],
+  'hromadske': ['hromadske.ua'],
+  'iea': ['iea.org'],
+  'interfax': ['interfax.com', 'interfax.ru'],
+  'kitco': ['kitco.com'],
+  'marketwatch': ['marketwatch.com'],
+  'mit-technology-review': ['technologyreview.com'],
+  'ndtv': ['ndtv.com'],
+  'nikkei': ['nikkei.com'],
+  'politico': ['politico.com', 'politico.eu'],
+  'reuters': ['reuters.com'],
+  'rt': ['rt.com'],
+  'seeking-alpha': ['seekingalpha.com'],
+  'sp-global': ['spglobal.com'],
+  'techcrunch': ['techcrunch.com'],
+  'the-verge': ['theverge.com'],
+  'venturebeat': ['venturebeat.com'],
+  'white-house': ['whitehouse.gov'],
+});
+export const PUBLISHER_FAMILY_DOMAIN_TABLE = PUBLISHER_FAMILY_DOMAINS;
+
+const familyByDomain = new Map();
+for (const [familyId, domains] of Object.entries(PUBLISHER_FAMILY_DOMAINS)) {
+  for (const domain of domains) familyByDomain.set(domain, familyId);
+}
+
+/**
+ * Curated family id for an article host, or '' when no family lists it.
+ * Matches the host itself and every parent domain with at least two labels
+ * ("www.bbc.co.uk" -> "bbc.co.uk"), so a subdomain edition folds into its
+ * newsroom without a public-suffix list.
+ *
+ * @param {unknown} hostname
+ * @returns {string}
+ */
+export function publisherFamilyForDomain(hostname) {
+  if (typeof hostname !== 'string') return '';
+  const labels = hostname.trim().toLowerCase().replace(/\.+$/, '').split('.').filter(Boolean);
+  for (let start = 0; start <= labels.length - 2; start += 1) {
+    const family = familyByDomain.get(labels.slice(start).join('.'));
+    if (family) return family;
+  }
+  return '';
+}
 
 /**
  * How many distinct publishers make a story corroborated.
@@ -269,6 +349,25 @@ export function publisherFamiliesFor(labels) {
  */
 export function countPublisherFamilies(labels) {
   return publisherFamiliesFor(labels).size;
+}
+
+/**
+ * Resolve the publisher family for one parsed digest item.
+ *
+ * RSS <source> is upstream content and can be forged by a feed. The parser
+ * marks it trusted only for an explicitly configured aggregator (currently
+ * Google News). All other items use the server-configured feed label, so one
+ * hostile feed cannot manufacture independent families by emitting different
+ * <source> values.
+ *
+ * @param {{ source?: unknown; originPublisher?: unknown; originPublisherTrusted?: unknown }} item
+ * @returns {string}
+ */
+export function publisherFamilyForItem(item) {
+  const sourceFamily = publisherFamilyFor(item?.source);
+  if (item?.originPublisherTrusted !== true) return sourceFamily;
+  const originFamily = publisherFamilyFor(item?.originPublisher);
+  return originFamily || sourceFamily;
 }
 
 /**

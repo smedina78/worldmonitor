@@ -27,10 +27,11 @@ import { getSourceProvenanceState } from '../../../shared/source-provenance.js';
 import { computeCredibilityScore } from '../../../shared/news-credibility.js';
 import { getSourceTier } from '../../../server/_shared/source-tiers';
 import { buildAuthHeaders } from '../auth';
+import { fetchMcpDownstream } from '../downstream';
 import { assertToolFetchOk } from '../billing-denial';
 import { argStr, ciIncludes } from '../filters';
 import { McpSourceUnavailableError } from '../source-unavailable';
-import type { ToolDef } from '../types';
+import type { ToolDef, McpToolExecutionContext } from '../types';
 
 // ── #5697 on-demand NLP intelligence utilities ──────────────────────────────
 // Four deterministic (classify_event excepted — enum-validated LLM) utilities
@@ -140,6 +141,56 @@ type NlpDigestCategoryGroup = {
   }>;
 };
 
+const NLP_DIGEST_COVERAGE_STATES = ['complete', 'partial', 'stale', 'unavailable'] as const;
+type NlpDigestCoverageState = typeof NLP_DIGEST_COVERAGE_STATES[number];
+
+const NLP_DIGEST_COVERAGE_OUTPUT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: [
+    'state',
+    'servedItems',
+    'servedPublishers',
+    'feedsCompleted',
+    'feedsTotal',
+    'categoriesCompleted',
+    'categoriesTotal',
+    'missingCategories',
+    'stale',
+    'staleAgeSeconds',
+    'staleReason',
+  ],
+  properties: {
+    state: {
+      type: 'string',
+      enum: [...NLP_DIGEST_COVERAGE_STATES],
+      description: 'Coverage state for the digest attempt: complete, partial, stale, or unavailable.',
+    },
+    servedItems: { type: 'integer', minimum: 0, description: 'Headlines served in this response.' },
+    servedPublishers: { type: 'integer', minimum: 0, description: 'Distinct normalized publishers served.' },
+    feedsCompleted: { type: 'integer', minimum: 0 },
+    feedsTotal: { type: 'integer', minimum: 0 },
+    categoriesCompleted: { type: 'integer', minimum: 0 },
+    categoriesTotal: { type: 'integer', minimum: 0 },
+    missingCategories: {
+      type: 'array',
+      maxItems: 12,
+      items: { type: 'string' },
+      description: 'Digest categories that did not complete in the current attempt.',
+    },
+    stale: { type: 'boolean', description: 'True when the response serves retained content from an earlier attempt.' },
+    staleAgeSeconds: {
+      type: 'integer',
+      minimum: 0,
+      description: 'Age of the replayed content since acceptance, in seconds. 0 when the digest is fresh.',
+    },
+    staleReason: {
+      type: 'string',
+      description: 'Why retained content is served: empty-rebuild or build-error. Empty when fresh.',
+    },
+  },
+} as const;
+
 type NlpDigestFetch = {
   items: NewsItemCore[];
   generatedAt: string;
@@ -148,6 +199,30 @@ type NlpDigestFetch = {
   category: string | null;
   /** Present when a non-empty category filter did not match any digest key. */
   note?: string;
+  /**
+   * Compact data-quality summary from the digest's coverage block (#7085):
+   * closed state, served/publisher counts, feed and category completion,
+   * and missing category names. Agents can condition summaries on it.
+   */
+  digestCoverage?: {
+    state: NlpDigestCoverageState;
+    servedItems: number;
+    servedPublishers: number;
+    feedsCompleted: number;
+    feedsTotal: number;
+    categoriesCompleted: number;
+    categoriesTotal: number;
+    missingCategories: string[];
+    stale: boolean;
+    /**
+     * #7084: how old the replayed content is, seconds (0 when fresh). A bare
+     * `stale` flag tells an agent the evidence is old without saying HOW old
+     * — 90 seconds and 6 hours warrant different conclusions.
+     */
+    staleAgeSeconds: number;
+    /** #7084: why stale content is served — empty-rebuild | build-error ('' when fresh). */
+    staleReason: string;
+  };
 };
 
 // Caching asymmetry among these four tools is deliberate. get_keyword_spikes
@@ -173,25 +248,76 @@ async function fetchNlpDigestItems(
   base: string,
   context: Parameters<typeof buildAuthHeaders>[0],
   variant: NlpDigestVariant,
-  category = '',
+  category: string,
+  // Required-but-nullable, matching fetchMcpDownstream: a caller that forgets
+  // the execution context fails typecheck instead of silently dropping the
+  // self-hosted transport token.
+  execution: McpToolExecutionContext | undefined,
 ): Promise<NlpDigestFetch> {
   const digestUrl = `${base}/api/news/v1/list-feed-digest?variant=${variant}&lang=en`;
   const auth = await buildAuthHeaders(context, 'GET', digestUrl, null);
-  const res = await fetch(digestUrl, {
+  const res = await fetchMcpDownstream(digestUrl, {
     headers: { ...auth, 'User-Agent': NLP_UA },
     signal: AbortSignal.timeout(NLP_DIGEST_TIMEOUT_MS),
-  });
+  }, execution);
   await assertToolFetchOk(res, 'list-feed-digest');
   const body = await res.json() as {
     categories?: Record<string, NlpDigestCategoryGroup>;
     feedStatuses?: Record<string, string>;
     generatedAt?: string;
+    coverage?: {
+      state?: string;
+      itemsServed?: number;
+      publisherCount?: number;
+      feedCompleted?: number;
+      feedTotal?: number;
+      categoryCompleted?: number;
+      categoryTotal?: number;
+      categoryStates?: Record<string, string>;
+      servedStale?: boolean;
+      staleAgeSeconds?: number;
+      staleReason?: string;
+    };
   };
 
   const seen = new Set<string>();
   const items: NewsItemCore[] = [];
   const categories = body.categories ?? {};
-  if (Object.keys(categories).length === 0 && Object.keys(body.feedStatuses ?? {}).length === 0) {
+  // #7085: carry the digest's coverage block through to agents in a
+  // compact, closed shape. Unknown states are malformed, not synonyms for
+  // `unavailable`, because only an explicit upstream state can distinguish a
+  // valid empty attempt from an absent digest response.
+  const cov = body.coverage;
+  const digestCoverage = cov && isNlpDigestCoverageState(cov.state)
+    ? {
+      state: cov.state,
+      servedItems: nlpClampInt(cov.itemsServed ?? 0, 0, Number.MAX_SAFE_INTEGER, 0),
+      servedPublishers: nlpClampInt(cov.publisherCount ?? 0, 0, Number.MAX_SAFE_INTEGER, 0),
+      feedsCompleted: nlpClampInt(cov.feedCompleted ?? 0, 0, Number.MAX_SAFE_INTEGER, 0),
+      feedsTotal: nlpClampInt(cov.feedTotal ?? 0, 0, Number.MAX_SAFE_INTEGER, 0),
+      categoriesCompleted: nlpClampInt(cov.categoryCompleted ?? 0, 0, Number.MAX_SAFE_INTEGER, 0),
+      categoriesTotal: nlpClampInt(cov.categoryTotal ?? 0, 0, Number.MAX_SAFE_INTEGER, 0),
+      missingCategories: Object.entries(cov.categoryStates ?? {})
+        .filter(([, v]) => v === 'missing')
+        .map(([k]) => k)
+        .slice(0, 12),
+      stale: cov.state === 'stale',
+      // #7084: complete the stale disclosure. The flag alone says the
+      // evidence is old without saying how old or why — an agent deciding
+      // whether stale evidence is usable needs the age.
+      staleAgeSeconds: cov.state === 'stale'
+        ? nlpClampInt(cov.staleAgeSeconds ?? 0, 0, Number.MAX_SAFE_INTEGER, 0)
+        : 0,
+      staleReason: cov.state === 'stale'
+        ? nlpTruncateUtf8(cov.staleReason ?? '', NLP_DIGEST_METADATA_MAX_BYTES)
+        : '',
+    }
+    : undefined;
+  if (
+    Object.keys(categories).length === 0
+    && Object.keys(body.feedStatuses ?? {}).length === 0
+    && digestCoverage?.state !== 'unavailable'
+  ) {
     throw new McpSourceUnavailableError(
       `Feed digest unavailable for ${variant}/en`,
       [`news:digest:v1:${variant}:en`],
@@ -206,6 +332,11 @@ async function fetchNlpDigestItems(
     groups = Object.values(categories);
   } else if (Object.prototype.hasOwnProperty.call(categories, category)) {
     groups = [categories[category]!];
+  } else if (digestCoverage?.state === 'unavailable') {
+    // This is a valid empty response, not an unknown category. Preserve the
+    // requested filter and the explicit coverage state without a misleading
+    // corrective note.
+    groups = [];
   } else {
     groups = [];
     // Prefer the live snapshot keys so agents see what this cycle actually
@@ -256,7 +387,14 @@ async function fetchNlpDigestItems(
     variant,
     category: category || null,
     ...(note ? { note } : {}),
+    ...(digestCoverage ? { digestCoverage } : {}),
   };
+}
+
+/** Coverage states are a closed vocabulary — pass through only the known four. */
+function isNlpDigestCoverageState(value: unknown): value is NlpDigestCoverageState {
+  return typeof value === 'string'
+    && (NLP_DIGEST_COVERAGE_STATES as readonly string[]).includes(value);
 }
 
 function resolveNlpDigestVariant(value: unknown): NlpDigestVariant | null {
@@ -336,7 +474,7 @@ export const NLP_TOOLS: ToolDef[] = [
       },
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-    _execute: async (params, base, context) => {
+    _execute: async (params, base, context, execution) => {
       const text = typeof params.text === 'string' ? params.text.trim() : '';
       if (!text) return { classification: null, error: 'text is required (a non-empty string of at most 500 characters)' };
       if (text.length > CLASSIFY_TEXT_MAX_CHARS) {
@@ -344,13 +482,13 @@ export const NLP_TOOLS: ToolDef[] = [
       }
       const url = `${base}/api/intelligence/v1/classify-event?title=${encodeURIComponent(text)}`;
       const auth = await buildAuthHeaders(context, 'GET', url, null);
-      const res = await fetch(url, {
+      const res = await fetchMcpDownstream(url, {
         headers: { ...auth, 'User-Agent': NLP_UA },
         // Matches the classify-event handler's own UPSTREAM_TIMEOUT_MS (25s)
         // and the sibling LLM tools below. A shorter client budget would abort
         // slow-but-successful cache-miss classifications the handler completes.
         signal: AbortSignal.timeout(25_000),
-      });
+      }, execution);
       await assertToolFetchOk(res, 'classify-event');
       const result = await res.json() as {
         classification?: { category?: string; subcategory?: string; severity?: string; confidence?: number };
@@ -383,7 +521,7 @@ export const NLP_TOOLS: ToolDef[] = [
   {
     name: 'extract_entities',
     _outputBudgetBytes: 16384,
-    description: 'Extract named entities deterministically — registry entities (companies, indices, commodities, crypto, sectors, countries) plus pattern entities (CVE IDs, APT/FIN threat-group designators, tracked world leaders). Supply text (max 2 KB), or omit text to aggregate headlines from the full digest (default) or tech digest with variant/category filters. No LLM involved.',
+    description: 'Extract named entities deterministically — registry entities (companies, indices, commodities, crypto, sectors, countries) plus pattern entities (CVE IDs, APT/FIN threat-group designators, tracked world leaders). Supply text (max 2 KB), or omit text to aggregate headlines from the full digest (default) or tech digest with variant/category filters. Headline mode includes digestCoverage so agents can distinguish complete, partial, stale, and unavailable input. No LLM involved.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -427,11 +565,12 @@ export const NLP_TOOLS: ToolDef[] = [
         variant: { type: 'string', enum: [...NLP_DIGEST_VARIANTS], description: 'Applied digest variant in headlines mode. Omitted in text mode.' },
         category: { type: ['string', 'null'], description: 'Applied digest category filter in headlines mode; null when scanning every category. Omitted in text mode.' },
         note: { type: 'string', description: 'Present in headlines mode when category did not match any digest key (typo or missing bucket).' },
+        digestCoverage: NLP_DIGEST_COVERAGE_OUTPUT_SCHEMA,
         error: { type: 'string', description: 'Present instead of a result when input validation fails.' },
       },
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    _execute: async (params, base, context) => {
+    _execute: async (params, base, context, execution) => {
       // Validation failures keep every outputSchema-required member present so
       // schema-validating clients can parse the envelope (classify_event does
       // the same with `classification: null`).
@@ -477,7 +616,7 @@ export const NLP_TOOLS: ToolDef[] = [
         };
       }
       const category = argStr(params.category);
-      const digest = await fetchNlpDigestItems(base, context, variant, category);
+      const digest = await fetchNlpDigestItems(base, context, variant, category, execution);
       const aggregated = nlpRegistryEntities(digest.items.map(item => item.title), limit);
       return {
         mode: 'headlines',
@@ -486,6 +625,7 @@ export const NLP_TOOLS: ToolDef[] = [
         variant: digest.variant,
         category: digest.category,
         ...(digest.note ? { note: digest.note } : {}),
+        ...(digest.digestCoverage ? { digestCoverage: digest.digestCoverage } : {}),
         ...aggregated,
       };
     },
@@ -499,7 +639,7 @@ export const NLP_TOOLS: ToolDef[] = [
     // records plus a separate primary record. Keep the dispatcher budget
     // aligned with that supported maximum instead of rejecting valid output.
     _outputBudgetBytes: 262144,
-    description: 'Current topic clusters over the live headline digest, computed with the same Jaccard clustering the dashboard uses. Select the full digest (default) or tech digest with variant, then optionally restrict by category such as commodities, vcblogs, or accelerators. Each cluster reports its primary headline, member count, distinct sources with fail-closed provenance, top keywords, threat level, time span, and credibilityScore (0-100 source reliability, distinct from importance). Deterministic — no LLM.',
+    description: 'Current topic clusters over the live headline digest, computed with the same Jaccard clustering the dashboard uses. Select the full digest (default) or tech digest with variant, then optionally restrict by category such as commodities, vcblogs, or accelerators. Each cluster reports its primary headline, member count, distinct sources with fail-closed provenance, top keywords, threat level, time span, and credibilityScore (0-100 source reliability, distinct from importance). The result includes digestCoverage so agents can distinguish complete, partial, stale, and unavailable input. Deterministic — no LLM.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -569,11 +709,12 @@ export const NLP_TOOLS: ToolDef[] = [
         variant: { type: 'string', enum: [...NLP_DIGEST_VARIANTS], description: 'Applied digest variant.' },
         category: { type: ['string', 'null'], description: 'Applied digest category filter; null when clustering every category.' },
         note: { type: 'string', description: 'Present when category did not match any digest key (typo or missing bucket).' },
+        digestCoverage: NLP_DIGEST_COVERAGE_OUTPUT_SCHEMA,
         error: { type: 'string', description: 'Present when variant validation fails.' },
       },
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    _execute: async (params, base, context) => {
+    _execute: async (params, base, context, execution) => {
       const limit = nlpClampInt(params.limit, 1, 25, 10);
       const minSources = nlpClampInt(params.min_sources, 1, 10, 1);
       const variant = resolveNlpDigestVariant(params.variant);
@@ -589,7 +730,7 @@ export const NLP_TOOLS: ToolDef[] = [
       }
       const category = argStr(params.category);
       const query = argStr(params.query);
-      const digest = await fetchNlpDigestItems(base, context, variant, category);
+      const digest = await fetchNlpDigestItems(base, context, variant, category, execution);
       const clusters = clusterNewsCore(digest.items, () => 3);
       const selectedClusters = clusters
         .map(cluster => ({
@@ -660,6 +801,7 @@ export const NLP_TOOLS: ToolDef[] = [
         variant: digest.variant,
         category: digest.category,
         ...(digest.note ? { note: digest.note } : {}),
+        ...(digest.digestCoverage ? { digestCoverage: digest.digestCoverage } : {}),
       };
     },
     _apiPaths: [
@@ -729,6 +871,10 @@ export const NLP_TOOLS: ToolDef[] = [
 
       // v3 invalidates v2 title-only sampleHeadlines (no source/link/sourceNames).
       const cacheKey = `intelligence:keyword-spikes:mcp:v3:${windowHours}h:${minCount}`;
+      // App-owned cache key (#7674): this tool is its own writer, so read and
+      // write it through the deployment-prefixed default. A preview deploy
+      // computes and caches into its own namespace instead of leaking into
+      // production rows.
       // A cache-read failure must degrade to live computation, not surface as a
       // tool error: readJsonFromUpstash throws on network failure (unlike
       // redisPipeline, which returns null).
@@ -757,6 +903,12 @@ export const NLP_TOOLS: ToolDef[] = [
       // Read recent and pre-window cohorts independently. A single newest-first
       // cap can be consumed entirely by a busy recent window, which proves
       // nothing about whether older baseline rows exist.
+      // App-owned state (#7674): the digest route writes the accumulator and
+      // the story rows through the prefix-aware server helpers, so the MCP
+      // reader must request the same deployment-namespaced keys (runRedisPipeline
+      // (…, false) in server/worldmonitor/news/v1/list-feed-digest.ts). The
+      // unprefixed reads here made every preview deployment consume — and the
+      // spike cache write below leak into — the production namespace.
       const zres = await redisPipeline([
         [
           'ZRANGE', DIGEST_ACCUMULATOR_KEY_MCP,

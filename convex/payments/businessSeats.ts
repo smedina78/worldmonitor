@@ -1,9 +1,9 @@
 /**
  * API Business domain-gated Pro-seat invites (#4634/#4635).
  *
- * An active `api_business` subscriber on a corporate email domain may invite up
- * to 4 same-domain teammates. Each accepted invitee resolves to a full Pro
- * entitlement (minus billing/account management) via the grant row in
+ * An active API Business subscriber on a corporate email domain may invite up
+ * to 4 teammates at any corporate email domain. Each accepted invitee resolves
+ * to a full Pro entitlement (minus billing/account management) via the grant row in
  * `businessProGrants`. Grants are auto-revoked when the Business subscription
  * stops covering.
  */
@@ -28,7 +28,7 @@ import {
   signBusinessInviteToken,
   verifyBusinessInviteToken,
 } from "../lib/identitySigning";
-import { isCoveringAt } from "./subscriptionHelpers";
+import { isBusinessPlan, isCoveringAt } from "./subscriptionHelpers";
 
 function escapeHtml(value: string): string {
   return value
@@ -72,8 +72,7 @@ async function touchBusinessSeatLock(
 }
 
 /**
- * Returns true when the caller owns an active/covering `api_business`
- * subscription.
+ * Returns the caller's covering monthly or annual API Business subscription.
  */
 async function getCoveringBusinessSubscription(
   ctx: MutationCtx | QueryCtx,
@@ -85,7 +84,7 @@ async function getCoveringBusinessSubscription(
     .withIndex("by_userId", (q) => q.eq("userId", userId))
     .collect();
   return subs.find(
-    (s) => s.planKey === "api_business" && isCoveringAt(s, at),
+    (s) => isBusinessPlan(s.planKey) && isCoveringAt(s, at),
   ) ?? null;
 }
 
@@ -113,8 +112,8 @@ async function countActiveOrPendingGrants(
 }
 
 /**
- * Owner invites up to 4 same-domain teammates. Pending invites count against
- * the cap; each gets a single-use HMAC token emailed via Resend.
+ * Owner invites up to 4 teammates at any corporate email domain. Pending
+ * invites count against the cap; each gets a single-use HMAC token emailed via Resend.
  */
 export const inviteSeats = mutation({
   args: { emails: v.array(v.string()) },
@@ -183,9 +182,6 @@ export const inviteSeats = mutation({
       }
       if (!isCorporateDomain(email)) {
         throw new ConvexError({ kind: "INVITEE_DOMAIN_NOT_CORPORATE" });
-      }
-      if (!sameDomain(ownerEmail, email)) {
-        throw new ConvexError({ kind: "INVITEE_DOMAIN_MISMATCH" });
       }
 
       const existing = existingByEmail.get(email);
@@ -490,7 +486,7 @@ export const acceptBusinessInvite = mutation({
         q.eq("dodoSubscriptionId", grant.businessSubscriptionId),
       )
       .unique();
-    if (!businessSub || businessSub.planKey !== "api_business" || !isCoveringAt(businessSub, now)) {
+    if (!businessSub || !isBusinessPlan(businessSub.planKey) || !isCoveringAt(businessSub, now)) {
       throw new ConvexError({ kind: "BUSINESS_NOT_ACTIVE" });
     }
 

@@ -119,7 +119,8 @@
       "activeSirens": "Aktif Sirenler",
       "sirens24h": "Sirenler / 24s",
       "aviationDisruptions": "Havacılık Aksaklıkları",
-      "gpsJammingZones": "GPS Karıştırma Bölgeleri"
+      "gpsJammingZones": "GPS Karıştırma Bölgeleri",
+      "temporalUnavailable": "Zamansal gözlemler kullanılamıyor"
     },
     "fallback": {
       "instabilityIndex": "**Istikrarsizlik Endeksi: {{score}}/100** ({{level}}, {{trend}})",
@@ -192,7 +193,7 @@
       "decisionSignalsUnavailable": "Çin karar sinyali anlık görüntüsü şu anda kullanılamıyor."
     },
     "foodStocks": "Food stocks",
-    "foodStocksHelp": "USDA PSD commodity stocks-to-use by marketing year, with the world ratio alongside for context. FAOSTAT fills production only where PSD has no country coverage.",
+    "foodStocksHelp": "USDA PSD commodity stocks-to-use by marketing year, with the world ratio alongside for context. FAOSTAT Food Balances supplies production and domestic supply when PSD has no complete country balance.",
     "loadingFoodStocks": "Loading food stocks…",
     "foodStocksUnavailable": "Food stocks unavailable.",
     "foodStocksProLocked": "Upgrade to PRO for commodity stocks-to-use",
@@ -232,6 +233,71 @@
       "manufacturingShare": "Manufacturing employment",
       "source": "Sources: {{sources}}.",
       "retained": "{{stage}} data retained from the last successful refresh."
+    },
+    "fiveFactorScorecard": {
+      "title": "Beş Faktörlü Dayanıklılık Puan Kartı",
+      "help": "Gıda, enerji, demografi, teknoloji ve savunma için dondurulmuş v1 kanıt puanları. Girdileri, kaynak kökenini ve eksik veri nedenlerini incelemek için bir satırı genişletin.",
+      "loading": "Beş faktörlü puan kartı yükleniyor…",
+      "unavailable": "Beş faktörlü puan kartı kullanılamıyor.",
+      "proLocked": "Beş faktörlü dayanıklılık puan kartı için PRO'ya yükseltin",
+      "insufficient": "Yetersiz veri",
+      "notAvailable": "Kullanılamıyor",
+      "noEvidence": "Bu sütun için kanıt mevcut değil.",
+      "score": "{{score}}/5",
+      "coverage": "%{{coverage}} kapsam",
+      "methodologyVersion": "Yöntem v{{version}}",
+      "methodologyLink": "Yöntem",
+      "pillars": {
+        "food": "Gıda",
+        "energy": "Enerji",
+        "demographics": "Demografi",
+        "technology": "Teknoloji",
+        "defense": "Savunma"
+      },
+      "reasons": {
+        "source-unavailable": "Kaynak kullanılamıyor",
+        "country-unavailable": "Ülke kullanılamıyor",
+        "invalid-value": "Geçersiz kaynak değeri",
+        "stale": "Kanıt eski",
+        "coverage-below-floor": "Kapsama puanlama alt sınırının altında",
+        "required-group-missing": "Zorunlu kanıt grubu eksik",
+        "missing-population": "Nüfus verisi mevcut değil",
+        "redistribution-blocked": "Kaynak yeniden dağıtımına izin verilmiyor",
+        "pillar-unavailable": "Sütun mevcut değil"
+      },
+      "inputs": {
+        "population": "Population",
+        "food_productionBalance": "Üretim dengesi",
+        "food_stocksToUse": "Kullanılacak stoklar",
+        "food_waterSecurity": "Su güvenliği",
+        "food_importDiversity": "İthalat çeşitliliği",
+        "energy_productionBalance": "Üretim dengesi",
+        "energy_lowCarbonShare": "Düşük karbonlu enerji payı",
+        "energy_gridEfficiency": "Şebeke verimliliği",
+        "demographics_totalDependency": "Toplam bağımlılık",
+        "demographics_oldAgeDependency": "Yaşlı bağımlılığı",
+        "demographics_workingAgeProjection": "Çalışma çağı projeksiyonu",
+        "demographics_tertiaryEnrollment": "Yükseköğretim kayıt oranı",
+        "demographics_researchersPerMillion": "Milyon başına araştırmacı sayısı",
+        "demographics_stemGraduateShare": "Mühendislik ve fen mezunu payı",
+        "demographics_trainedIndustrialShare": "Eğitilmiş sanayi iş gücü payı",
+        "demographics_manufacturingEmploymentShare": "İmalat istihdam payı",
+        "technology_internetUse": "İnternet kullanımı",
+        "technology_mobileSubscriptions": "Mobil abonelikler",
+        "technology_fixedBroadband": "Sabit geniş bant",
+        "technology_rdSpend": "Araştırma ve geliştirme harcamaları",
+        "technology_researchersPerMillion": "Milyon başına araştırmacı sayısı",
+        "technology_stemGraduateShare": "STEM mezun oranı",
+        "technology_electricityAccess": "Elektrik erişimi",
+        "defense_expenditureUsd": "Savunma harcaması",
+        "defense_expenditurePctGdp": "Savunma yükü",
+        "defense_personnel": "Silahlı kuvvetler personeli",
+        "defense_industrialBalance": "Savunma sanayi dengesi",
+        "defense_supplierDiversity": "Silah tedarikçi çeşitliliği"
+      }
+    },
+    "defenseIndustrialBase": {
+      "proLocked": "Silah tedarikçisi bağımlılığı ve askeri kapasite için PRO'ya yükseltin"
     }
   },
   "header": {
@@ -530,6 +596,8 @@
       "recent": "Son Aramalar",
       "empty": "Veri ara veya komut çalıştır",
       "noResults": "Sonuc bulunamadi",
+      "resultAnnouncement_one": "{{query}} için {{count}} sonuç",
+      "resultAnnouncement_other": "{{query}} için {{count}} sonuç",
       "commands": "Komutlar",
       "results": "Sonuçlar",
       "seeAllCommands": "Tüm komutları gör",
@@ -788,7 +856,6 @@
   "components": {
     "webcams": {
       "paused": "Web kameralar duraklatıldı",
-      "pausedIdle": "Web kameralar duraklatıldı — devam etmek için fareyi hareket ettirin",
       "regions": {
         "all": "TUMU",
         "mideast": "ORTA DOGU",
@@ -915,7 +982,8 @@
       "refineryStage": "Refine",
       "stageUnavailable": "No published figures for this stage",
       "withheldNote": "W withheld",
-      "productionCaption": "Country shares of actual production. The map deposits layer shows where resources sit; this table shows who mines or refines them."
+      "productionCaption": "Country shares of actual production. The map deposits layer shows where resources sit; this table shows who mines or refines them.",
+      "productionProLocked": "Maden ve rafineri ülke payları ile aşama başına konsantrasyon (HHI) için PRO'ya yükseltin"
     },
     "tradePolicy": {
       "tariffs": "Gümrük Tarifeleri",
@@ -1109,9 +1177,6 @@
       "datacenter": "Veri Merkezi",
       "base": "Us",
       "nuclear": "Nukleer"
-    },
-    "community": {
-      "joinDiscussion": "Help Shape What's Next"
     },
     "threatLabels": {
       "critical": "KRIT",
@@ -1422,7 +1487,10 @@
       "compiledFrom": "{{stories}} hikaye ve {{sources}} kaynaktan derlenmiştir",
       "provenanceTitle": "Kapsam kaynağı: bu özet için kaç alınan hikaye ve farklı kaynaktan seçildiği",
       "briefFreshness": "{{minutes}}m önce oluşturuldu · en yeni kaynak {{hours}}s eski",
-      "briefStoryDetails": "Story details ({{count}})"
+      "briefStoryDetails": "Haber ayrıntıları ({{count}})",
+      "streamIdleStopLabel": "Hareketsizlik sırasında canlı videoyu durdur",
+      "streamIdleStopDesc": "Canlı Haber ve Canlı Web Kameralarını bu kadar süre etkinlik olmadan durdurur ve panelde bir bildirim gösterir.",
+      "streamIdleStopNever": "Asla"
     },
     "settings": {
       "exportSettings": "Ayarları Dışa Aktar",
@@ -1751,6 +1819,16 @@
       "loading": "Telegram aktarıcısına bağlanılıyor...",
       "empty": "Mevcut mesaj yok",
       "disabled": "Telegram aktarıcısı etkin değil",
+      "watchlistPlaceholder": "@username ile herkese açık kanal ekle",
+      "resolving": "Kanal aranıyor...",
+      "invalidUsername": "Herkese açık bir Telegram @username kullanın",
+      "resolveFailed": "Kanal bulunamadı",
+      "watchlistLimit": "En fazla {{count}} özel kanalı takip edebilirsiniz",
+      "previewMembers": "{{count}} üye",
+      "addChannel": "Kanal ekle",
+      "added": "Eklendi",
+      "remove": "Kaldır",
+      "custom": "Özel",
       "filterAll": "Tümü",
       "filterBreaking": "Son Dakika",
       "filterConflict": "Çatışma",
@@ -1962,6 +2040,22 @@
       "metals": {
         "gold": "Gold",
         "silver": "Silver"
+      },
+      "divergence": {
+        "compositeValue": "Fiziksel stress endeksi: {{value}} / 100",
+        "fiveDayTrend": "Beş işlem günü prim trendi",
+        "regimes": {
+          "normal": "Normal",
+          "elevated": "Yükseltilmiş",
+          "stressed": "Stresli",
+          "extreme": "Aşırı"
+        },
+        "states": {
+          "insufficientHistory": "Isınıyor: {{count}} / {{required}} işlem noktası",
+          "staleInput": "Fiziksel benchmark eski",
+          "missingInput": "Sapma sinyali kullanılamıyor"
+        },
+        "twentyDayTrend": "Yirmi işlem günü prim trendi"
       }
     },
     "crypto": {
@@ -2118,6 +2212,26 @@
         "failedToLoad": "Yükleme başarısız"
       },
       "cissStale": "ECB daha yeni bir değer yayınlamadı — bu okuma güncel olmayabilir."
+    },
+    "supplyVulnerability": {
+      "title": "Emtia kırılganlığı",
+      "help": "Tedarikçi yoğunlaşması, deniz geçişi ve mevcut stratejik tamponlara göre ülkenin emtia bazında maruziyeti.",
+      "loading": "Emtia kırılganlığı yükleniyor…",
+      "unavailable": "Emtia kırılganlığı verileri kullanılamıyor",
+      "noCoverage": "Bu ülke için kanıt yetersiz",
+      "unknown": "Bilinmiyor",
+      "concentration": "Yoğunlaşma",
+      "transit": "Geçiş",
+      "buffer": "Tampon",
+      "sources": "Kaynaklar",
+      "methodology": "Metodoloji",
+      "hormuzTitle": "Emtia bağımlılıkları",
+      "dependentCountries": "Bağımlı ülkeler",
+      "dependentCommodities": "Bağımlı emtialar",
+      "stateOk": "Güncel",
+      "stateStale": "Eski girdi",
+      "stateInsufficient": "Yetersiz veri",
+      "proLocked": "Emtia kırılganlık puanlandırması için PRO'ya yükseltin"
     },
     "hormuzTracker": {
       "infoTooltip": "<strong>Hürmüz Ticaret Takipçisi</strong> Dünyanın en kritik petrol darboğazı olan Hürmüz Boğazı'ndan geçen AIS gemi takibi. Tanker sayılarını, aksama olaylarını ve haftalık akış değişikliklerini izler. Küresel petrol arzının yaklaşık %20'si buradan günlük geçmektedir.",
@@ -2513,7 +2627,14 @@
       "signals_one": "{{count}} sinyal",
       "signals_other": "{{count}} sinyal",
       "analyzing": "Analiz ediliyor...",
-      "viewOnMap": "Haritada görüntüle"
+      "viewOnMap": "Haritada görüntüle",
+      "waiting": "Bir sonraki veri güncellemesi bekleniyor. Bu panel otomatik olarak güncellenir.",
+      "offline": "Bağlantı bekleniyor. Yeniden çevrimiçi olduğunuzda bu panel otomatik olarak güncellenir.",
+      "updated": "Güncellendi {{time}}",
+      "saved": "Bilinen son güncelleme {{time}} · Güncellemeler kontrol ediliyor",
+      "savedOffline": "Bilinen son güncelleme {{time}} · Çevrimdışı",
+      "localSignals": "Panoya yüklenen sinyallere dayanır",
+      "emptySaved": "Bilinen son güncellemede yakınsama yoktu."
     },
     "thermalEscalation": {
       "title": "Termal Yükseltme",
@@ -2663,6 +2784,47 @@
       "rubBase": "Rusya Merkez Bankası — 1 birim için ruble",
       "rubPerUnit": "Birim başına ruble",
       "sourceCbr": "Kaynak: Rusya Merkez Bankası"
+    },
+    "passkeyOffer": {
+      "title": "Passkey kaydedilsin mi?",
+      "body": "Bir sonraki oturum açışında parmak izi, yüz veya cihaz PIN'i ile giriş yapın — hatırlanacak parola yok.",
+      "accept": "Passkey'i kaydet",
+      "dismiss": "Şimdi değil",
+      "close": "Kapat",
+      "announce": "Bir sonraki oturum açışında daha hızlı giriş yapmak için passkey'i kaydedin.",
+      "busy": "Cihazınızdan bekleniyor…",
+      "succeeded": "Passkey kaydedildi. Bir sonraki oturum açışında kullanabilirsiniz.",
+      "retryable": "Bu tamamlanmadı. Yeniden deneyebilirsiniz.",
+      "failed": "Bu cihaza passkey kaydedilemedi."
+    },
+    "decisionBrief": {
+      "commodityTitle": "Emtia karar özeti",
+      "commodity": "Emtia / ürün",
+      "blockedChokepoint": "Kapalı olduğu varsayılan geçit",
+      "commodityCapture": "Emtia karşılaştırmasını kaydet",
+      "title": "Karar özeti",
+      "fuel": "Yakıt",
+      "chokepoint": "Dar geçit",
+      "baseline": "Temel kesinti",
+      "comparison": "Karşılaştırma kesintisi",
+      "capture": "İkisini de al / yenile",
+      "downloadHtml": "Özeti HTML olarak indir",
+      "downloadJson": "Özeti JSON olarak indir",
+      "back": "← Ülke özetine dön",
+      "select": "Bir enerji kesintisi seçin, ardından iki senaryoyu da alın.",
+      "changed": "Seçim değişti. Dışa aktarmadan önce iki senaryoyu da alın.",
+      "loading": "İki senaryo alınıyor…",
+      "captured": "Alındı. İndirmeden önce gözlem tarihlerini ve kısıtları inceleyin.",
+      "failed": "Senaryolar alınamadı. Erişiminizi kontrol edip yeniden deneyin. Dışa aktarılacak sonuç yok.",
+      "locked": "Karar özeti Pro ile kullanılabilir."
+    },
+    "liveMedia": {
+      "idleStatus": "Hareketsizlik nedeniyle duraklatıldı",
+      "idleBody": "Canlı video {{duration}} süre sonra fare, klavye veya dokunmatik etkinlik olmadan durduruldu.",
+      "idleResume": "Devam Et",
+      "idleKeepPlaying": "Hareketsizlik sırasında oynatmaya devam et",
+      "idleSettingsHint": "Bunu istediğiniz zaman Ayarlar › Medya bölümünde değiştirebilirsiniz.",
+      "idleKeepPlayingToast": "Canlı video hareketsizlik sırasında oynatmaya devam edecektir. Ayarlar › Medya bölümünden değiştirin."
     }
   },
   "popups": {
@@ -2706,9 +2868,9 @@
     },
     "gpsJamming": {
       "title": "GPS/GNSS Paraziti",
-      "navPerformance": "Nav Performance",
-      "samples": "ADS-B Samples",
-      "aircraft": "Aircraft",
+      "navPerformance": "Etkilenen hava araçları",
+      "samples": "Etkilenen hava aracı sayısı",
+      "aircraft": "Gözlemlenen hava araçlarının toplam sayısı",
       "h3Hex": "H3 Hex"
     },
     "flight": {
@@ -3444,7 +3606,8 @@
   "auth": {
     "signIn": "Oturum Aç",
     "createAccount": "Hesap oluştur",
-    "settings": "Ayarlar"
+    "settings": "Ayarlar",
+    "passkeyOffer": {}
   },
   "mcp": {
     "connectPanel": "MCP'yi Bağla",

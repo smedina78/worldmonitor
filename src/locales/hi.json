@@ -188,7 +188,8 @@
       "activeSirens": "सक्रिय सायरन",
       "sirens24h": "सायरन / 24 घंटे",
       "aviationDisruptions": "हवाई मार्ग विघ्न",
-      "gpsJammingZones": "जीपीएस जामिंग क्षेत्र"
+      "gpsJammingZones": "जीपीएस जामिंग क्षेत्र",
+      "temporalUnavailable": "अस्थायी प्रेक्षण उपलब्ध नहीं"
     },
     "fallback": {
       "instabilityIndex": "**अस्थिरता सूचकांक: {{score}}/100** ({{level}}, {{trend}})",
@@ -261,7 +262,7 @@
       "decisionSignalsUnavailable": "चीन का निर्णय-संकेत स्नैपशॉट वर्तमान में अनुपलब्ध है।"
     },
     "foodStocks": "Food stocks",
-    "foodStocksHelp": "USDA PSD commodity stocks-to-use by marketing year, with the world ratio alongside for context. FAOSTAT fills production only where PSD has no country coverage.",
+    "foodStocksHelp": "USDA PSD commodity stocks-to-use by marketing year, with the world ratio alongside for context. FAOSTAT Food Balances supplies production and domestic supply when PSD has no complete country balance.",
     "loadingFoodStocks": "Loading food stocks…",
     "foodStocksUnavailable": "Food stocks unavailable.",
     "foodStocksProLocked": "Upgrade to PRO for commodity stocks-to-use",
@@ -301,6 +302,71 @@
       "manufacturingShare": "Manufacturing employment",
       "source": "Sources: {{sources}}.",
       "retained": "{{stage}} data retained from the last successful refresh."
+    },
+    "fiveFactorScorecard": {
+      "title": "पाँच-कारक लचीलाता स्कोरकार्ड",
+      "help": "खान-पान, ऊर्जा, जनसांख्यिकी, प्रौद्योगिकी और रक्षा के लिए फ्रोज़न v1 प्रमाण स्कोर। इनपुट, स्रोत प्रामाणिकता और डेटा-अनुपलब्धता के कारणों की जाँच करने के लिए एक पंक्ति का विस्तार करें।",
+      "loading": "पाँच-कारक स्कोरकार्ड लोड हो रहा है…",
+      "unavailable": "पाँच-कारक स्कोरकार्ड अनुपलब्ध है।",
+      "proLocked": "पाँच-कारक लचीलाता स्कोरकार्ड के लिए PRO में अपग्रेड करें",
+      "insufficient": "अपर्याप्त डेटा",
+      "notAvailable": "अनुपलब्ध",
+      "noEvidence": "इस स्तंभ के लिए कोई प्रमाण उपलब्ध नहीं है।",
+      "score": "{{score}}/5",
+      "coverage": "{{coverage}}% कवरेज",
+      "methodologyVersion": "पद्धति v{{version}}",
+      "methodologyLink": "पद्धति देखें",
+      "pillars": {
+        "food": "खान-पान",
+        "energy": "ऊर्जा",
+        "demographics": "जनसांख्यिकी",
+        "technology": "प्रौद्योगिकी",
+        "defense": "रक्षा"
+      },
+      "reasons": {
+        "source-unavailable": "स्रोत अनुपलब्ध",
+        "country-unavailable": "देश अनुपलब्ध",
+        "invalid-value": "अमान्य स्रोत मान",
+        "stale": "सूचना पुरानी है",
+        "coverage-below-floor": "स्कोरिंग फ्लोर से कम कवरेज",
+        "required-group-missing": "आवश्यक प्रमाण समूह अनुपलब्ध",
+        "missing-population": "जनसंख्या अनुपलब्ध",
+        "redistribution-blocked": "स्रोत पुनर्वितरण की अनुमति नहीं है",
+        "pillar-unavailable": "स्तंभ अनुपलब्ध"
+      },
+      "inputs": {
+        "population": "Population",
+        "food_productionBalance": "उत्पादन संतुलन",
+        "food_stocksToUse": "उपयोग हेतु स्टॉक",
+        "food_waterSecurity": "जल सुरक्षा",
+        "food_importDiversity": "आयात विविधता",
+        "energy_productionBalance": "उत्पादन संतुलन",
+        "energy_lowCarbonShare": "कम-कार्बन ऊर्जा हिस्सा",
+        "energy_gridEfficiency": "ग्रिड दक्षता",
+        "demographics_totalDependency": "कुल निर्भरता",
+        "demographics_oldAgeDependency": "वृद्धावस्था निर्भरता",
+        "demographics_workingAgeProjection": "कार्यक्षम आयु वर्ग पूर्वानुमान",
+        "demographics_tertiaryEnrollment": "उच्च शिक्षा प्रवेश",
+        "demographics_researchersPerMillion": "प्रति मिलियन शोधकर्ता",
+        "demographics_stemGraduateShare": "STEM स्नातकों का हिस्सा",
+        "demographics_trainedIndustrialShare": "प्रशिक्षित औद्योगिक श्रम बल का हिस्सा",
+        "demographics_manufacturingEmploymentShare": "निर्माण रोजगार का हिस्सा",
+        "technology_internetUse": "इंटरनेट उपयोग",
+        "technology_mobileSubscriptions": "मोबाइल सब्सक्रिप्शन",
+        "technology_fixedBroadband": "फिक्स्ड ब्रॉडबैंड",
+        "technology_rdSpend": "शोध और विकास खर्च",
+        "technology_researchersPerMillion": "प्रति मिलियन शोधकर्ता",
+        "technology_stemGraduateShare": "STEM स्नातकों का हिस्सा",
+        "technology_electricityAccess": "बिजली की सुविधा",
+        "defense_expenditureUsd": "सैन्य व्यय",
+        "defense_expenditurePctGdp": "सैन्य बोझ",
+        "defense_personnel": "सशस्त्र बलों का जनशक्ति",
+        "defense_industrialBalance": "रक्षा औद्योगिक संतुलन",
+        "defense_supplierDiversity": "हथियार आपूर्तिकर्ता विविधता"
+      }
+    },
+    "defenseIndustrialBase": {
+      "proLocked": "हथियार आपूर्तिकर्ता निर्भरता और सैन्य क्षमता के लिए PRO में अपग्रेड करें"
     }
   },
   "header": {
@@ -599,6 +665,8 @@
       "recent": "हाल की खोजें",
       "empty": "डेटा खोजें या कमांड चलाएं",
       "noResults": "कोई परिणाम नहीं",
+      "resultAnnouncement_one": "{{query}} के लिए {{count}} परिणाम",
+      "resultAnnouncement_other": "{{query}} के लिए {{count}} परिणाम",
       "commands": "कमांड्स",
       "results": "परिणाम",
       "addPanel": "जोड़ें",
@@ -857,7 +925,6 @@
   "components": {
     "webcams": {
       "paused": "वेबकैम रुके हुए हैं",
-      "pausedIdle": "वेबकैम रुके हुए हैं — फिर से चालू करने के लिए माउस हिलाएँ",
       "regions": {
         "all": "सभी",
         "mideast": "मिडिल ईस्ट",
@@ -1016,7 +1083,8 @@
       "refineryStage": "Refine",
       "stageUnavailable": "No published figures for this stage",
       "withheldNote": "W withheld",
-      "productionCaption": "Country shares of actual production. The map deposits layer shows where resources sit; this table shows who mines or refines them."
+      "productionCaption": "Country shares of actual production. The map deposits layer shows where resources sit; this table shows who mines or refines them.",
+      "productionProLocked": "खान और रिफाइनरी देश शेयर के लिए PRO में अपग्रेड करें, चरण के अनुसार सांद्रता (HHI) के साथ।"
     },
     "tradePolicy": {
       "overview": "ओवरव्यू",
@@ -1250,9 +1318,6 @@
       "datacenter": "डेटा केंद्र",
       "base": "बेस",
       "nuclear": "परमाणु"
-    },
-    "community": {
-      "joinDiscussion": "आगे क्या होगा में मदद करें"
     },
     "threatLabels": {
       "critical": "गंभीर",
@@ -1563,7 +1628,10 @@
       "provenanceTitle": "कवरेज प्रोवेनेंस: इस ब्रीफ को कितनी अंतर्ग्रहीत कहानियों और विशिष्ट स्रोतों से चुना गया था",
       "compiledFrom": "{{stories}} कहानियों और {{sources}} स्रोतों से संकलित",
       "briefFreshness": "{{minutes}}m पहले जनरेट किया गया · नवीनतम स्रोत {{hours}}h पुराना",
-      "briefStoryDetails": "Story details ({{count}})"
+      "briefStoryDetails": "खबर का विवरण ({{count}})",
+      "streamIdleStopLabel": "निष्क्रियता पर लाइव वीडियो रोकें",
+      "streamIdleStopDesc": "निष्क्रियता की इस अवधि के बाद लाइव न्यूज़ और लाइव वेबकैम को रोक देता है और पैनल में एक नोटिस दिखाता है।",
+      "streamIdleStopNever": "कभी नहीं"
     },
     "settings": {
       "exportSettings": "सेटिंग्स निर्यात करें",
@@ -1892,6 +1960,16 @@
       "loading": "टेलीग्राम रिले से जुड़ रहे हैं...",
       "empty": "कोई संदेश उपलब्ध नहीं",
       "disabled": "टेलीग्राम रिले सक्रिय नहीं है",
+      "watchlistPlaceholder": "@username से सार्वजनिक चैनल जोड़ें",
+      "resolving": "चैनल खोजा जा रहा है...",
+      "invalidUsername": "सार्वजनिक टेलीग्राम @username का उपयोग करें",
+      "resolveFailed": "चैनल नहीं मिला",
+      "watchlistLimit": "आप अधिकतम {{count}} कस्टम चैनल फ़ॉलो कर सकते हैं",
+      "previewMembers": "{{count}} सदस्य",
+      "addChannel": "चैनल जोड़ें",
+      "added": "जोड़ा गया",
+      "remove": "हटाएँ",
+      "custom": "कस्टम",
       "filterAll": "सभी",
       "filterBreaking": "ब्रेकिंग",
       "filterConflict": "संघर्ष",
@@ -2039,6 +2117,22 @@
       "metals": {
         "gold": "Gold",
         "silver": "Silver"
+      },
+      "divergence": {
+        "compositeValue": "भौतिक तनाव सूचकांक: {{value}} / 100",
+        "fiveDayTrend": "पाँच-कारोबारी-दिन प्रीमियम प्रवृत्ति",
+        "regimes": {
+          "normal": "सामान्य",
+          "elevated": "उन्नत",
+          "stressed": "दबाव में",
+          "extreme": "अत्यंत"
+        },
+        "states": {
+          "insufficientHistory": "तैयारी में: {{count}} / {{required}} कारोबारी बिंदु",
+          "staleInput": "भौतिक बेंचमार्क पुराना है",
+          "missingInput": "विचलन संकेत उपलब्ध नहीं"
+        },
+        "twentyDayTrend": "बीस कारोबारी दिन का प्रीमियम प्रवृत्ति"
       }
     },
     "crypto": {
@@ -2326,6 +2420,26 @@
         "failedToLoad": "लोड करने में विफल"
       }
     },
+    "supplyVulnerability": {
+      "title": "वस्तु संवेदनशीलता",
+      "help": "आपूर्तिकर्ता संकेंद्रण, समुद्री पारगमन और उपलब्ध रणनीतिक भंडार के आधार पर वस्तु-वार देश का जोखिम।",
+      "loading": "वस्तु संवेदनशीलता लोड हो रही है…",
+      "unavailable": "वस्तु संवेदनशीलता डेटा उपलब्ध नहीं है",
+      "noCoverage": "इस देश के लिए पर्याप्त साक्ष्य नहीं हैं",
+      "unknown": "अज्ञात",
+      "concentration": "संकेंद्रण",
+      "transit": "पारगमन",
+      "buffer": "भंडार",
+      "sources": "स्रोत",
+      "methodology": "कार्यप्रणाली",
+      "hormuzTitle": "वस्तु निर्भरताएँ",
+      "dependentCountries": "निर्भर देश",
+      "dependentCommodities": "निर्भर वस्तुएँ",
+      "stateOk": "वर्तमान",
+      "stateStale": "पुराना इनपुट",
+      "stateInsufficient": "अपर्याप्त डेटा",
+      "proLocked": "वस्तु कमजोरी स्कोरिंग के लिए PRO में अपग्रेड करें"
+    },
     "hormuzTracker": {
       "infoTooltip": "<strong>हर्मुज व्यापार ट्रैकर</strong> हर्मुज स्ट्रेट के माध्यम से लाइव AIS जहाज ट्रैकिंग, विश्व का सबसे महत्वपूर्ण तेल चोकपॉइंट। टैंकर गिनती, व्यवधान घटनाएं, और साप्ताहिक प्रवाह परिवर्तन मॉनिटर करता है। लगभग 20% वैश्विक तेल दैनिक यहां से गुजरता है।",
       "title": "हर्मुज व्यापार ट्रैकर",
@@ -2582,7 +2696,14 @@
       "signals_one": "{{count}} संकेत",
       "signals_other": "{{count}} संकेत",
       "analyzing": "विश्लेषण कर रहे हैं...",
-      "viewOnMap": "मानचित्र पर देखें"
+      "viewOnMap": "मानचित्र पर देखें",
+      "waiting": "डेटा के अगले अपडेट की प्रतीक्षा है। यह पैनल अपने आप अपडेट होता है।",
+      "offline": "कनेक्शन की प्रतीक्षा है। आपके फिर से ऑनलाइन होने पर यह पैनल अपने आप अपडेट होगा।",
+      "updated": "अपडेट किया गया {{time}}",
+      "saved": "अंतिम ज्ञात अपडेट {{time}} · अपडेट की जाँच जारी है",
+      "savedOffline": "अंतिम ज्ञात अपडेट {{time}} · ऑफ़लाइन",
+      "localSignals": "डैशबोर्ड में लोड किए गए संकेतों पर आधारित",
+      "emptySaved": "अंतिम ज्ञात अपडेट में कोई अभिसरण नहीं था।"
     },
     "thermalEscalation": {
       "title": "थर्मल बढ़ोतरी",
@@ -2732,6 +2853,47 @@
       "rubBase": "बैंक ऑफ रूस — प्रति 1 इकाई रूबल",
       "rubPerUnit": "प्रति इकाई रूबल",
       "sourceCbr": "स्रोत: बैंक ऑफ रूस"
+    },
+    "passkeyOffer": {
+      "title": "एक पासकी सेव करें?",
+      "body": "अगली बार अपने फिंगरप्रिंट, चेहरे या डिवाइस PIN से साइन इन करें — याद रखने के लिए कोई पासवर्ड नहीं।",
+      "accept": "पासकी सेव करें",
+      "dismiss": "अभी नहीं",
+      "close": "बंद करें",
+      "announce": "अगली बार तेजी से साइन इन करने के लिए एक पासकी सेव करें।",
+      "busy": "आपके डिवाइस की प्रतीक्षा की जा रही है…",
+      "succeeded": "पासकी सेव हो गई। आप इसे अगली बार साइन इन करते समय उपयोग कर सकते हैं।",
+      "retryable": "वह पूरी नहीं हुई। आप फिर से कोशिश कर सकते हैं।",
+      "failed": "हम इस डिवाइस पर एक पासकी सेव नहीं कर सके।"
+    },
+    "decisionBrief": {
+      "commodityTitle": "वस्तु निर्णय सारांश",
+      "commodity": "वस्तु / उत्पाद",
+      "blockedChokepoint": "अवरुद्ध माना गया मार्ग",
+      "commodityCapture": "वस्तु तुलना दर्ज करें",
+      "title": "निर्णय सारांश",
+      "fuel": "ईंधन",
+      "chokepoint": "अवरोध बिंदु",
+      "baseline": "आधारभूत व्यवधान",
+      "comparison": "तुलनात्मक व्यवधान",
+      "capture": "दोनों प्राप्त / रीफ़्रेश करें",
+      "downloadHtml": "सारांश HTML में डाउनलोड करें",
+      "downloadJson": "सारांश JSON में डाउनलोड करें",
+      "back": "← देश सारांश पर वापस जाएँ",
+      "select": "ऊर्जा आपूर्ति में व्यवधान चुनें, फिर दोनों परिदृश्य प्राप्त करें।",
+      "changed": "चयन बदल गया है। निर्यात से पहले दोनों परिदृश्य प्राप्त करें।",
+      "loading": "दोनों परिदृश्य प्राप्त किए जा रहे हैं…",
+      "captured": "प्राप्त हो गया। डाउनलोड करने से पहले अवलोकन की तारीखें और सीमाएँ जाँचें।",
+      "failed": "परिदृश्य प्राप्त नहीं हो सके। अपनी पहुँच जाँचें और फिर कोशिश करें। निर्यात के लिए कोई परिणाम उपलब्ध नहीं है।",
+      "locked": "निर्णय सारांश Pro में उपलब्ध है।"
+    },
+    "liveMedia": {
+      "idleStatus": "निष्क्रियता के कारण रुका हुआ",
+      "idleBody": "माउस, कीबोर्ड या टच गतिविधि के बिना {{duration}} के बाद लाइव वीडियो रुक गया।",
+      "idleResume": "फिर से शुरू करें",
+      "idleKeepPlaying": "निष्क्रियता में चलाते रहें",
+      "idleSettingsHint": "सेटिंग्स › मीडिया में कभी भी यह बदलें।",
+      "idleKeepPlayingToast": "लाइव वीडियो निष्क्रियता के दौरान भी चलता रहेगा। इसे सेटिंग्स › मीडिया में कभी भी बदलें।"
     }
   },
   "popups": {
@@ -2775,9 +2937,9 @@
     },
     "gpsJamming": {
       "title": "GPS/GNSS व्यवधान",
-      "navPerformance": "नेविगेशन प्रदर्शन",
-      "samples": "ADS-B नमूने",
-      "aircraft": "विमान",
+      "navPerformance": "प्रभावित विमान",
+      "samples": "प्रभावित विमानों की संख्या",
+      "aircraft": "देखे गए विमान",
       "h3Hex": "H3 हेक्स"
     },
     "flight": {
@@ -3444,7 +3606,8 @@
   "auth": {
     "signIn": "साइन इन करें",
     "createAccount": "खाता बनाएं",
-    "settings": "सेटिंग्स"
+    "settings": "सेटिंग्स",
+    "passkeyOffer": {}
   },
   "mcp": {
     "connectPanel": "MCP से जुड़ें",

@@ -25,7 +25,7 @@ function extractHotspotSegment(source: string): string {
 function extractHotspotBaselines(source: string): Array<{ id: string; name: string; baseline: number }> {
   const segment = extractHotspotSegment(source);
   const entries: Array<{ id: string; name: string; baseline: number }> = [];
-  const blockRe = /^  \{\n([\s\S]*?)^  \},/gm;
+  const blockRe = /^ {2}\{\n([\s\S]*?)^ {2}\},/gm;
   let blockMatch: RegExpExecArray | null;
   while ((blockMatch = blockRe.exec(segment)) !== null) {
     const block = blockMatch[1]!;
@@ -106,7 +106,7 @@ test('public signal docs stay aligned with hotspot escalation math', () => {
       /static_?baseline[\s\S]{0,120}escalationScore|escalationScore[\s\S]{0,120}staticBaseline/i,
       `${label} must publish hotspot static baseline source`,
     );
-    assert.match(doc, /0\.30[\s\S]{0,120}0\.70/, `${label} must publish hotspot 30\/70 blend`);
+    assert.match(doc, /0\.30[\s\S]{0,120}0\.70/, `${label} must publish hotspot 30/70 blend`);
     assert.match(doc, /1-5/, `${label} must state hotspot scores are on a 1-5 scale`);
     assert.doesNotMatch(doc, /proximity_boost/, `${label} must not document a nonexistent hotspot proximity boost`);
   }
@@ -264,4 +264,39 @@ test('public data-source docs disclose Telegram source-bias metadata', () => {
   assert.match(dataSourcesDoc, /honest mapping from the private operational `tier`/);
   assert.match(dataSourcesDoc, /cannot leave stale tier keys in the RSS registry/);
   assert.match(dataSourcesDoc, /anonymous OSINT aggregators stay specialty or aggregator tier/);
+});
+test('public algorithms docs describe flow_drop the way the detector actually works', () => {
+  // #6422: the cross-stream table described `flow_drop` as "ETF flow estimates
+  // reverse direction while price continues - Smart money divergence". The
+  // detector reads no ETF data and no price series at all: detectPipelineFlowDrops
+  // lowercases a cluster's headlines and requires a PIPELINE_KEYWORDS hit and a
+  // FLOW_DROP_KEYWORDS hit within the same cluster. Two other surfaces already
+  // described it correctly - docs/signal-intelligence.mdx and the SIGNAL_CONTEXT
+  // copy in src/utils/analysis-constants.ts - which is what makes the algorithms
+  // row an outlier rather than a difference of emphasis.
+  const detector = readRepo('src/services/analysis-core.ts');
+  assert.match(detector, /const hasPipeline = titles\.some\(title => includesKeyword\(title, PIPELINE_KEYWORDS\)\)/);
+  assert.match(detector, /const hasFlowDrop = titles\.some\(title => includesKeyword\(title, FLOW_DROP_KEYWORDS\)\)/);
+  assert.doesNotMatch(detector, /ETF/);
+
+  for (const path of ['docs/algorithms.mdx', 'docs/zh/algorithms.mdx'] as const) {
+    const row = readRepo(path)
+      .split('\n')
+      .find((line) => line.startsWith('| `flow_drop`'));
+    assert.ok(row, `${path} must keep a signal table row for flow_drop`);
+    assert.doesNotMatch(
+      row,
+      /ETF/,
+      `${path} still describes flow_drop as an ETF-flow signal; detectPipelineFlowDrops reads none`,
+    );
+  }
+
+  assert.match(
+    readRepo('docs/algorithms.mdx'),
+    /\| `flow_drop`\s+\| Headlines carry both a pipeline keyword and a flow-disruption keyword/,
+  );
+  assert.match(
+    readRepo('docs/zh/algorithms.mdx'),
+    /\| `flow_drop`\s+\| 标题同时包含管道关键词和流量中断关键词/,
+  );
 });

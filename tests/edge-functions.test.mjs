@@ -56,6 +56,10 @@ describe('scripts/shared/ stays in sync with shared/', () => {
     'brief-llm-core.js',
     'brief-llm-core.d.ts',
     'correlation-runtime-mode.js',
+    'physical-divergence-contract.js',
+    'physical-divergence-contract.d.ts',
+    'physical-divergence-staleness.js',
+    'physical-divergence-staleness.d.ts',
     // #6428: publisher-family resolution for corroboration counting, consumed
     // by scripts/_clustering.mjs (Railway rootDirectory=scripts) and by the
     // edge digest. Must stay byte-identical.
@@ -115,6 +119,20 @@ describe('Edge Function no node: built-ins', () => {
         !match,
         `${name}: imports node:${match?.[1]} — Vercel Edge Runtime does not support node: built-in modules. Use an edge-compatible alternative.`,
       );
+    });
+  }
+});
+
+// AGENTS.md: legacy JS entries share code only through `_*.js` helpers or
+// packages. Importing another route entry couples two deployables and bundles
+// the whole sibling handler (#8305 briefly had authorize.js import register.js).
+describe('Legacy JS entries import only _-prefixed relative modules', () => {
+  for (const { name, path } of allEdgeFunctions) {
+    it(`${name} imports no sibling route entry`, () => {
+      const src = readFileSync(path, 'utf-8');
+      const specs = [...src.matchAll(/(?:from|import\()\s*['"](\.[^'"]+)['"]/g)].map((m) => m[1]);
+      const routes = specs.filter((spec) => !spec.split('/').pop().startsWith('_'));
+      assert.deepEqual(routes, [], `${name}: move shared code into a _-prefixed helper`);
     });
   }
 });

@@ -99,6 +99,102 @@ describe('Frontend bootstrap runtime behavior', () => {
     }
   });
 
+  it('does not report the slow tier settled while a bootstrap is still in flight', async () => {
+    // fetchBootstrapData clears slowTierSettled up front and only assigns it
+    // once the fast tier has committed. waitForBootstrapSlowTier opens with
+    // `if (!pending) return true`, so during that window "not scheduled yet"
+    // was indistinguishable from "already done" and the wait no-opped.
+    //
+    // App.ts awaits this checkpoint before setting viewportHydrationReady and
+    // registering the scroll listener, precisely so an early scroll cannot
+    // consume the consume-once slow-tier hydration keys before they land
+    // (getHydratedData deletes on read). A fail-open here opens that gate early
+    // whenever Phase 6 wins the race against fast-tier completion — panels then
+    // fall back to per-panel RPCs that never re-read the late payload, wasting
+    // the ~500 KB slow tier. Surfaced as the #5876 e2e flaking under CI load.
+    const requests = installFetchStub();
+    const boot = fetchBootstrapData();
+
+    await tick();
+    assert.equal(tierRequests(requests, 'fast').length, 1, 'fast tier should be in flight');
+    assert.equal(tierRequests(requests, 'slow').length, 0, 'slow tier must not be scheduled yet');
+
+    // The bootstrap is running and the slow tier has NOT settled, so a bounded
+    // wait must report "not settled" rather than clearing instantly.
+    assert.equal(
+      await waitForBootstrapSlowTier(50),
+      false,
+      'the checkpoint must not clear before the slow tier has even been scheduled',
+    );
+
+    // Let the boot finish so the suite leaves no in-flight state behind.
+    tierRequests(requests, 'fast')[0]!.deferred.resolve(jsonResponse({ fastKey: 'fast' }));
+    await boot;
+    await tick();
+    tierRequests(requests, 'slow')[0]!.deferred.resolve(jsonResponse({ slowKey: 'slow' }));
+    assert.equal(await waitForBootstrapSlowTier(100), true, 'a settled slow tier still clears');
+  });
+
+  it('reports an in-flight slow tier as unsettled, then fires onSlowSettled exactly once', async () => {
+    // App.ts's `if (!settled)` boot branch: when the bounded wait times out it runs
+    // loadAllData() once and defers the visible fan-out to onSlowSettled. That is one
+    // extra data pass only while the callback stays single-shot and still fires after a
+    // timed-out wait, so pin both halves. The wait budget and the slow tier's own abort
+    // budget are clocked independently, which is what makes this branch reachable in
+    // production rather than only under a synthetic timeout.
+    const requests = installFetchStub();
+    let settledCalls = 0;
+    const boot = fetchBootstrapData(() => { settledCalls += 1; });
+
+    await tick();
+    tierRequests(requests, 'fast')[0]!.deferred.resolve(jsonResponse({ fastKey: 'fast' }));
+    await boot;
+    await tick();
+    assert.equal(tierRequests(requests, 'slow').length, 1, 'the slow tier should be in flight');
+
+    assert.equal(
+      await waitForBootstrapSlowTier(50),
+      false,
+      'a slow tier still in flight must not report settled',
+    );
+    assert.equal(settledCalls, 0, 'onSlowSettled must not fire while the slow tier is in flight');
+
+    tierRequests(requests, 'slow')[0]!.deferred.resolve(jsonResponse({ slowKey: 'slow' }));
+    assert.equal(await waitForBootstrapSlowTier(100), true, 'the settled slow tier clears the checkpoint');
+    await tick();
+    assert.equal(settledCalls, 1, 'the deferred fan-out must be armed exactly once');
+  });
+
+  it('releases a superseded bootstrap checkpoint instead of stranding its awaiters', async () => {
+    // The reservation must be resolved on EVERY path out of fetchBootstrapData,
+    // not just the happy one. waitForBootstrapSlowTier captures `pending` at
+    // call time, so an awaiter can be holding a generation's promise when a
+    // newer bootstrap supersedes it and that generation returns early without
+    // ever scheduling a slow tier. Leaving that promise unresolved would turn
+    // the old fail-open into a permanent hang for waitForBootstrapSlowTier(0)
+    // callers (CorrelationPanel awaits with no timeout).
+    const requests = installFetchStub();
+    const firstBoot = fetchBootstrapData();
+    await tick();
+
+    // Capture the checkpoint belonging to the FIRST generation, mid-flight.
+    const captured = waitForBootstrapSlowTier(0);
+
+    // A second bootstrap supersedes it; the first generation now returns early.
+    const secondBoot = fetchBootstrapData();
+    await tick();
+    tierRequests(requests, 'fast')[0]!.deferred.resolve(jsonResponse({ a: 1 }));
+    tierRequests(requests, 'fast')[1]!.deferred.resolve(jsonResponse({ b: 2 }));
+    await firstBoot.catch(() => {});
+    await secondBoot.catch(() => {});
+
+    const outcome = await Promise.race([
+      captured.then(() => 'resolved' as const),
+      new Promise<'hung'>((resolve) => setTimeout(() => resolve('hung'), 250)),
+    ]);
+    assert.equal(outcome, 'resolved', 'a superseded generation must not strand slow-tier awaiters');
+  });
+
   it('returns after the fast tier and starts the slow tier only after fast state is committed', async () => {
     const requests = installFetchStub();
     let callbackState = getBootstrapHydrationState();

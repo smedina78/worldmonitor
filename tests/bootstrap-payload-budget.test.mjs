@@ -14,6 +14,7 @@ import {
   DEMOTED_FAST_KEYS,
   ENERGY_ON_DEMAND_KEYS,
   FAST_FIRST_PAINT_JUSTIFICATION,
+  FEATURE_GATED_UNCAPTURED_KEYS,
   FINAL_TIER_DECODED_BYTE_CEILINGS,
   PRODUCTION_CAPTURE,
   REPRESENTATIVE_FIXTURE_CONTRACTS,
@@ -134,6 +135,10 @@ test('budget manifest records pre-change ceilings, final targets, and reviewed e
   }
 });
 
+test('retired WSB key is absent from every bootstrap tier', () => {
+  for (const tier of ['fast', 'slow', 'on-demand']) assert.ok(!bootstrapTierKeyNames(tier).includes('wsbTickers'));
+});
+
 test('all demotions are represented in their actual destination tier', () => {
   const fast = new Set(bootstrapTierKeyNames('fast'));
   const slow = new Set(bootstrapTierKeyNames('slow'));
@@ -226,6 +231,32 @@ test('every remaining fast key has a first-paint justification', () => {
     );
   }
   assert.deepEqual([...fast].sort(), Object.keys(FAST_FIRST_PAINT_JUSTIFICATION).sort());
+});
+
+test('feature-gated uncaptured keys match the Iran-enabled registry gap', () => {
+  const enabledGap = Object.fromEntries(
+    ['fast', 'slow'].flatMap((tier) => {
+      const disabled = new Set(bootstrapTierKeyNames(tier, { iranEventsEnabled: false }));
+      return bootstrapTierKeyNames(tier, { iranEventsEnabled: true })
+        .filter((key) => !disabled.has(key))
+        .map((key) => [key, tier]);
+    }),
+  );
+  assert.deepEqual(
+    Object.fromEntries(
+      Object.entries(FEATURE_GATED_UNCAPTURED_KEYS).map(([key, spec]) => [key, spec.tier]),
+    ),
+    enabledGap,
+  );
+  for (const key of Object.keys(FEATURE_GATED_UNCAPTURED_KEYS)) {
+    assert.equal(
+      CAPTURED_KEY_DECODED_BYTES[key],
+      undefined,
+      `${key} has frozen bytes and must not be listed as uncaptured`,
+    );
+    assert.ok(FEATURE_GATED_UNCAPTURED_KEYS[key].gate);
+    assert.ok(FEATURE_GATED_UNCAPTURED_KEYS[key].rationale.trim().length > 0);
+  }
 });
 
 test('web and desktop bootstrap deadlines stay unchanged', () => {

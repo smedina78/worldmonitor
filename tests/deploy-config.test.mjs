@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { readFileSync as originalReadFileSync, existsSync, readdirSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 function readFileSync(path, options) {
   const content = originalReadFileSync(path, options);
   if (typeof content === 'string') {
@@ -12,13 +12,44 @@ function readFileSync(path, options) {
   }
   return content;
 }
+
+// Consecutive User-agent lines share one robots.txt group. A blank line, or a
+// User-agent line after rules, starts a new group; comments do not end a group.
+function parseRobotsGroups(source) {
+  const groups = [];
+  let current = null;
+  for (const raw of source.split('\n')) {
+    const line = raw.trim();
+    if (line === '') {
+      current = null;
+      continue;
+    }
+    if (line.startsWith('#')) continue;
+    const colon = line.indexOf(':');
+    if (colon === -1) continue;
+    const key = line.slice(0, colon).trim().toLowerCase();
+    const value = line.slice(colon + 1).trim();
+    if (key === 'user-agent') {
+      if (!current || current.rules.length > 0) {
+        current = { agents: [], rules: [] };
+        groups.push(current);
+      }
+      current.agents.push(value.toLowerCase());
+    } else if (current && (key === 'allow' || key === 'disallow')) {
+      current.rules.push(`${key}: ${value}`);
+    }
+  }
+  return groups;
+}
 import { fileURLToPath } from 'node:url';
 import { guardProBuiltOutput, shouldSkipProBuiltOutput, withoutUnbuiltProPaths } from './_lib/pro-built-output.mjs';
+import { CACHE_POLICY_HEADER_NAME, isSharedCacheable } from './helpers/shared-cache-policy.mjs';
 import {
   CONTENT_CORPUS_PREFIXES,
   discoverContentCorpusPages,
 } from '../scripts/discover-content-corpus-pages.mjs';
 import { guardBuiltOutput, shouldSkipBuiltOutput } from './_lib/built-output-guard.mjs';
+import { AGENT_TEXT_FILES } from '../scripts/cloudflare-cache-rule.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageJson = JSON.parse(readFileSync(resolve(__dirname, '../package.json'), 'utf-8'));
@@ -28,8 +59,12 @@ const proViteConfigSource = readFileSync(resolve(__dirname, '../pro-test/vite.co
 const playwrightConfigSource = readFileSync(resolve(__dirname, '../playwright.config.ts'), 'utf-8');
 const embedE2eSource = readFileSync(resolve(__dirname, '../e2e/embed.spec.ts'), 'utf-8');
 const webMcpE2eSource = readFileSync(resolve(__dirname, '../e2e/webmcp.spec.ts'), 'utf-8');
+const webMcpCancellationE2eSource = readFileSync(
+  resolve(__dirname, '../e2e/helpers/webmcp-cancellation.ts'),
+  'utf-8',
+);
 const testWorkflowSource = readFileSync(resolve(__dirname, '../.github/workflows/test.yml'), 'utf-8');
-const sitemapSource = readFileSync(resolve(__dirname, '../public/sitemap.xml'), 'utf-8');
+const sitemapSource = readFileSync(resolve(__dirname, '../public/sitemap-main.xml'), 'utf-8');
 const robotsSource = readFileSync(resolve(__dirname, '../public/robots.www.txt'), 'utf-8');
 const mainSource = readFileSync(resolve(__dirname, '../src/main.ts'), 'utf-8');
 const zodCspSource = readFileSync(resolve(__dirname, '../src/bootstrap/zod-csp.ts'), 'utf-8');
@@ -41,7 +76,7 @@ const frontendDockerfileSource = readFileSync(resolve(__dirname, '../docker/Dock
 const dockerignoreSource = readFileSync(resolve(__dirname, '../.dockerignore'), 'utf-8');
 const vercelIgnoreSource = readFileSync(resolve(__dirname, '../scripts/vercel-ignore.sh'), 'utf-8');
 const variantDashboardSource = readFileSync(resolve(__dirname, '../src/config/variant-dashboard-html.ts'), 'utf-8');
-const SPA_HTML_CACHE_SOURCE = '/((?!api|mcp|a2a|ask|oauth|assets|blog|docs|countries|chokepoints|crises|tools|research|reference|changelog|sources|use-cases|src|tmp|server|embed|embed\\.html|favico|map-styles|data|textures|pro|sw\\.js|workbox-[a-f0-9]+\\.js|manifest\\.webmanifest|offline\\.html|robots\\.txt|robots\\.www\\.txt|robots\\.variant\\.txt|robots\\.api\\.txt|sitemap\\.xml|schemamap\\.xml|sandbox|llms\\.txt|llms-full\\.txt|llms\\*\\.txt|openapi\\.yaml|openapi\\.json|auth\\.md|pricing\\.md|support\\.md|ai-search\\.md|agents\\.md|developers\\.md|developers/llms\\.txt|mcp-server\\.md|openapi\\.md|sdks\\.md|agent\\.txt|\\.well-known|wm-widget-sandbox\\.html|mcp-grant\\.html|mcp-grant|.*\\.md$).*)';
+const SPA_HTML_CACHE_SOURCE = '/((?!api|mcp|a2a|ask|oauth|assets|blog|docs|country-instability-index|countries|chokepoints|compare|crises|tools|research|reference|changelog|sources|use-cases|accuracy|src|tmp|server|embed|embed\\.html|favico|map-styles|data|textures|pro|sw\\.js|workbox-[a-f0-9]+\\.js|manifest\\.webmanifest|offline\\.html|robots\\.txt|robots\\.www\\.txt|robots\\.variant\\.txt|robots\\.api\\.txt|sitemap\\.xml|sitemap-main\\.xml|schemamap\\.xml|sandbox|llms\\.txt|llms-full\\.txt|llms\\*\\.txt|openapi\\.yaml|openapi\\.json|plugin\\.json|auth\\.md|pricing\\.md|support\\.md|ai-search\\.md|agents\\.md|developers\\.md|developers/llms\\.txt|mcp-server\\.md|openapi\\.md|sdks\\.md|world-monitor\\.md|api-versioning\\.md|agent\\.txt|\\.well-known|wm-widget-sandbox\\.html|mcp-grant\\.html|mcp-grant|.*\\.md$).*)';
 const GLOBAL_SECURITY_HEADER_SOURCE = '/((?!docs|embed|embed\\.html|wm-widget-sandbox\\.html).*)';
 const APP_ROOT_HOST_PATTERN = '^(?:(?:www|tech|finance|commodity|happy|energy)\\.)?worldmonitor\\.app$';
 const WEBMCP_PRODUCTION_HOST_PATTERN = '^(?:www|tech|finance|commodity|happy|energy)\\.worldmonitor\\.app$';
@@ -123,6 +158,9 @@ function probePlaywrightWebMcpEnvironment(overrides = {}) {
   return probe;
 }
 
+const HTML_ENTRY_BROWSER_CACHE = 'public, max-age=0, must-revalidate';
+const HTML_ENTRY_EDGE_CACHE = 'public, s-maxage=600, stale-while-revalidate=60';
+
 const getCacheHeaderValue = (sourcePath) => {
   let value = null;
   for (const rule of vercelConfig.headers.filter((entry) => entry.source === sourcePath)) {
@@ -176,8 +214,18 @@ const sourceToRegExp = (source) => {
         out += source.slice(j, k + 1);
         i = k;
       } else if (source[j] === '*') {
+        // Vercel compiles `source` with path-to-regexp in STRICT mode: a `*`
+        // param is a run of NON-EMPTY segments and no optional trailing slash
+        // is appended. So `/countries/:path*` matches `/countries` and
+        // `/countries/japan`, but neither `/countries/` nor `/countries/japan/`
+        // — and every crawlable-corpus URL canonicalises to the trailing-slash
+        // form. This modelled `(?:/.*)?` until #7530, which matched both forms
+        // and kept the corpus cache assertions green while production served
+        // Vercel's static default on all 250 corpus routes (see the strict-mode
+        // cases in 'vercel.json source matching'). Raw `(.*)` groups are
+        // unaffected — they are copied through verbatim above.
         out = out.replace(/\/$/, '');
-        out += '(?:/.*)?';
+        out += '(?:/[^/]+)*';
         i = j;
       } else {
         out += '[^/]+';
@@ -246,6 +294,43 @@ const effectiveCacheControl = (path) => {
   return value;
 };
 
+const effectiveHeader = (path, key) => {
+  let value = null;
+  for (const entry of vercelConfig.headers) {
+    if (!sourceToRegExp(entry.source).test(path)) continue;
+    const header = entry.headers?.find((h) => h.key.toLowerCase() === key.toLowerCase());
+    if (header) value = header.value;
+  }
+  return value;
+};
+
+const assertPublicHtmlEntryCache = (route) => {
+  assert.equal(
+    effectiveCacheControl(route),
+    HTML_ENTRY_BROWSER_CACHE,
+    `${route} must keep a browser-only revalidation policy after all matching rules apply`,
+  );
+  assert.ok(
+    !effectiveCacheControl(route).includes('no-store'),
+    'HTML must not set no-store — it disables bfcache',
+  );
+  assert.doesNotMatch(
+    effectiveCacheControl(route),
+    /\bs-maxage\b/,
+    `${route} Cache-Control must not carry s-maxage; Vercel consumes it and forwards max-age=0 to Cloudflare`,
+  );
+  assert.equal(
+    effectiveHeader(route, 'CDN-Cache-Control'),
+    HTML_ENTRY_EDGE_CACHE,
+    `${route} must advertise the 600s Cloudflare TTL on CDN-Cache-Control`,
+  );
+  assert.equal(
+    effectiveHeader(route, 'Vercel-CDN-Cache-Control'),
+    HTML_ENTRY_EDGE_CACHE,
+    `${route} must advertise the 600s Vercel TTL on Vercel-CDN-Cache-Control`,
+  );
+};
+
 const getHeaderValueForSource = (sourcePath, key) => {
   const headers = getHeadersForSource(sourcePath);
   const header = headers.find((h) => h.key.toLowerCase() === key.toLowerCase());
@@ -282,7 +367,6 @@ const getCspDirectiveTokens = (csp, directive) => {
 // scheme-wide source is flagged while the known ones stay quiet.
 const KNOWN_FRAME_WILDCARDS = [
   'https://*.clerk.accounts.dev',
-  'https://*.vercel.app',
   'https://*.dodopayments.com',
   'https://*.hs.dodopayments.com',
   'https://*.custom.hs.dodopayments.com',
@@ -334,6 +418,56 @@ const getVariantUrls = () => {
   );
 };
 
+
+// `sourceToRegExp` is this suite's model of how Vercel compiles a `source`.
+// Pin its strict-mode semantics directly: while the model was more permissive
+// than Vercel's compiler, every assertion built on it reported a match that
+// production did not make, and ~22 dead corpus cache rules shipped unnoticed
+// (#7530). Each case below was verified against production before being pinned.
+describe('vercel.json source matching', () => {
+  it('models a :param* catch-all as non-empty segments with no trailing slash', () => {
+    const matches = (path) => sourceToRegExp('/countries/:path*').test(path);
+    assert.equal(matches('/countries'), true);
+    assert.equal(matches('/countries/japan'), true);
+    assert.equal(matches('/countries/japan/kanto'), true);
+    // The forms the corpus actually canonicalises to — Vercel does not match
+    // these, which is the whole defect.
+    assert.equal(matches('/countries/'), false);
+    assert.equal(matches('/countries/japan/'), false);
+  });
+
+  it('models a raw regex group as matching the empty string and trailing slashes', () => {
+    const matches = (path) => sourceToRegExp('/countries/(.*)').test(path);
+    // Verified in production against the equivalently shaped `/assets/(.*)`
+    // rule: `/assets/` returns the configured immutable cache header, so the
+    // group does match empty.
+    assert.equal(matches('/countries/'), true);
+    assert.equal(matches('/countries/japan/'), true);
+    assert.equal(matches('/countries/japan'), true);
+    assert.equal(matches('/countries'), false, 'the literal /countries rule covers the bare form');
+  });
+
+  // The load-bearing form for the shared-content 308s: a named param with an
+  // explicit `.*` pattern behaves like the raw group but keeps the `:match`
+  // destination interpolation every other redirect in this file already uses,
+  // so no rule depends on `$1` support we have no in-repo evidence for.
+  it('models a :name(regex) custom matcher like the equivalent raw group', () => {
+    const named = (path) => sourceToRegExp('/countries/:match(.*)').test(path);
+    const raw = (path) => sourceToRegExp('/countries/(.*)').test(path);
+    for (const path of ['/countries/', '/countries/japan', '/countries/japan/', '/countries']) {
+      assert.equal(named(path), raw(path), `${path} must match both forms identically`);
+    }
+    assert.equal(named('/countries/'), true);
+    assert.equal(named('/countries/japan/'), true);
+    assert.equal(named('/countries'), false);
+  });
+
+  it('models a literal source as exact, with no optional trailing slash', () => {
+    assert.equal(sourceToRegExp('/countries').test('/countries'), true);
+    assert.equal(sourceToRegExp('/countries').test('/countries/'), false);
+    assert.equal(sourceToRegExp('/offline.html').test('/offline.html'), true);
+  });
+});
 
 describe('crawlable content corpus deployment contracts', () => {
   const staticCorpusPaths = [
@@ -421,7 +555,7 @@ describe('crawlable content corpus deployment contracts', () => {
       );
       assert.ok(
         script.indexOf('npm run build:sitemap') < script.indexOf('vite build'),
-        scriptName + ' must update public/sitemap.xml before Vite copies public/ into dist/'
+        scriptName + ' must update the public sitemap index and urlset before Vite copies public/ into dist/'
       );
       // public/pro/ is a BUILD PRODUCT, not committed bytes (#6898). Vercel's
       // build command is `npm run build:full`, so if that chain stops running
@@ -458,7 +592,7 @@ describe('crawlable content corpus deployment contracts', () => {
       );
       assert.ok(
         source.indexOf('npm run build:sitemap') < source.indexOf('npx vite build'),
-        name + ' must update public/sitemap.xml before Vite copies public/ into dist/'
+        name + ' must update the public sitemap index and urlset before Vite copies public/ into dist/'
       );
       // Unlike /blog (deliberately skipped in the images), docker/nginx.conf.template
       // routes `location ^~ /pro` and `/pro/assets/`, so a self-hosted image that
@@ -475,10 +609,21 @@ describe('crawlable content corpus deployment contracts', () => {
         source.indexOf('node scripts/generate-inventory-facts.mjs') < source.indexOf('npx vite build'),
         name + ' must generate ignored inventory assets in a clean build context before Vite runs',
       );
+      // generate-inventory-facts and build-handlers write untracked .js into
+      // SOURCE_ROOTS. The corpus step runs the attribution drift gate against
+      // those same roots, so it must see the pristine tree (#7435).
+      assert.ok(
+        source.indexOf('npm run build:crawlable-corpus') < source.indexOf('node scripts/generate-inventory-facts.mjs'),
+        name + ' must run the attribution gate before inventory-facts writes untracked JS into api/',
+      );
     }
     assert.ok(
       dockerfileSource.indexOf('node scripts/generate-inventory-facts.mjs') < dockerfileSource.indexOf('node docker/build-handlers.mjs'),
       'the self-host image must generate the Edge inventory module before handler bundling',
+    );
+    assert.ok(
+      dockerfileSource.indexOf('npm run build:crawlable-corpus') < dockerfileSource.indexOf('node docker/build-handlers.mjs'),
+      'the self-host image must run the attribution gate before build-handlers writes compiled .js into api/',
     );
     assert.match(frontendDockerfileSource, /RUN test -s dist\/product-facts\.json/);
     assert.ok(!packageJson.scripts['build:full'].includes('npm run build:blog &&'), 'build:full must not regenerate inventory facts inside build:blog');
@@ -489,7 +634,11 @@ describe('crawlable content corpus deployment contracts', () => {
     assert.ok(vercelIgnoreSource.includes("'docs/snapshots/'"));
     for (const path of [
       'docs/docs.json',
+      'scripts/build-comparison-pages.mjs',
+      'scripts/comparison-page-narratives.mjs',
+      'scripts/unranked-country-inventory.mjs',
       'scripts/build-use-cases.mjs',
+      'scripts/build-accuracy-page.mjs',
       'scripts/crawlable-sources-page.mjs',
       'scripts/source-origin.mjs',
       'scripts/source-origin.d.mts',
@@ -519,7 +668,11 @@ describe('crawlable content corpus deployment contracts', () => {
 
       for (const path of [
         'docs/docs.json',
+        'scripts/build-comparison-pages.mjs',
+      'scripts/comparison-page-narratives.mjs',
+        'scripts/unranked-country-inventory.mjs',
         'scripts/build-use-cases.mjs',
+        'scripts/build-accuracy-page.mjs',
         'scripts/crawlable-sources-page.mjs',
         'scripts/source-origin.mjs',
         'scripts/source-origin.d.mts',
@@ -575,6 +728,19 @@ describe('crawlable content corpus deployment contracts', () => {
     }
   });
 
+  it('marks stock workspaces and their markdown twins noindex without breaking deep links (#7905)', () => {
+    for (const path of ['/stocks', '/stocks/', '/stocks.md', '/stocks/AAPL', '/stocks/ZZZZFAKE',
+      '/stocks/aapl/', '/stocks/BRK.B', '/stocks/7203.T', '/stocks/AAPL.md', '/stocks/ZZZZFAKE.md']) {
+      assert.equal(effectiveHeader(path, 'X-Robots-Tag'), 'noindex, follow', path);
+    }
+    for (const path of ['/dashboard', '/stocksmith', '/countries/united-states']) {
+      assert.equal(effectiveHeader(path, 'X-Robots-Tag'), null, path);
+    }
+    for (const symbol of ['AAPL', 'ZZZZFAKE', 'BRK.B', '7203.T']) {
+      assert.equal(firstRewriteFor({ host: 'www.worldmonitor.app', path: `/stocks/${symbol}` })?.destination, DASHBOARD_HTML_DESTINATION);
+    }
+  });
+
   it('serves no SPA fallback for generated corpus paths while keeping real client deep links', () => {
     // #6575: unknown paths must fall through to the filesystem (404), so the
     // only dashboard-serving rewrites left are the explicit client History
@@ -610,8 +776,157 @@ describe('crawlable content corpus deployment contracts', () => {
     for (const prefix of CONTENT_CORPUS_PREFIXES) {
       const expected = 'public, max-age=3600, must-revalidate';
       assert.equal(getCacheHeaderValue('/' + prefix), expected, '/' + prefix + ' must have a cache policy');
-      assert.equal(getCacheHeaderValue('/' + prefix + '/:path*'), expected, '/' + prefix + '/:path* must have a cache policy');
+      assert.equal(getCacheHeaderValue('/' + prefix + '/(.*)'), expected, '/' + prefix + '/(.*) must have a cache policy');
+      // Both canonical forms. The corpus canonicalises to a trailing slash, so
+      // the second is the only one crawlers ever request (#7530).
+      assert.equal(effectiveCacheControl('/' + prefix + '/example'), expected, '/' + prefix + '/example must not inherit SPA HTML cache headers');
       assert.equal(effectiveCacheControl('/' + prefix + '/example/'), expected, '/' + prefix + '/example/ must not inherit SPA HTML cache headers');
+      assert.equal(effectiveCacheControl('/' + prefix + '/'), expected, '/' + prefix + '/ must not inherit SPA HTML cache headers');
+    }
+  });
+
+  // A `:path*` source cannot match a trailing-slash URL under Vercel's strict
+  // path-to-regexp compilation, so no corpus source may use one: that is the
+  // exact shape that left every corpus cache rule inert in production while
+  // this suite stayed green (#7530). Production evidence at the time:
+  // `/countries/japan/` and `/chokepoints/` both served Vercel's static default
+  // `public, max-age=0, must-revalidate`, never the configured max-age=3600,
+  // while `/assets/(.*)` — a raw regex group — applied correctly.
+  // Scoped to CONTENT_CORPUS_PREFIXES on its first pass, this could not see the
+  // same shape surviving on /pro and /docs — `/pro/` was measured in production
+  // serving 200 with `public, max-age=0, must-revalidate` where the rule intends
+  // `private, no-cache` on an authenticated surface. Sweep EVERY header rule
+  // instead, with an explicit allowlist for the sources where the shape is
+  // correct because those URLs never carry a trailing slash.
+  it('never guards a route with a trailing-slash-blind :param* header source', () => {
+    // Mintlify serves /docs/<page> with no trailing slash, so its proxy rewrite
+    // is the one place the shape is right. It is a rewrite, not a header rule,
+    // and is asserted separately — nothing here should need an exemption.
+    const EXEMPT = new Set();
+    const blind = vercelConfig.headers
+      .map((entry) => entry.source)
+      .filter((source) => /:[A-Za-z0-9_]+\*/.test(source) && !EXEMPT.has(source));
+    assert.deepEqual(
+      blind,
+      [],
+      'these header sources use a :param* catch-all, which Vercel compiles in strict mode'
+        + ' and which therefore never matches the trailing-slash form of the URL',
+    );
+
+    // Positive control: the sweep must actually be looking at rules.
+    assert.ok(vercelConfig.headers.length > 50, 'expected the header rule set to be non-trivial');
+    assert.ok(
+      CONTENT_CORPUS_PREFIXES.every((prefix) => vercelConfig.headers.some(
+        (entry) => entry.source === `/${prefix}` || entry.source.startsWith(`/${prefix}/`),
+      )),
+      'every corpus family must still have its own header rule',
+    );
+  });
+
+  it('applies the /pro and /docs header rules to their trailing-slash forms', () => {
+    assert.equal(
+      effectiveCacheControl('/pro/'),
+      'private, no-cache, must-revalidate',
+      '/pro/ is an authenticated surface; a shared cache must not be allowed to store it',
+    );
+    assert.equal(effectiveCacheControl('/pro/welcome/'), 'private, no-cache, must-revalidate');
+    assert.equal(effectiveHeader('/docs/', 'X-Content-Type-Options'), 'nosniff');
+    assert.equal(effectiveHeader('/docs/zh/about/', 'X-Content-Type-Options'), 'nosniff');
+  });
+
+  it('advertises the edge cache and the RFC 8288 service linkset on every corpus route', () => {
+    const linkset = effectiveHeader('/', 'Link');
+    assert.match(linkset, /rel="api-catalog"/, 'the homepage linkset is the reference value');
+    for (const prefix of CONTENT_CORPUS_PREFIXES) {
+      for (const route of [`/${prefix}`, `/${prefix}/`, `/${prefix}/example/`]) {
+        assert.equal(
+          effectiveHeader(route, 'CDN-Cache-Control'),
+          HTML_ENTRY_EDGE_CACHE,
+          // Necessary but not sufficient — and this suite has now been the green
+          // half of that pair twice in two days, one layer apart:
+          //   #7590 (2026-09-03): the `:param*` source never matched the corpus's
+          //     trailing-slash URLs, so all ~22 rules were inert at Vercel while
+          //     the model here matched both forms and stayed green.
+          //   #7659 (2026-09-04): the header was finally reaching production and
+          //     Cloudflare still answered DYNAMIC, because a zone cache rule had
+          //     already declared the response ineligible — origin headers get no
+          //     vote once that happens.
+          // The lesson both times: no assertion over vercel.json can see whether a
+          // layer downstream honoured it. The live counterpart is the corpus probe
+          // in tests/live-api-cache-auth-regression.test.mjs, and the rule itself is
+          // scripts/cloudflare-cache-rule.mjs (tests/cloudflare-cache-rule.test.mjs).
+          `${route} must advertise the 600s Cloudflare TTL; without it the zone cache rule has no TTL to honour`,
+        );
+        assert.equal(
+          effectiveHeader(route, 'Vercel-CDN-Cache-Control'),
+          HTML_ENTRY_EDGE_CACHE,
+          `${route} must advertise the 600s Vercel TTL`,
+        );
+        assert.equal(
+          effectiveHeader(route, 'Link'),
+          linkset,
+          `${route} must carry the same service linkset as the homepage`,
+        );
+      }
+    }
+  });
+
+  it('advertises the edge cache on the blog, the proxied docs and the root agent text files (#7747)', () => {
+    // The vercel.json half of the pair. The Cloudflare half is
+    // scripts/cloudflare-cache-rule.mjs, and tests/cloudflare-cache-rule.test.mjs
+    // fails when the two halves cover different surfaces.
+    for (const route of ['/blog', '/blog/', '/blog/glossary/ais/', '/blog/rss.xml', '/blog/llms.txt', '/blog/sitemap-index.xml']) {
+      assert.equal(effectiveHeader(route, 'CDN-Cache-Control'), HTML_ENTRY_EDGE_CACHE, `${route} must advertise the 600s Cloudflare TTL`);
+      assert.equal(effectiveHeader(route, 'Vercel-CDN-Cache-Control'), HTML_ENTRY_EDGE_CACHE, `${route} must advertise the 600s Vercel TTL`);
+    }
+    // Blog assets keep their own policies: immutable hashed bundles, and the
+    // zone's month-long "Blog" rule for OG and post images. A shared 600s TTL
+    // would shorten Vercel's cache of the bundles and make the document rule the
+    // last writer of edge_ttl for the images.
+    for (const route of ['/blog/_astro/index.abc123.js', '/blog/og/post.png', '/blog/images/post.png']) {
+      assert.equal(effectiveHeader(route, 'CDN-Cache-Control'), null, `${route} must not inherit the document TTL`);
+      assert.equal(effectiveHeader(route, 'Vercel-CDN-Cache-Control'), null, `${route} must not inherit the document TTL`);
+    }
+    assert.equal(effectiveCacheControl('/blog/_astro/index.abc123.js'), 'public, max-age=31536000, immutable');
+
+    // /docs is a proxy to Mintlify, which negotiates markdown on Accept without
+    // a matching Vary and serves RSC flights at the document URL. Cloudflare gets
+    // the TTL and keys the negotiating requests out in the zone rule; Vercel's
+    // own cache must not store these at all, because it would key HTML and
+    // markdown under one URL. Vercel strips Vercel-CDN-Cache-Control before the
+    // response leaves, so the browser never sees the no-store.
+    for (const route of ['/docs/documentation', '/docs/mcp-overview', '/docs/zh/about/', '/docs/documentation.md', '/docs/sitemap.xml']) {
+      assert.equal(effectiveHeader(route, 'CDN-Cache-Control'), HTML_ENTRY_EDGE_CACHE, `${route} must advertise the 600s Cloudflare TTL`);
+      assert.equal(effectiveHeader(route, 'Vercel-CDN-Cache-Control'), 'no-store', `${route} must keep Vercel's cache out of the Mintlify proxy`);
+      assert.equal(effectiveHeader(route, 'X-Content-Type-Options'), 'nosniff', `${route} must still carry the docs security headers`);
+    }
+    for (const route of ['/docs/mcp', '/docs/mcp/', '/docs/mcp/session', '/docs/_next/static/chunks/a.js', '/docs/_mintlify/favicons/a.png']) {
+      assert.equal(effectiveHeader(route, 'CDN-Cache-Control'), null, `${route} is not a document and must not advertise the TTL`);
+      assert.equal(effectiveHeader(route, 'Vercel-CDN-Cache-Control'), null, `${route} is not a document and must not carry a Vercel cache policy`);
+    }
+
+    // The sitemaps joined AGENT_TEXT_FILES in #7869 and keep the stricter
+    // browser policy they have always had — the crawler that re-fetches a
+    // sitemap wants a revalidation, and the shared edge TTL is unaffected.
+    const SITEMAPS = new Set(['sitemap.xml', 'sitemap-main.xml']);
+    for (const file of AGENT_TEXT_FILES) {
+      const route = `/${file}`;
+      assert.equal(effectiveHeader(route, 'CDN-Cache-Control'), HTML_ENTRY_EDGE_CACHE, `${route} must advertise the 600s Cloudflare TTL`);
+      assert.equal(effectiveHeader(route, 'Vercel-CDN-Cache-Control'), HTML_ENTRY_EDGE_CACHE, `${route} must advertise the 600s Vercel TTL`);
+      assert.equal(
+        effectiveCacheControl(route),
+        SITEMAPS.has(file) ? 'public, max-age=3600, must-revalidate' : 'public, max-age=3600',
+        `${route} must keep its browser policy`,
+      );
+      assert.ok(existsSync(resolve(__dirname, '../public', file)), `${route} must be a static file in public/`);
+    }
+    // /index.md reaches the origin under its own name and is rewritten to
+    // /home.md there; robots.txt is left to the zone bypass on purpose (it is
+    // re-fetched rarely and cheap to serve); the nested llms.txt twins are not
+    // root files. /schemamap.xml is not in the sitemap index and no crawler is
+    // pointed at it.
+    for (const route of ['/index.md', '/robots.txt', '/schemamap.xml', '/api/download.md', '/developers/llms.txt']) {
+      assert.equal(effectiveHeader(route, 'CDN-Cache-Control'), null, `${route} must not advertise the document TTL`);
     }
   });
 
@@ -619,6 +934,20 @@ describe('crawlable content corpus deployment contracts', () => {
     assert.match(robotsSource, /^Sitemap: https:\/\/www\.worldmonitor\.app\/sitemap\.xml$/m);
     assert.match(robotsSource, /^Sitemap: https:\/\/www\.worldmonitor\.app\/blog\/sitemap-index\.xml$/m);
     assert.match(robotsSource, /^Sitemap: https:\/\/www\.worldmonitor\.app\/docs\/sitemap\.xml$/m);
+  });
+
+  // #7749 gave the sitemaps the Vercel half of the pair and deliberately left
+  // the Cloudflare bypass alone. Round 7 then measured both still DYNAMIC under
+  // a GET while every other corpus route hit, which is what the half-pair
+  // predicts: the bypass rule names /sitemap.xml and .xml is outside
+  // Cloudflare's default-cacheable extensions. #7869 completes the pair — the
+  // claim lives in scripts/cloudflare-cache-rule.mjs (AGENT_TEXT_FILES).
+  it('caches root sitemaps at both shared caches (#7869, supersedes #7749)', () => {
+    for (const route of ['/sitemap.xml', '/sitemap-main.xml']) {
+      assert.equal(effectiveCacheControl(route), 'public, max-age=3600, must-revalidate');
+      assert.equal(effectiveHeader(route, 'Vercel-CDN-Cache-Control'), HTML_ENTRY_EDGE_CACHE);
+      assert.equal(effectiveHeader(route, 'CDN-Cache-Control'), HTML_ENTRY_EDGE_CACHE);
+    }
   });
 
   it('keeps the root sitemap generated while delegating blog and docs inventories', () => {
@@ -655,34 +984,61 @@ describe('crawlable content corpus deployment contracts', () => {
       );
       writeFixturePage(
         publicDir,
-        'reference/changelog/page/1/index.html',
-        '<link rel="canonical" href="https://www.worldmonitor.app/reference/changelog/page/1/" /><link rel="next" href="https://www.worldmonitor.app/reference/changelog/page/2/" />'
+        'reference/changelog/index.html',
+        '<meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1" /><link rel="canonical" href="https://www.worldmonitor.app/reference/changelog/" /><link rel="next" href="https://www.worldmonitor.app/reference/changelog/page/2/" />'
       );
       writeFixturePage(
         publicDir,
         'reference/changelog/page/2/index.html',
-        '<link rel="canonical" href="https://www.worldmonitor.app/reference/changelog/page/2/" /><link rel="prev" href="https://www.worldmonitor.app/reference/changelog/page/1/" />'
+        '<meta name="robots" content="noindex, follow" /><link rel="canonical" href="https://www.worldmonitor.app/reference/changelog/page/2/" /><link rel="prev" href="https://www.worldmonitor.app/reference/changelog/" />'
       );
 
       const pages = discoverContentCorpusPages({ publicDir });
       const locations = pages.map((page) => page.loc).sort();
       assert.deepEqual(locations, [
-        'https://www.worldmonitor.app/reference/changelog/page/1/',
-        'https://www.worldmonitor.app/reference/changelog/page/2/',
+        'https://www.worldmonitor.app/reference/changelog/',
         'https://www.worldmonitor.app/chokepoints/suez-canal/',
         'https://www.worldmonitor.app/crises/ukraine-war/',
         'https://www.worldmonitor.app/countries/ukraine/',
         'https://www.worldmonitor.app/tools/natural-hazard-pulse/',
       ].sort());
+      assert.ok(
+        !locations.some((loc) => loc.includes('/changelog/page/')),
+        'paginated changelog URLs must be omitted from the sitemap inventory',
+      );
 
       writeFixturePage(
         publicDir,
         'reference/changelog/page/3/index.html',
-        '<link rel="canonical" href="https://www.worldmonitor.app/reference/changelog/page/3/" />'
+        '<meta name="robots" content="noindex, follow" /><link rel="canonical" href="https://www.worldmonitor.app/reference/changelog/page/3/" />'
       );
       assert.throws(
         () => discoverContentCorpusPages({ publicDir }),
         /missing rel="(?:prev|next)" pagination link/
+      );
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects noindex changelog pagination whose canonical path does not match the file', () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'wm-content-corpus-'));
+    const publicDir = join(tempRoot, 'public');
+    try {
+      writeFixturePage(
+        publicDir,
+        'reference/changelog/index.html',
+        '<meta name="robots" content="index, follow" /><link rel="canonical" href="https://www.worldmonitor.app/reference/changelog/" /><link rel="next" href="https://www.worldmonitor.app/reference/changelog/page/2/" />'
+      );
+      writeFixturePage(
+        publicDir,
+        'reference/changelog/page/2/index.html',
+        '<meta name="robots" content="noindex, follow" /><link rel="canonical" href="https://www.worldmonitor.app/reference/changelog/page/3/" /><link rel="prev" href="https://www.worldmonitor.app/reference/changelog/" />'
+      );
+
+      assert.throws(
+        () => discoverContentCorpusPages({ publicDir }),
+        /canonical \/reference\/changelog\/page\/3\/ does not match raw static path \/reference\/changelog\/page\/2\//
       );
     } finally {
       rmSync(tempRoot, { recursive: true, force: true });
@@ -701,16 +1057,17 @@ describe('deploy/cache configuration guardrails', () => {
     // path-to-regexp source-pattern parser rejects `(?:...)` in `source` fields
     // (deploy-fail PR #3646 round-2 review).
     //
-    // The header uses `private, no-cache, must-revalidate` rather than the
-    // previous `no-cache, no-store, must-revalidate` (PR #4004 / issue #3993).
-    // `no-store` fully disabled Chrome's bfcache (Lighthouse flagged 7 failure
-    // reasons rooted in this header). `no-cache` without `no-store` still
-    // revalidates on every navigation but lets bfcache restore on back/forward.
-    // `private` keeps shared caches (CDN, corporate proxies) from holding
-    // personalized HTML.
+    // Stacked-CDN HTML entries keep browser `Cache-Control` at max-age=0
+    // (must-revalidate, never no-store — #3993/#4004) and put the 600s TTL on
+    // CDN-Cache-Control + Vercel-CDN-Cache-Control. A combined Cache-Control
+    // value lets Vercel consume s-maxage and forward max-age=0 to Cloudflare,
+    // which then refuses to cache HTML.
     const spaNoCache = getCacheHeaderValue(SPA_HTML_CACHE_SOURCE);
     assert.equal(spaNoCache, 'private, no-cache, must-revalidate');
     assert.ok(!spaNoCache.includes('no-store'), 'HTML must not set no-store — it disables bfcache');
+    for (const route of ['/', '/dashboard', '/dashboard.html']) {
+      assertPublicHtmlEntryCache(route);
+    }
   });
 
   it('disables caching for the apex /mcp-grant Pro-MCP consent page (both URL forms)', () => {
@@ -765,6 +1122,15 @@ describe('deploy/cache configuration guardrails', () => {
     );
     assert.doesNotMatch(viteConfigSource, /globPatterns:\s*\['\*\*\/\*\.\{js,css,html/);
   });
+
+  it('emits public sourcemaps for preview attribution while production stays opt-in (#7382)', () => {
+    assert.match(
+      viteConfigSource,
+      /const emitPublicSourceMaps = process\.env\.WM_EMIT_SOURCEMAPS === '1'[\s\S]*\|\| process\.env\.VERCEL_ENV === 'preview'/,
+    );
+    assert.match(viteConfigSource, /sourcemap:\s*emitPublicSourceMaps/);
+  });
+
 
   it('keeps off-page public assets out of the PWA precache', () => {
     const assertGlobIgnore = (pattern) => {
@@ -901,7 +1267,7 @@ describe('welcome landing page routing', () => {
   // #4825: public/index.md became Vercel's DIRECTORY INDEX for `/` — filesystem
   // resolution beats the `/` → /pro/welcome.html rewrite, so the apex homepage
   // served raw text/markdown to browsers. No `index.*` file may exist in public/;
-  // the markdown homepage twin lives at public/home.md and keeps its scored URL
+  // the markdown homepage twin is built at public/pro/home.md and keeps its scored URL
   // through the /index.md rewrite below.
   it('keeps public/ free of index.* files so filesystem resolution cannot hijack the / rewrite', () => {
     const publicDir = resolve(__dirname, '../public');
@@ -909,11 +1275,13 @@ describe('welcome landing page routing', () => {
     assert.deepEqual(offenders, [], `public/${offenders[0] ?? ''} would shadow the / welcome rewrite as a directory index`);
   });
 
-  it('serves the markdown homepage twin at /index.md via rewrite to the non-index home.md', () => {
-    assert.ok(existsSync(resolve(__dirname, '../public/home.md')), 'expected public/home.md (markdown homepage twin)');
+  it('serves the complete built markdown homepage at /index.md', () => {
+    if (!shouldSkipProBuiltOutput()) {
+      assert.ok(existsSync(resolve(__dirname, '../public/pro/home.md')), 'expected built public/pro/home.md');
+    }
     const rewrite = vercelConfig.rewrites.find((r) => r.source === '/index.md');
     assert.ok(rewrite, 'expected a rewrite for /index.md');
-    assert.equal(rewrite.destination, '/home.md');
+    assert.equal(rewrite.destination, '/pro/home.md');
     // #6575: the SPA catch-all this ordering guarded is gone; /index.md only
     // needs its own explicit rewrite to win over filesystem resolution.
     assert.equal(vercelConfig.rewrites.filter((r) => r.source === '/index.md').length, 1);
@@ -933,6 +1301,27 @@ describe('welcome landing page routing', () => {
     }
   });
 
+  it('opens deployment and branch preview roots through the dashboard route', () => {
+    for (const host of [
+      'worldmonitor-h0zk88n4l-eliewm.vercel.app',
+      'worldmonitor-git-perf-defer-dashboard-app-eliewm.vercel.app',
+    ]) {
+      const redirect = firstRedirectFor({ host, path: '/' });
+      assert.equal(redirect?.destination, '/dashboard');
+      assert.equal(redirect.permanent, false);
+      assert.equal(firstRewriteFor({ host, path: redirect.destination })?.destination, DASHBOARD_HTML_DESTINATION);
+      assert.equal(firstRedirectFor({ host, path: '/', query: { mode: 'agent' } }), null);
+      assert.equal(firstRewriteFor({ host, path: '/', query: { mode: 'agent' } })?.destination, '/agent-view.json');
+    }
+  });
+
+  it('keeps preview root routing off production homepages, unknown pages, and lookalike hosts', () => {
+    for (const host of ['worldmonitor.app', 'www.worldmonitor.app', 'example.com', 'preview.vercel.app.evil.example']) {
+      assert.equal(firstRedirectFor({ host, path: '/' }), null);
+    }
+    assert.equal(firstRedirectFor({ host: 'preview.vercel.app', path: '/missing-page' }), null);
+  });
+
   it('keeps variant canonicals aligned with the /dashboard routing strategy', () => {
     const variantUrls = getVariantUrls();
     assert.equal(variantUrls.full, 'https://www.worldmonitor.app/dashboard');
@@ -948,52 +1337,10 @@ describe('welcome landing page routing', () => {
     }
   });
 
-  it('keeps variant crawler-stub canonicals aligned with variant metadata', () => {
-    const variantUrls = getVariantUrls();
-    const nonFullUrls = Object.entries(variantUrls).filter(([variant]) => variant !== 'full');
-
-    for (const [variant, url] of nonFullUrls) {
-      assert.match(
-        middlewareSource,
-        new RegExp(`\\b${variant}:\\s*\\{[\\s\\S]*?url:\\s*'${escapeRegExp(url)}'`),
-        `${variant} crawler-stub OG/canonical URL must match variant-meta.ts`
-      );
-    }
-
-    assert.ok(
-      middlewareSource.includes(`href="${variantUrls.full}"`),
-      'AI crawler body must link the full dashboard canonical',
-    );
-    assert.match(
-      middlewareSource,
-      /const AI_CRAWLER_VARIANT_LINKS = Object\.values\(VARIANT_HOST_MAP\)/,
-      'AI crawler body links must be derived from the canonical variant host map',
-    );
-    assert.match(
-      middlewareSource,
-      /const og = VARIANT_OG\[variant\]/,
-      'AI crawler body link labels and URLs must come from variant metadata',
-    );
-    assert.match(
-      middlewareSource,
-      /escHtml\(og\.url\)/,
-      'AI crawler body link URLs must stay HTML-escaped',
-    );
-    assert.match(
-      middlewareSource,
-      /escHtml\(og\.name\)/,
-      'AI crawler body link labels must stay HTML-escaped',
-    );
-    assert.ok(
-      middlewareSource.includes('${AI_CRAWLER_VARIANT_LINKS}'),
-      'AI crawler body must render the generated variant links',
-    );
-  });
-
   it('redirects legacy root map-state deep links to /dashboard before welcome routing', () => {
     assert.match(
       middlewareSource,
-      /LEGACY_DASHBOARD_ROOT_QUERY_KEYS = \['lat', 'lon', 'zoom', 'view', 'timeRange', 'layers'\]/,
+      /LEGACY_DASHBOARD_ROOT_QUERY_KEYS = \['lat', 'lon', 'zoom', 'view', 'timeRange', 'layers', 'c', 'country', 'chokepoint'\]/,
       'middleware must list dashboard URL-state params that bypass the root welcome page',
     );
     assert.match(
@@ -1006,10 +1353,25 @@ describe('welcome landing page routing', () => {
       /dashboardUrl\.pathname = '\/dashboard'/,
       'middleware must move legacy dashboard-state root links to /dashboard',
     );
+    // Hand-built rather than Response.redirect() so the response can carry
+    // Vary (#7660). The same URL now yields two different Locations depending
+    // on the User-Agent, and a 308 is cacheable by default (RFC 9110
+    // §15.4.9) — an unkeyed cache would replay one branch's Location to the
+    // other's client.
     assert.match(
       middlewareSource,
+      /headers: uaConditionedRedirectHeaders\(dashboardUrl\)/,
+      'the legacy root redirect must preserve the query string AND declare the User-Agent cache key',
+    );
+    assert.match(
+      middlewareSource,
+      /'CDN-Cache-Control': 'no-store',\n\s*'Vercel-CDN-Cache-Control': 'no-store',/,
+      'Cache-Control alone loses to the CDN directives on the / route',
+    );
+    assert.doesNotMatch(
+      middlewareSource,
       /Response\.redirect\(dashboardUrl\.toString\(\), 308\)/,
-      'middleware must redirect, preserving the original query string',
+      'Response.redirect() cannot set Vary, so it cannot be used for a UA-conditioned redirect',
     );
   });
 
@@ -1109,21 +1471,24 @@ describe('welcome landing page routing', () => {
   });
 
   it('requires revalidation for /dashboard HTML without disabling bfcache', () => {
-    const dashboardCache = getCacheHeaderValue('/dashboard');
-    assert.equal(dashboardCache, 'private, no-cache, must-revalidate');
-    assert.ok(!dashboardCache.includes('no-store'), 'HTML must not set no-store — it disables bfcache');
+    assertPublicHtmlEntryCache('/dashboard');
   });
 
   it('requires revalidation for root welcome HTML without disabling bfcache', () => {
-    const welcomeCache = getCacheHeaderValue('/');
-    assert.equal(welcomeCache, 'private, no-cache, must-revalidate');
-    assert.ok(!welcomeCache.includes('no-store'), 'HTML must not set no-store — it disables bfcache');
+    assertPublicHtmlEntryCache('/');
   });
 
   it('requires revalidation for direct dashboard.html without disabling bfcache', () => {
-    const dashboardCache = getCacheHeaderValue('/dashboard.html');
-    assert.equal(dashboardCache, 'private, no-cache, must-revalidate');
-    assert.ok(!dashboardCache.includes('no-store'), 'HTML must not set no-store — it disables bfcache');
+    assertPublicHtmlEntryCache('/dashboard.html');
+  });
+
+  it('redirects bare /api to the docs API reference hub (#7382)', () => {
+    for (const source of ['/api', '/api/']) {
+      const apiRedirect = vercelConfig.redirects.find((r) => r.source === source);
+      assert.ok(apiRedirect, `expected a redirect for ${source}`);
+      assert.equal(apiRedirect.destination, '/docs/api-reference');
+      assert.equal(apiRedirect.permanent, false);
+    }
   });
 
   it('starts installed PWAs on /dashboard, not the public welcome page', () => {
@@ -1131,20 +1496,20 @@ describe('welcome landing page routing', () => {
   });
 
   it('sitemap lists dashboard routes and does not list legacy /welcome', () => {
-    const sitemap = readFileSync(resolve(__dirname, '../public/sitemap.xml'), 'utf-8');
+    const sitemap = readFileSync(resolve(__dirname, '../public/sitemap-main.xml'), 'utf-8');
     assert.ok(
       sitemap.includes('<loc>https://www.worldmonitor.app/dashboard</loc>'),
-      'public/sitemap.xml must list https://www.worldmonitor.app/dashboard'
+      'public/sitemap-main.xml must list https://www.worldmonitor.app/dashboard'
     );
     for (const host of ['tech', 'finance', 'commodity', 'happy', 'energy']) {
       assert.ok(
         sitemap.includes(`<loc>https://${host}.worldmonitor.app/dashboard</loc>`),
-        `public/sitemap.xml must list https://${host}.worldmonitor.app/dashboard`
+        `public/sitemap-main.xml must list https://${host}.worldmonitor.app/dashboard`
       );
     }
     assert.ok(
       !sitemap.includes('<loc>https://www.worldmonitor.app/welcome</loc>'),
-      'public/sitemap.xml must not list legacy https://www.worldmonitor.app/welcome'
+      'public/sitemap-main.xml must not list legacy https://www.worldmonitor.app/welcome'
     );
   });
 
@@ -1327,7 +1692,11 @@ describe('welcome landing page routing', () => {
     // when the rule it exists to protect is deleted outright.
     for (const required of [
       'main a[data-umami-event-target="welcome-hero"]',
-      'main a[href*="moments"]',
+      // Exact, not `[href*="moments"]`: since #7608 `main` also carries headline
+      // anchors whose href is a third-party article URL, and a substring match
+      // would paint any story slug containing "moments" as a hero CTA until the
+      // deferred stylesheet lands.
+      'main a[href="#moments"]',
       'nav[data-wm-nav] a[aria-label*="Launch"]',
     ]) {
       assert.ok(scanned.has(required), `critical CSS must still style the welcome CTA via ${required}`);
@@ -1847,7 +2216,7 @@ describe('security header guardrails', () => {
     const script = packageJson.scripts?.['test:e2e:webmcp'] ?? '';
     const productionScript = packageJson.scripts?.['test:e2e:webmcp:production'] ?? '';
     const variantSmokeJob = testWorkflowSource.match(
-      /\n  variant-smoke-full:\n[\s\S]*?(?=\n  [a-z][a-z0-9-]+:\n|$)/,
+      /\n {2}variant-smoke-pro-webmcp:\n[\s\S]*?(?=\n {2}[a-z][a-z0-9-]+:\n|$)/,
     )?.[0] ?? '';
     assert.match(script, /WM_REQUIRE_WEBMCP=1/);
     assert.match(script, /e2e\/webmcp\.spec\.ts/);
@@ -1874,11 +2243,35 @@ describe('security header guardrails', () => {
     assert.match(webMcpE2eSource, /document\.modelContext/);
     assert.match(webMcpE2eSource, /\.getTools\(\)/);
     assert.match(webMcpE2eSource, /provider\.executeTool/);
-    assert.match(webMcpE2eSource, /new AbortController\(\)/);
-    assert.match(webMcpE2eSource, /page\.on\('pageerror'/);
-    assert.match(webMcpE2eSource, /window\.addEventListener\('unhandledrejection'/);
-    assert.match(webMcpE2eSource, /lateLeakWindowMs/);
+    assert.match(webMcpCancellationE2eSource, /new AbortController\(\)/);
+    assert.match(webMcpCancellationE2eSource, /page\.on\('pageerror'/);
+    assert.match(webMcpCancellationE2eSource, /window\.addEventListener\('unhandledrejection'/);
+    assert.match(webMcpCancellationE2eSource, /lateLeakWindowMs/);
     assert.match(webMcpE2eSource, /headers\['origin-trial'\]/);
+    assert.match(
+      webMcpE2eSource,
+      /const unconfiguredLocalFixture =\s*!productionSmoke && accessSnapshot\.clerk === 'unavailable'/,
+      'clerk_unavailable is only valid on the local unconfigured Clerk fixture',
+    );
+    assert.match(
+      webMcpE2eSource,
+      /production smoke must open the real Clerk sign-in modal/,
+      'production WebMCP smoke must require the real Clerk modal',
+    );
+    assert.match(
+      webMcpE2eSource,
+      /signIn: \{ tool: 'open_sign_in'/,
+      'production smoke must attach open_sign_in modal evidence',
+    );
+    assert.match(webMcpE2eSource, /testInfo\.outputPath\(name\)/);
+    assert.match(webMcpE2eSource, /writeFile\(path/);
+    assert.match(webMcpE2eSource, /testInfo\.attach\(name, \{ path/);
+    assert.match(webMcpE2eSource, /webmcp-production-matrix\.json/);
+    assert.match(webMcpE2eSource, /build-hash\.txt/);
+    assert.match(webMcpE2eSource, /expect\(servedSha,[\s\S]*?\.toBe\(expectedDeployedSha\)/);
+    assert.match(webMcpE2eSource, /https:\/\/tech\.worldmonitor\.app\/embed/);
+    assert.match(webMcpE2eSource, /redirectHeaders\['origin-trial'\]/);
+    assert.match(playwrightConfigSource, /preserveOutput:\s*'always'/);
     assert.match(embedE2eSource, /WEBMCP_MIN_CHROME_MAJOR = 149/);
     assert.match(embedE2eSource, /WM_REQUIRE_WEBMCP requires Chrome/);
   });
@@ -1927,36 +2320,41 @@ describe('security header guardrails', () => {
     }
   });
 
-  it('enrolls only eligible production pages with exact-origin WebMCP trial tokens', () => {
+  it('enrolls only eligible production documents with exact-origin WebMCP trial tokens', () => {
     const rules = vercelConfig.headers.filter((entry) =>
       entry.headers?.some((header) => header.key.toLowerCase() === 'origin-trial')
     );
-    assert.equal(rules.length, WEBMCP_PRODUCTION_HOSTS.length * 3);
+    assert.equal(rules.length, 3 + (WEBMCP_PRODUCTION_HOSTS.length - 1) * 2);
 
     for (const host of WEBMCP_PRODUCTION_HOSTS) {
       const hostPattern = '^' + host.replaceAll('.', '\\.') + '$';
       const hostRules = rules.filter((rule) =>
         rule.has?.some((condition) => condition.type === 'host' && condition.value === hostPattern)
       );
+      const expectedSources = host === 'www.worldmonitor.app'
+        ? ['/', '/dashboard', '/dashboard.html']
+        : ['/dashboard', '/dashboard.html'];
       assert.deepEqual(
         hostRules.map((rule) => rule.source).sort(),
-        ['/', '/dashboard', '/dashboard.html'],
-        host + ' must enroll the homepage, canonical dashboard, and direct dashboard document',
+        expectedSources,
+        host + ' must enroll only documents that directly return WebMCP HTML',
       );
-      const rootRule = hostRules.find((rule) => rule.source === '/');
-      assert.ok(rootRule, host + ' must define a homepage origin-trial rule');
-      assert.deepEqual(
-        rootRule.missing,
-        [{ type: 'query', key: 'mode', value: 'agent' }],
-        host + ' must exclude the /?mode=agent JSON representation from enrollment',
-      );
-      assert.equal(headerRuleMatchesRequest(rootRule, { path: '/', host }), true);
-      assert.equal(headerRuleMatchesRequest(rootRule, { path: '/', host, query: { mode: 'reader' } }), true);
-      assert.equal(
-        headerRuleMatchesRequest(rootRule, { path: '/', host, query: { mode: 'agent' } }),
-        false,
-        host + ' must not attach an Origin-Trial token to /?mode=agent',
-      );
+      if (host === 'www.worldmonitor.app') {
+        const rootRule = hostRules.find((rule) => rule.source === '/');
+        assert.ok(rootRule, host + ' must define a homepage origin-trial rule');
+        assert.deepEqual(
+          rootRule.missing,
+          [{ type: 'query', key: 'mode', value: 'agent' }],
+          host + ' must exclude the /?mode=agent JSON representation from enrollment',
+        );
+        assert.equal(headerRuleMatchesRequest(rootRule, { path: '/', host }), true);
+        assert.equal(headerRuleMatchesRequest(rootRule, { path: '/', host, query: { mode: 'reader' } }), true);
+        assert.equal(
+          headerRuleMatchesRequest(rootRule, { path: '/', host, query: { mode: 'agent' } }),
+          false,
+          host + ' must not attach an Origin-Trial token to /?mode=agent',
+        );
+      }
       assert.equal(
         hostRules.some((rule) => headerRuleMatchesRequest(rule, { path: '/dashboard', host })),
         true,
@@ -2028,6 +2426,38 @@ describe('security header guardrails', () => {
       getHeaderValue('Permissions-Policy'),
       'Self-hosted docker users must have the same Permissions-Policy as Vercel.'
     );
+  });
+
+  it('every shipped CSP directive name is a real CSP directive', () => {
+    // A detect-secrets pragma once leaked into the header value itself
+    // (`object-src 'none'; x-allowlist // pragma: allowlist secret;
+    // form-action ...`), which Chrome reported on every production page load
+    // as "Unrecognized Content-Security-Policy directive 'x-allowlist'". JSON
+    // has no comment syntax, so any such annotation ships to browsers.
+    const KNOWN_CSP_DIRECTIVES = new Set([
+      'base-uri', 'block-all-mixed-content', 'child-src', 'connect-src',
+      'default-src', 'font-src', 'form-action', 'frame-ancestors', 'frame-src',
+      'img-src', 'manifest-src', 'media-src', 'object-src', 'prefetch-src',
+      'report-to', 'report-uri', 'require-trusted-types-for', 'sandbox',
+      'script-src', 'script-src-attr', 'script-src-elem', 'style-src',
+      'style-src-attr', 'style-src-elem', 'trusted-types',
+      'upgrade-insecure-requests', 'worker-src',
+    ]);
+    const surfaces = [
+      ['vercel', getHeaderValue('Content-Security-Policy')],
+      ['docker/nginx', getNginxHeaderValue('Content-Security-Policy')],
+    ];
+    for (const [label, csp] of surfaces) {
+      assert.ok(csp, `${label} must define a Content-Security-Policy`);
+      for (const segment of csp.split(';')) {
+        const name = segment.trim().split(/\s+/)[0];
+        if (!name) continue;
+        assert.ok(
+          KNOWN_CSP_DIRECTIVES.has(name),
+          `${label} CSP ships unrecognized directive "${name}" — browsers ignore it and log an error on every page load`,
+        );
+      }
+    }
   });
 
   it('CSP connect-src does not allow unencrypted WebSocket (ws:)', () => {
@@ -2264,6 +2694,17 @@ describe('security header guardrails', () => {
     }
   });
 
+  it('CSP framing rejects unrelated Vercel projects while preserving same-origin previews and the toolbar', () => {
+    const csp = getHeaderValue('Content-Security-Policy');
+    for (const directive of ['frame-src', 'frame-ancestors']) {
+      const tokens = getCspDirectiveTokens(csp, directive);
+      assert.ok(tokens.includes("'self'"), `${directive} must allow same-origin preview frames`);
+      assert.ok(tokens.some((token) => token === 'https://vercel.live'), `${directive} must allow the Vercel toolbar`);
+      assert.ok(!tokens.includes('https://*.vercel.app'), `${directive} must not trust every Vercel team`);
+    }
+    assert.deepEqual(findOpenFrameSources(getCspDirectiveTokens(csp, 'frame-ancestors')), []);
+  });
+
   // Per-file assertions, so the built /pro pages drop out of the population
   // rather than taking the five committed files down with them (#6898).
   it('HTML entry script tags carry the nonce trusted by the header CSP', () => {
@@ -2276,12 +2717,12 @@ describe('security header guardrails', () => {
     );
     assert.match(
       viteConfigSource,
-      new RegExp(`cspNonce:\\s*STATIC_SCRIPT_NONCE`),
+      /cspNonce:\s*STATIC_SCRIPT_NONCE/,
       'Vite must stamp emitted HTML entry scripts with the nonce trusted by the header CSP'
     );
     assert.match(
       proViteConfigSource,
-      new RegExp(`cspNonce:\\s*STATIC_SCRIPT_NONCE`),
+      /cspNonce:\s*STATIC_SCRIPT_NONCE/,
       'Pro Vite builds must stamp emitted HTML entry scripts with the nonce trusted by the header CSP'
     );
 
@@ -2376,6 +2817,7 @@ describe('security header guardrails', () => {
     // (`https://*.vercel.app`). It therefore passed while dead. Drive the
     // predicate directly against widenings written the way they'd really appear.
     for (const widened of [
+      'https://*.vercel.app', // arbitrary projects on other Vercel teams
       'https://*.evil.com',   // a new vendor wildcard
       'https://*',            // scheme-wide with a wildcard host
       'http://*.evil.com',
@@ -2425,6 +2867,61 @@ describe('embeddable map route guardrails', () => {
     assert.equal(getCacheHeaderValue(SPA_HTML_CACHE_SOURCE), 'private, no-cache, must-revalidate');
   });
 
+  it('no vercel.json rule re-enables shared caching of /api/geo', () => {
+    // /api/geo's body IS the caller's IP-geo, so it ships `Cache-Control: no-store`
+    // (api/geo.js) and tests/geo-per-visitor-cache.test.mts pins that. But a
+    // vercel.json header rule is ADDITIVE and outranks the handler at the CDN --
+    // Vercel reads Vercel-CDN-Cache-Control > CDN-Cache-Control > Cache-Control --
+    // so adding a cache directive to the existing `/api/(.*)` block would make the
+    // per-visitor body shared-cacheable again while the handler-level test stays
+    // green. This is the half of that guard the handler test cannot see.
+    // Judge the VALUE, not just the header name: a deployment rule that sets
+    // `Vercel-CDN-Cache-Control: no-store` reinforces the endpoint's contract and
+    // must not fail CI. Only a value a shared cache may actually store is an
+    // offender. Shares one predicate with the handler-level guard so the two
+    // cannot drift apart.
+    const offenders = [];
+    for (const rule of vercelConfig.headers) {
+      if (!sourceToRegExp(rule.source).test('/api/geo')) continue;
+      for (const header of rule.headers ?? []) {
+        if (!CACHE_POLICY_HEADER_NAME.test(header.key)) continue;
+        if (isSharedCacheable(header.value)) {
+          offenders.push(`${rule.source} -> ${header.key}: ${header.value}`);
+        }
+      }
+    }
+    assert.deepEqual(
+      offenders,
+      [],
+      'a vercel.json rule sets a cache-policy header on /api/geo, overriding the handler no-store at the CDN',
+    );
+  });
+
+  it('the /api/geo cache guard judges header values, not just header names', () => {
+    // Control for the guard above, both directions. A deployment rule that pins a
+    // non-storable policy REINFORCES the endpoint's contract and must not be
+    // reported; only a storable value is an offender.
+    assert.equal(isSharedCacheable('no-store'), false, 'a no-store deployment rule must not be flagged');
+    assert.equal(isSharedCacheable('private, max-age=300'), false);
+    assert.equal(isSharedCacheable('public, s-maxage=3600'), true);
+    assert.equal(isSharedCacheable('max-age=300'), true, 'bare max-age is still shared-storable');
+    assert.ok(CACHE_POLICY_HEADER_NAME.test('Vercel-CDN-Cache-Control'));
+    assert.ok(CACHE_POLICY_HEADER_NAME.test('Cloudflare-CDN-Cache-Control'));
+    assert.equal(CACHE_POLICY_HEADER_NAME.test('RateLimit-Limit'), false);
+  });
+
+  it('the /api/geo cache guard is wired to a rule source that really matches it', () => {
+    // Positive control for the guard above: prove sourceToRegExp actually matches
+    // /api/geo against a real rule in the file. Without this, a change to the
+    // matcher (or a renamed route) would make the guard vacuous -- it would scan
+    // zero rules and pass forever.
+    const matching = vercelConfig.headers.filter((rule) => sourceToRegExp(rule.source).test('/api/geo'));
+    assert.ok(
+      matching.some((rule) => rule.source === '/api/(.*)'),
+      'expected the /api/(.*) header rule to match /api/geo; the cache guard above scans nothing if it does not',
+    );
+  });
+
   it('keeps the global security header anti-framing rule off the embed entries', () => {
     // Both /embed (partner iframe) and /wm-widget-sandbox.html (agent widget
     // sandbox) need cross-origin framing + their own dedicated CSP; the
@@ -2442,7 +2939,14 @@ describe('embeddable map route guardrails', () => {
       `${source} must not match the global security-header rule`,
     );
     assert.equal(getHeaderValueForSource(source, 'X-Frame-Options'), null);
-    assert.match(getHeaderValueForSource(source, 'Content-Security-Policy') ?? '', /default-src 'none'/);
+    const csp = getHeaderValueForSource(source, 'Content-Security-Policy') ?? '';
+    assert.match(csp, /default-src 'none'/);
+    assert.match(csp, /(?:^|;\s*)sandbox allow-scripts(?:;|$)/, 'sandbox response must retain script execution in an opaque origin');
+    assert.equal(
+      getHeaderValueForSource(source, 'Cache-Control'),
+      'public, max-age=0, must-revalidate',
+      'unversioned sandbox policy documents must revalidate on every request',
+    );
   });
 
   for (const source of ['/embed', '/embed.html']) {
@@ -2501,7 +3005,7 @@ describe('embeddable map route guardrails', () => {
     assert.match(nginxTemplate, /location = \/embed\.js \{[\s\S]*?Access-Control-Allow-Origin "\*"/);
     assert.match(dockerNginxSource, /location = \/embed\.js \{[\s\S]*?Access-Control-Allow-Origin "\*"/);
     assert.doesNotMatch(
-      dockerNginxSource.match(/location = \/embed\.js \{[\s\S]*?\n    \}/)?.[0] ?? '',
+      dockerNginxSource.match(/location = \/embed\.js \{[\s\S]*?\n {4}\}/)?.[0] ?? '',
       /frame-ancestors/,
     );
   });
@@ -2541,8 +3045,8 @@ describe('self-hosted docker nginx SPA entry', () => {
     //   docker/Dockerfile -> docker/nginx.conf.template (published ghcr image)
     for (const conf of ['docker/nginx.conf', 'docker/nginx.conf.template']) {
       const src = readFileSync(resolve(__dirname, `../${conf}`), 'utf-8');
-      assert.match(src, /^\s*index dashboard\.html;/m, `${conf}: index directive must be dashboard.html`);
-      assert.match(src, /try_files \$uri \$uri\/ \/dashboard\.html;/, `${conf}: SPA fallback must serve /dashboard.html`);
+      assert.match(src, /^\s*index dashboard\.html index\.html;/m, `${conf}: index directive must prefer dashboard.html then serve corpus index.html`);
+      assert.match(src, /try_files \$uri \$uri\/ \$uri\/index\.html \/dashboard\.html;/, `${conf}: SPA fallback must serve corpus index.html before /dashboard.html`);
       assert.doesNotMatch(src, /try_files \$uri \$uri\/ \/index\.html;/, `${conf}: must not keep the broken /index.html SPA fallback`);
     }
   });
@@ -2738,13 +3242,18 @@ describe('agent readiness: api-catalog + openapi build', () => {
     const meta = apiEntry['service-meta'];
     assert.ok(Array.isArray(meta) && meta.length > 0, 'api context must carry service-meta entries');
     const hrefs = meta.map((entry) => entry.href);
-    assert.ok(hrefs.includes('https://worldmonitor.app/pricing.md'), 'service-meta must advertise pricing.md');
+    // www, not apex: neither path is on the Cloudflare apex-exemption list, so
+    // the apex form is a 301 an agent pays for before reaching the file (#7660).
+    assert.ok(hrefs.includes('https://www.worldmonitor.app/pricing.md'), 'service-meta must advertise pricing.md');
     assert.ok(
       hrefs.includes('https://www.worldmonitor.app/api/product-catalog'),
       'service-meta must advertise the live product-catalog JSON endpoint'
     );
-    assert.ok(hrefs.includes('https://worldmonitor.app/support.md'), 'service-meta must advertise support.md');
-    assert.ok(hrefs.includes('https://worldmonitor.app/agents.md'), 'service-meta must advertise agents.md (#4952)');
+    assert.ok(hrefs.includes('https://www.worldmonitor.app/support.md'), 'service-meta must advertise support.md');
+    assert.ok(hrefs.includes('https://www.worldmonitor.app/agents.md'), 'service-meta must advertise agents.md (#4952)');
+    assert.ok(hrefs.includes('https://www.worldmonitor.app/world-monitor.md'), 'service-meta must advertise world-monitor.md');
+    assert.ok(hrefs.includes('https://www.worldmonitor.app/api-versioning.md'), 'service-meta must advertise api-versioning.md');
+    assert.ok(hrefs.includes('https://www.worldmonitor.app/plugin.json'), 'service-meta must advertise /plugin.json');
     // The Commerce spec lives outside the root openapi bundle (size budget,
     // #4853) — without this link no advertised descriptor reaches it
     // (post-#4867 review finding); Mintlify serves the raw YAML at this URL.
@@ -2830,6 +3339,20 @@ describe('agent readiness: api-catalog + openapi build', () => {
     );
   });
 
+  it('no dashboard-serving rewrite can shadow the static /plugin.json Agent Plugin manifest', () => {
+    const shadow = vercelConfig.rewrites.find((r) =>
+      r.destination === DASHBOARD_HTML_DESTINATION && sourceToRegExp(r.source).test('/plugin.json')
+    );
+    assert.equal(shadow, undefined, '/plugin.json must serve the static manifest, not the app shell');
+    assert.ok(
+      SPA_HTML_CACHE_SOURCE.includes('plugin\\.json'),
+      'HTML cache catch-all must keep excluding plugin.json'
+    );
+    assert.equal(getHeaderValueForSource('/plugin.json', 'Content-Type'), 'application/json; charset=utf-8');
+    assert.equal(getHeaderValueForSource('/plugin.json', 'Access-Control-Allow-Origin'), '*');
+    assert.equal(effectiveCacheControl('/plugin.json'), 'public, max-age=3600');
+  });
+
   it('every web-variant build regenerates inventory facts and OpenAPI', () => {
     // build:desktop and build:pro are intentionally excluded — Tauri
     // sidecar builds and the standalone pro-test workspace don't ship
@@ -2849,9 +3372,8 @@ describe('agent readiness: api-catalog + openapi build', () => {
         script.includes('npm run build:openapi'),
         `scripts["${buildName}"] must chain "npm run build:openapi" so the web bundle ships the spec; got: ${script}`
       );
-      assert.equal(
-        pkg.scripts[prebuildName],
-        'npm run product:facts',
+      assert.ok(
+        pkg.scripts[prebuildName]?.split(' && ').includes('npm run product:facts'),
         `scripts["${prebuildName}"] must regenerate ignored inventory facts before ${buildName}`,
       );
     }
@@ -2981,11 +3503,14 @@ describe('agent readiness: MCP/OAuth origin alignment', () => {
       /resource_metadata="\$\{[A-Za-z_][A-Za-z0-9_]*\}"|`[^`]*resource_metadata="\$\{[^}]+\}"/,
       'api/mcp.ts must construct resource_metadata from a host-derived variable'
     );
-    // Must actually read the request host header somewhere in the file.
+    // Must derive the origin from the request, through the shared resolver that
+    // validates Host against the allowlist (api/_agent-metadata.ts). Reading the
+    // raw header directly would reflect a spoofed Host into the discovery
+    // pointer, and could name a host whose metadata document we never serve.
     assert.match(
       source,
-      /request\.headers\.get\(['"]host['"]\)|req\.headers\.get\(['"]host['"]\)/i,
-      'api/mcp.ts should read the request host header'
+      /resolveMetadataOrigin\(req(?:uest)?\)/,
+      'api/mcp.ts must derive the resource_metadata origin via resolveMetadataOrigin'
     );
   });
 
@@ -3122,6 +3647,15 @@ describe('agent readiness: MCP/OAuth origin alignment', () => {
 describe('agent readiness: auth.md walkthrough', () => {
   const authMd = readFileSync(resolve(__dirname, '../public/auth.md'), 'utf-8');
 
+  it('opens with its title and describes API key and OAuth authentication', () => {
+    assert.match(
+      authMd,
+      /^# WorldMonitor — Agent Authentication \(auth\.md\)\n/,
+      'auth.md must open directly with its H1 for scanner compatibility'
+    );
+    assert.match(authMd, /API keys?.*OAuth|OAuth.*API keys?/i);
+  });
+
   it('publishes /auth.md with the WorkOS-prescribed sections', () => {
     for (const heading of ['Discover', 'Pick a method', 'Register', 'Claim', 'Use the credential', 'Errors', 'Revocation']) {
       assert.match(
@@ -3240,7 +3774,7 @@ describe('agent readiness: generic markdown URL-fallback rewrite', () => {
     );
     const mdIdx = vercelConfig.rewrites.indexOf(mdTwinRewrite);
     assert.ok(mdIdx > rewriteIndex('/docs/:match*'), '/docs/:match* must stay ahead of the generic .md fallback');
-    assert.ok(mdIdx > rewriteIndex('/index.md'), '/index.md → /home.md must stay ahead of the generic .md fallback');
+    assert.ok(mdIdx > rewriteIndex('/index.md'), '/index.md → /pro/home.md must stay ahead of the generic .md fallback');
   });
 
   it('does not reintroduce a shadowing /api/:path* → /api/not-found rewrite', () => {
@@ -3254,7 +3788,7 @@ describe('agent readiness: generic markdown URL-fallback rewrite', () => {
     assert.equal(firstRewriteFor({ host: 'www.worldmonitor.app', path: '/dashboard.md' })?.destination, '/api/md-twin?path=:mdPath');
     assert.equal(firstRewriteFor({ host: 'www.worldmonitor.app', path: '/stocks/AAPL.md' })?.destination, '/api/md-twin?path=:mdPath');
     assert.equal(firstRewriteFor({ host: 'www.worldmonitor.app', path: '/docs/auth.md' })?.destination, 'https://worldmonitor.mintlify.dev/docs/:match*');
-    assert.equal(firstRewriteFor({ host: 'www.worldmonitor.app', path: '/index.md' })?.destination, '/home.md');
+    assert.equal(firstRewriteFor({ host: 'www.worldmonitor.app', path: '/index.md' })?.destination, '/pro/home.md');
     assert.equal(firstRewriteFor({ host: 'www.worldmonitor.app', path: '/api/health.md' }), null);
   });
 
@@ -3262,6 +3796,30 @@ describe('agent readiness: generic markdown URL-fallback rewrite', () => {
     assert.ok(SPA_HTML_CACHE_SOURCE.includes('|.*\\.md$'), 'HTML cache catch-all must exclude every *.md path');
     assert.equal(sourceToRegExp(SPA_HTML_CACHE_SOURCE).test('/dashboard.md'), false);
     assert.equal(sourceToRegExp(SPA_HTML_CACHE_SOURCE).test('/dashboard'), true);
+  });
+
+  it('never declares a static canonical over the unbounded generated .md space', () => {
+    // The curated twins (pricing.md, developers.md, …) are standalone documents
+    // with no HTML sibling, so their literal self-canonical header rules are
+    // correct. The generated space is unbounded — /countries/iran.md and an
+    // invented /countries/does-not-exist-xyz.md both land on /api/md-twin — so a
+    // canonical rule that reached them would mint a self-canonical soft-404 that
+    // no handler change can retract (#7860). Only the handler may set a
+    // canonical there, and it points at the sibling HTML page.
+    const generatedTwins = ['/countries/iran.md', '/countries/does-not-exist-xyz.md', '/stocks/AAPL.md'];
+    for (const rule of vercelConfig.headers ?? []) {
+      const declaresCanonical = (rule.headers ?? []).some(
+        (h) => h.key?.toLowerCase() === 'link' && /rel="?canonical"?/.test(h.value ?? ''),
+      );
+      if (!declaresCanonical) continue;
+      for (const path of generatedTwins) {
+        assert.equal(
+          sourceToRegExp(rule.source).test(path),
+          false,
+          `header rule "${rule.source}" declares a canonical over generated twin ${path}`,
+        );
+      }
+    }
   });
 });
 
@@ -3275,7 +3833,7 @@ describe('agent readiness: remaining markdown twins', () => {
   // joined the set with its canonical Link header (#4999): it is
   // sitemap-listed, and without the catch-all exclusion the SPA cache-header
   // catch-all (later in the headers array) overrides its max-age rule.
-  for (const mdPath of ['/pricing.md', '/support.md', '/agents.md', '/ai-search.md']) {
+  for (const mdPath of ['/pricing.md', '/support.md', '/agents.md', '/ai-search.md', '/world-monitor.md', '/api-versioning.md']) {
     it(`serves ${mdPath} as markdown, never the app shell`, () => {
       assert.equal(getHeaderValueForSource(mdPath, 'Content-Type'), 'text/markdown; charset=utf-8');
       assert.equal(getHeaderValueForSource(mdPath, 'Access-Control-Allow-Origin'), '*');
@@ -3345,17 +3903,19 @@ describe('vercel.json functions config (none expected after carousel moved to ed
 // status) or the full IANA URI form (RFC 9728 OAuth rels). The MCP
 // card rel carries anchor="/mcp" because the server card describes
 // the /mcp endpoint, not the document URL being fetched.
-describe('agent readiness: homepage Link headers', () => {
+describe('agent readiness: public document Link headers', () => {
   const vercel = JSON.parse(readFileSync(resolve(__dirname, '../vercel.json'), 'utf-8'));
 
-  for (const source of ['/', '/dashboard', '/dashboard.html']) {
+  it('keeps discovery headers off blog and pro asset routes', () => {
+    for (const path of ['/blog/_astro/main.js', '/blog/og/post.png', '/blog/images/post.jpg', '/pro/assets/main.js']) {
+      assert.equal(effectiveHeader(path, 'Link'), null, path);
+    }
+  });
+
+  for (const source of ['/', '/dashboard', '/dashboard.html', '/blog', '/blog/', '/blog/glossary/ais/', '/blog/example/', '/pro', '/pro/']) {
     it(`${source} emits a Link header`, () => {
-      const entry = vercel.headers.find((h) =>
-        h.source === source && h.headers.some((header) => header.key === 'Link')
-      );
-      assert.ok(entry, `expected a headers entry for ${source}`);
-      const linkHeader = entry.headers.find((h) => h.key === 'Link');
-      assert.ok(linkHeader, `expected a Link header on ${source}`);
+      const linkHeader = { value: effectiveHeader(source, 'Link') };
+      assert.ok(linkHeader.value, `expected a Link header on ${source}`);
 
       // Must advertise each required rel at least once
       const requiredRels = [
@@ -3367,6 +3927,7 @@ describe('agent readiness: homepage Link headers', () => {
         'rel="http://www.iana.org/assignments/relation/oauth-authorization-server"',
         'rel="mcp-server-card"',
         'rel="agent-skills-index"',
+        'rel="deprecation"',
       ];
       for (const rel of requiredRels) {
         assert.ok(
@@ -3410,6 +3971,11 @@ describe('agent readiness: homepage Link headers', () => {
         linkHeader.value,
         /<\/openapi\.yaml>; rel="service-desc"; type="application\/vnd\.oai\.openapi"/,
         'Link header must still advertise /openapi.yaml as the OpenAPI service-desc'
+      );
+      assert.match(
+        linkHeader.value,
+        /<\/api-versioning\.md>; rel="deprecation"; type="text\/markdown"/,
+        'Link header must advertise the static REST deprecation policy'
       );
 
       // Target URIs must be root-relative (start with /, not http://).
@@ -3539,71 +4105,45 @@ describe('agent readiness: Content-Signal declarations', () => {
   });
 });
 
-// #4952 — three-tier AI crawler policy. A named `User-agent` group REPLACES
-// the `*` group for that crawler (robots.txt groups do not inherit), so the
-// AI search/assistant allow-group must restate the full `*` rule set or those
-// crawlers would lose the /api/ protections. The training-only group must
-// stay a hard `Disallow: /`.
+// #4952 — a named `User-agent` group replaces the `*` group for that crawler.
+// Autonomous search crawlers restate the full `*` rule set. User-triggered
+// fetchers keep the bounded path protections but can open shared map links.
+// The training-only group stays a hard `Disallow: /`.
 describe('agent readiness: robots.txt AI crawler policy', () => {
   const robotsSource = readFileSync(resolve(__dirname, '../public/robots.www.txt'), 'utf-8');
 
-  // Minimal robots.txt group parser: consecutive User-agent lines share one
-  // group; a blank line or a User-agent line following rules starts a new one;
-  // comments never end a group.
-  const parseGroups = (source) => {
-    const groups = [];
-    let current = null;
-    for (const raw of source.split('\n')) {
-      const line = raw.trim();
-      if (line === '') {
-        current = null;
-        continue;
-      }
-      if (line.startsWith('#')) continue;
-      const colon = line.indexOf(':');
-      if (colon === -1) continue;
-      const key = line.slice(0, colon).trim().toLowerCase();
-      const value = line.slice(colon + 1).trim();
-      if (key === 'user-agent') {
-        if (!current || current.rules.length > 0) {
-          current = { agents: [], rules: [] };
-          groups.push(current);
-        }
-        current.agents.push(value.toLowerCase());
-      } else if (current && (key === 'allow' || key === 'disallow')) {
-        current.rules.push(`${key}: ${value}`);
-      }
-    }
-    return groups;
-  };
-
-  const groups = parseGroups(robotsSource);
+  const groups = parseRobotsGroups(robotsSource);
   const starGroup = groups.find((g) => g.agents.includes('*'));
   const aiAllowGroup = groups.find((g) => g.agents.includes('gptbot'));
+  const userFetchGroup = groups.find((g) => g.agents.includes('chatgpt-user'));
   const trainingBlockGroup = groups.find((g) => g.agents.includes('ccbot'));
 
-  // The agents AEO scanners score by name (search/assistant tier).
   const REQUIRED_AI_SEARCH_AGENTS = [
     'gptbot',
     'claudebot',
-    'chatgpt-user',
     'perplexitybot',
     'google-extended',
     'applebot-extended',
   ];
+  const REQUIRED_USER_FETCH_AGENTS = [
+    'chatgpt-user',
+    'claude-user',
+    'perplexity-user',
+    'mistralai-user',
+  ];
   const BLOCKED_TRAINING_AGENTS = ['ccbot', 'bytespider', 'anthropic-ai'];
 
-  it('explicitly allows the AI search/assistant agents in one named group', () => {
-    assert.ok(aiAllowGroup, 'robots.txt must have a named AI search/assistant group (GPTBot et al.)');
+  it('explicitly allows the AI search crawlers in one named group', () => {
+    assert.ok(aiAllowGroup, 'robots.txt must have a named AI search group (GPTBot et al.)');
     for (const agent of REQUIRED_AI_SEARCH_AGENTS) {
       assert.ok(
         aiAllowGroup.agents.includes(agent),
-        `AI search/assistant group must include User-agent: ${agent}`
+        `AI search group must include User-agent: ${agent}`
       );
     }
     assert.ok(
       aiAllowGroup.rules.includes('allow: /'),
-      'AI search/assistant group must Allow: /'
+      'AI search group must Allow: /'
     );
   });
 
@@ -3614,6 +4154,15 @@ describe('agent readiness: robots.txt AI crawler policy', () => {
       [...starGroup.rules].sort(),
       'the AI allow-group must restate the exact `*` rule set — named groups do not inherit, so a drift here silently opens /api/ (or blocks paths) for AI crawlers'
     );
+  });
+
+  it('keeps user-triggered fetchers in their own crawl-permitting group', () => {
+    assert.ok(userFetchGroup, 'robots.txt must have a user-triggered assistant group');
+    for (const agent of REQUIRED_USER_FETCH_AGENTS) {
+      assert.ok(userFetchGroup.agents.includes(agent), `user fetch group must include User-agent: ${agent}`);
+      assert.ok(!aiAllowGroup.agents.includes(agent), `${agent} must not inherit autonomous crawl limits`);
+    }
+    assert.ok(userFetchGroup.rules.includes('allow: /'), 'user fetch group must Allow: /');
   });
 
   it('disallows the bulk training-only scrapers entirely', () => {
@@ -3632,7 +4181,7 @@ describe('agent readiness: robots.txt AI crawler policy', () => {
   });
 
   it('never lists an allowed AI agent in the blocked group (and vice versa)', () => {
-    for (const agent of REQUIRED_AI_SEARCH_AGENTS) {
+    for (const agent of [...REQUIRED_AI_SEARCH_AGENTS, ...REQUIRED_USER_FETCH_AGENTS]) {
       assert.ok(
         !trainingBlockGroup.agents.includes(agent),
         `${agent} drives citations and must not be in the blocked group`
@@ -3655,6 +4204,410 @@ describe('agent readiness: robots.txt AI crawler policy', () => {
         );
       }
     }
+  });
+});
+
+// #7660: autonomous crawl groups block unbounded coordinate state and /tmp/
+// paths. User-triggered fetchers can follow shared map links.
+describe('agent readiness: crawl-budget disallows (#7660)', () => {
+  const CRAWL_BUDGET_DISALLOWS = [
+    'disallow: /tmp/',
+    'disallow: /*?*lat=',
+    'disallow: /*?*lon=',
+    'disallow: /*?*zoom=',
+  ];
+
+  // The inverse half of the contract, and the more important one. robots.txt is
+  // a crawl control, not a canonicalization tool: a disallowed URL is never
+  // fetched, so Google reads neither its rel=canonical nor its redirect. These
+  // families already consolidate — middleware 308s a crawler off ref/
+  // wm_referral/utm_* (a 308 passes the link equity that affiliates' pasted
+  // /pro?ref=… URLs carry), and wm_content_* answers 200 with a canonical.
+  // Blocking them would replace a working mechanism with a worse one.
+  const MUST_STAY_CRAWLABLE = [
+    'disallow: /*?*ref=',
+    'disallow: /*?*wm_referral=',
+    'disallow: /*?*wm_content_',
+    'disallow: /*?*utm_',
+    // `layers` looks like map state but is not what makes the space unbounded.
+    // src/utils/urlState.ts sets `zoom` unconditionally on every share URL, so
+    // `/*?*zoom=` already catches the whole family; `layers` added no coverage
+    // and disallowed the bounded dashboard CTAs build-use-cases.mjs publishes
+    // with layers and no coordinates (PR #7689 review).
+    'disallow: /*?*layers=',
+  ];
+
+  for (const file of ['robots.www.txt', 'robots.variant.txt']) {
+    it(`${file} lets user-triggered assistant fetchers open shared map links`, () => {
+      const groups = parseRobotsGroups(readFileSync(resolve(__dirname, `../public/${file}`), 'utf-8'));
+      const starGroup = groups.find((group) => group.agents.includes('*'));
+      const userFetchGroup = groups.find((group) => group.agents.includes('chatgpt-user'));
+      assert.ok(starGroup, `${file} must have a default group`);
+      assert.ok(userFetchGroup, `${file} must have a user-triggered assistant group`);
+      for (const agent of ['chatgpt-user', 'claude-user', 'perplexity-user', 'mistralai-user']) {
+        assert.ok(userFetchGroup.agents.includes(agent), `${file} must include ${agent}`);
+      }
+      const coordinateRules = new Set(CRAWL_BUDGET_DISALLOWS.slice(1));
+      const expectedRules = starGroup.rules.filter((rule) => !coordinateRules.has(rule));
+      assert.deepStrictEqual(
+        [...userFetchGroup.rules].sort(),
+        [...expectedRules].sort(),
+        `${file} user-triggered fetchers must omit only the coordinate rules`
+      );
+    });
+
+    it(`${file} carries every crawl-budget disallow in every autonomous crawl group`, () => {
+      const groups = parseRobotsGroups(readFileSync(resolve(__dirname, `../public/${file}`), 'utf-8'));
+      const crawling = groups.filter((g) => g.rules.includes('allow: /'));
+      const autonomous = crawling.filter((g) => !g.agents.includes('chatgpt-user'));
+      assert.ok(autonomous.length >= 2, `${file} must have a * group and a named AI group that crawl`);
+      for (const group of autonomous) {
+        for (const rule of CRAWL_BUDGET_DISALLOWS) {
+          assert.ok(
+            group.rules.includes(rule),
+            `${file} group [${group.agents.join(', ')}] is missing \`${rule.replace('disallow:', 'Disallow:')}\` — ` +
+              'robots groups do not inherit, so this crawler still burns budget on the space the others no longer crawl'
+          );
+        }
+      }
+      for (const group of crawling) {
+        for (const rule of MUST_STAY_CRAWLABLE) {
+          assert.ok(
+            !group.rules.includes(rule),
+            `${file} group [${group.agents.join(', ')}] added \`${rule.replace('disallow:', 'Disallow:')}\` — ` +
+              'that family already consolidates via a 308 or a rel=canonical, and a disallowed URL is never ' +
+              'fetched, so blocking it strands the signal instead of folding it'
+          );
+        }
+      }
+    });
+  }
+
+  it('leaves the canonical param-free documents crawlable', () => {
+    // The disallows are query-scoped on purpose: `/dashboard` and `/pro` are
+    // the consolidation targets the canonicals point at, so blocking the bare
+    // paths would delete the pages this change exists to protect.
+    for (const file of ['robots.www.txt', 'robots.variant.txt']) {
+      const body = readFileSync(resolve(__dirname, `../public/${file}`), 'utf-8');
+      assert.doesNotMatch(body, /^Disallow: \/dashboard$/m, `${file} must keep /dashboard crawlable`);
+      assert.doesNotMatch(body, /^Disallow: \/docs$/m, `${file} must keep /docs crawlable`);
+      for (const line of body.split('\n')) {
+        const match = /^Disallow: (\/\*.*)$/.exec(line.trim());
+        if (!match) continue;
+        assert.match(
+          match[1],
+          /^\/\*\?\*/,
+          `${line.trim()} must be query-scoped (\`/*?*\`) — a bare wildcard would block the canonical document too`
+        );
+      }
+    }
+  });
+
+  // Rule presence is not the contract — what the rules MATCH is. This resolves
+  // real request paths against the `*` group using Google's documented
+  // semantics (`*` = any sequence, `$` = end of URL, longest match wins,
+  // Allow beats an equal-length Disallow) so a future edit that quietly
+  // narrows or widens a pattern fails here rather than in Search Console.
+  describe('resolved against the paths Search Console actually reported', () => {
+    const escapeRe = (part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // Google's robots.txt path matching: `*` is any sequence, a trailing `$`
+    // anchors the end of the URL (query string included), everything else is
+    // a literal prefix match.
+    const pathMatches = (pattern, path) => {
+      const source = pattern.endsWith('$')
+        ? `^${pattern.slice(0, -1).split('*').map(escapeRe).join('.*')}$`
+        : `^${pattern.split('*').map(escapeRe).join('.*')}`;
+      return new RegExp(source).test(path);
+    };
+
+    const ruleCache = new Map();
+    const starGroupRules = (file) => {
+      if (!ruleCache.has(file)) {
+        const groups = parseRobotsGroups(readFileSync(resolve(__dirname, `../public/${file}`), 'utf-8'));
+        const star = groups.find((g) => g.agents.includes('*'));
+        assert.ok(star, `${file} must have a * group`);
+        ruleCache.set(
+          file,
+          star.rules.map((rule) => {
+            const [key, ...rest] = rule.split(': ');
+            return { allow: key === 'allow', pattern: rest.join(': ') };
+          })
+        );
+      }
+      return ruleCache.get(file);
+    };
+
+    const isCrawlable = (file, path) => {
+      let best = null;
+      for (const rule of starGroupRules(file)) {
+        if (!pathMatches(rule.pattern, path)) continue;
+        if (!best || rule.pattern.length > best.pattern.length) best = rule;
+        else if (rule.pattern.length === best.pattern.length && rule.allow) best = rule;
+      }
+      return best ? best.allow : true;
+    };
+
+    // Verbatim shapes from the 2026-09-04 GSC "Page with redirect" and
+    // "Not found (404)" exports.
+    const BLOCKED = [
+      '/?lat=20.0000&lon=0.0000&zoom=1.00&view=global&timeRange=7d&layers=conflicts,bases',
+      '/index?lat=NaN&lon=NaN&zoom=2.50&view=america&timeRange=7d&layers=conflicts',
+      '/dashboard?lat=20.0000&lon=0.0000&zoom=1.00',
+      '/tmp/gem-pipelines.json',
+    ];
+    const CRAWLABLE = [
+      '/',
+      '/dashboard',
+      '/pro',
+      '/countries/iran/',
+      '/compare/iran-vs-israel/',
+      '/docs/mcp-overview',
+      // #7660 proposed Disallow: /docs/_next/ for the 139 stale hashed chunks
+      // that 404 after every Mintlify redeploy. Measured instead: a live
+      // /docs/* page pulls 76 assets from that prefix, JS and CSS both, and
+      // the current deploy's assets carry the same `?dpl=` pin as the stale
+      // ones — no pattern separates them. Blocking it would hide every render
+      // resource from Googlebot on the pages already stuck in "crawled -
+      // currently not indexed", which costs more than a cheap 404.
+      '/docs/_next/static/chunks/462bacc63bed9960.css?dpl=dpl_6TpKozpvfbf2eKSzPrrzWSvEC9fx',
+      // docs/embed-live-map.mdx documents this exact iframe src. The map-param
+      // rules would otherwise stop Googlebot fetching our widget while it
+      // renders a partner's page.
+      '/embed?layers=conflicts,earthquakes,weather&center=20,0&zoom=1&theme=dark&variant=full',
+      '/embed?panel=fear-greed&theme=dark',
+      // Bounded, already-consolidating families: the middleware 308 and the
+      // rel=canonical only work if the crawler is allowed to fetch them.
+      '/pro?ref=affiliate',
+      '/pro?wm_referral=abc123',
+      '/pro?wm_content_source=use-cases&wm_content_medium=internal',
+      '/countries/iran/?utm_source=newsletter',
+      '/blog/',
+      '/api/llms.txt',
+    ];
+
+    for (const file of ['robots.www.txt', 'robots.variant.txt']) {
+      it(`${file} blocks the reported crawl-waste URLs`, () => {
+        for (const path of BLOCKED) {
+          assert.equal(isCrawlable(file, path), false, `${file} must block ${path}`);
+        }
+      });
+
+      it(`${file} still allows the canonical corpus`, () => {
+        for (const path of CRAWLABLE) {
+          // /pro and its query forms are deliberately Disallowed on variant
+          // hosts (#6835) — /pro/welcome.html stays 200 there.
+          if (file === 'robots.variant.txt' && path.startsWith('/pro')) continue;
+          assert.equal(isCrawlable(file, path), true, `${file} must keep ${path} crawlable`);
+        }
+      });
+    }
+
+    // Probed against production 2026-09-04: Vercel applies vercel.json
+    // `redirects` BEFORE middleware. On a variant host, `/?ref=x` answers
+    // 308 -> `/dashboard?ref=x` with the param intact, while the same request
+    // on www answers 308 -> `/` with it stripped — so the middleware never
+    // runs for `/` there, and crawlerCanonicalUrl() cannot collapse variant
+    // map-state URLs.
+    //
+    // That makes the variant robots rules load-bearing rather than
+    // belt-and-braces: they are the ONLY thing keeping a compliant crawler off
+    // the variant hosts' share of the space (415 of the 1,000 exported
+    // redirect URLs). If the `/` -> `/dashboard` host redirect is ever
+    // removed, middleware takes over and this coupling changes — so assert the
+    // pair together rather than leaving the dependency unwritten.
+    it('keeps the variant map-state rules load-bearing while the / host redirect exists', () => {
+      const variantRootRedirect = vercelConfig.redirects.find(
+        (r) =>
+          r.source === '/' &&
+          Array.isArray(r.has) &&
+          r.has.some((h) => h.type === 'host' && /tech|finance|commodity|happy|energy/.test(h.value))
+      );
+      if (!variantRootRedirect) return;
+      assert.equal(variantRootRedirect.destination, '/dashboard');
+      for (const path of [
+        '/?lat=20.0000&lon=0.0000&zoom=1.00',
+        '/dashboard?lat=20.0000&lon=0.0000&zoom=1.00',
+      ]) {
+        assert.equal(
+          isCrawlable('robots.variant.txt', path),
+          false,
+          `robots.variant.txt must block ${path} itself — the middleware collapse never runs on a variant host`
+        );
+      }
+    });
+
+    // The sitemap covers the documents we declare. This covers the links those
+    // documents CONTAIN — a different failure, and the one a crawl-budget rule
+    // is most likely to cause: publishing a link on ~240 generated pages while
+    // telling Google it may not follow it. Blocking a link you keep emitting is
+    // the worst of both, and it moves the volume into "Blocked by robots.txt"
+    // rather than removing it.
+    //
+    // Shapes are the ones the corpus builders actually emit
+    // (scripts/build-crawlable-corpus.mjs withUtmSource, scripts/build-use-cases.mjs
+    // content attribution, scripts/crawlable-sources-page.mjs,
+    // scripts/build-research-reports.mjs).
+    // `/*?*lat=` is a substring match over the whole query, not a parameter-NAME
+    // match: it also catches any param ending in the token (`?colon=` matches
+    // `/*?*lon=`) and value-side text (`?q=flat=earth` matches `/*?*lat=`).
+    //
+    // That cannot be fixed in robots.txt. Name-anchoring needs `/*&lat=` for a
+    // non-first parameter, and a literal `&` in a rule path never matches —
+    // verified against Protego, which implements Google's spec: `/*&lat=` does
+    // not match `/d?view=g&lat=1` while `/*?*lat=` does. Anchoring would have
+    // silently stopped blocking every map URL whose lat is not the first param.
+    //
+    // So the exposure is real and permanent, and the guard is on the other
+    // side: no parameter this application actually reads may end in one of the
+    // blocked tokens. 96 params read via searchParams today, zero collisions —
+    // this fails the day someone adds `?colon=`, `?salon=`, `?pylon=` or
+    // `?flat=`, which is when it matters.
+    it('has no live collision between a blocked token and a real parameter', () => {
+      const BLOCKED_TOKENS = ['lat', 'lon', 'zoom', 'layers'];
+      const SOURCE_DIRS = ['src', 'server', 'api', 'scripts', 'shared'];
+      // Both spellings: `url.searchParams.get('x')` and the bare
+      // `params.get('x')` / `params.set('x', …)` used once a URLSearchParams is
+      // in a local (src/utils/urlState.ts reads zoom and layers that way).
+      const PARAM_RE = /(?:searchParams|params)\.(?:get|has|set)\(\s*['"]([A-Za-z0-9_]+)['"]/g;
+
+      const collectParams = (dir, acc) => {
+        for (const entry of readdirSync(dir, { withFileTypes: true })) {
+          if (entry.name === 'node_modules' || entry.name.startsWith('.')) continue;
+          const full = join(dir, entry.name);
+          if (entry.isDirectory()) {
+            collectParams(full, acc);
+            continue;
+          }
+          if (!/\.(ts|tsx|mts|mjs|js|cjs)$/.test(entry.name)) continue;
+          for (const m of readFileSync(full, 'utf-8').matchAll(PARAM_RE)) acc.add(m[1]);
+        }
+        return acc;
+      };
+
+      const params = new Set();
+      for (const dir of SOURCE_DIRS) collectParams(resolve(__dirname, '..', dir), params);
+      assert.ok(params.size > 50, `expected to find the app's query params, got ${params.size}`);
+      for (const token of BLOCKED_TOKENS) assert.ok(params.has(token), `${token} must be a real param`);
+
+      // The bounding-box params collide on the token but never on a crawlable
+      // URL: they exist only on `/api/*` RPC routes, which `Disallow: /api/`
+      // has covered since long before these rules. Allowlisted explicitly, and
+      // re-proved below, so a NEW collision on a crawlable surface still fails.
+      const API_ONLY_COLLISIONS = ['sw_lat', 'sw_lon', 'ne_lat', 'ne_lon'];
+
+      const collisions = [...params].filter(
+        (name) => !BLOCKED_TOKENS.includes(name) && BLOCKED_TOKENS.some((t) => name.endsWith(t))
+      );
+      assert.deepEqual(
+        collisions.filter((name) => !API_ONLY_COLLISIONS.includes(name)).sort(),
+        [],
+        'these parameters end in a blocked token, so `/*?*<token>=` would disallow every URL ' +
+          `carrying them: ${collisions.join(', ')}. Rename the param, or drop the rule.`
+      );
+
+      // The allowlist cannot rot: every file that names one of these must also
+      // name an /api/ path, so the day one is used on a crawlable URL this
+      // fails instead of quietly widening the exemption.
+      const filesNaming = (needle, dir, acc = []) => {
+        for (const entry of readdirSync(dir, { withFileTypes: true })) {
+          if (entry.name === 'node_modules' || entry.name.startsWith('.')) continue;
+          const full = join(dir, entry.name);
+          if (entry.isDirectory()) {
+            filesNaming(needle, full, acc);
+            continue;
+          }
+          if (!/\.(ts|tsx|mts|mjs|js|cjs)$/.test(entry.name)) continue;
+          const body = readFileSync(full, 'utf-8');
+          // As a query KEY only — quoted, or written into a query string. A
+          // bare prose mention (`// [sw_lat, sw_lon, …]` documenting an array
+          // order) is not a parameter and must not trip this.
+          const asQueryKey = new RegExp(`['"\`]${needle}['"\`]|[?&]${needle}=`);
+          if (asQueryKey.test(body)) acc.push({ path: full, apiScoped: body.includes('/api/') });
+        }
+        return acc;
+      };
+      for (const name of API_ONLY_COLLISIONS) {
+        for (const dir of SOURCE_DIRS) {
+          for (const hit of filesNaming(name, resolve(__dirname, '..', dir))) {
+            assert.ok(
+              hit.apiScoped,
+              `${name} is allowlisted as /api/-only, but ${relative(resolve(__dirname, '..'), hit.path)} ` +
+                'names it without any /api/ path — if it now reaches a crawlable URL, `/*?*lat=` disallows that URL'
+            );
+          }
+        }
+      }
+    });
+
+    it('never blocks a link shape our own build emits', () => {
+      // Read the hrefs out of the builders rather than sampling them by hand.
+      // The hand-written sample was the bug: it listed twelve shapes and missed
+      // the two `layers=` dashboard CTAs in build-use-cases.mjs, so the rules
+      // shipped blocking links the site publishes (PR #7689 review).
+      const BUILDERS = [
+        'scripts/build-crawlable-corpus.mjs',
+        'scripts/build-use-cases.mjs',
+        'scripts/crawlable-sources-page.mjs',
+        'scripts/build-research-reports.mjs',
+      ];
+      // A quoted or backticked literal that starts with `/` and has a query.
+      const HREF_RE = /['"`](\/[A-Za-z0-9._\-/${}]*\?[^'"`]*)['"`]/g;
+
+      const emitted = new Map();
+      for (const builder of BUILDERS) {
+        const src = readFileSync(resolve(__dirname, '..', builder), 'utf-8');
+        src.split('\n').forEach((line, index) => {
+          for (const match of line.matchAll(HREF_RE)) {
+            const raw = match[1];
+            if (raw.includes('://')) continue;
+            // Template interpolation stands in as a concrete value; the rules
+            // key on parameter names, so the substituted value is irrelevant.
+            emitted.set(raw.replace(/\$\{[^}]*\}/g, 'X'), `${builder}:${index + 1}`);
+          }
+        });
+      }
+
+      assert.ok(
+        emitted.size >= 8,
+        `expected to read the corpus builders' query-bearing hrefs, found ${emitted.size} — ` +
+          'the extraction regex probably stopped matching, which would make this test vacuous'
+      );
+
+      // The attribution wrappers every builder applies on top of those literals.
+      const TAGGED = (href) =>
+        `${href}${href.includes('?') ? '&' : '?'}wm_content_source=worldmonitor-use-cases&utm_source=seo-use-case`;
+
+      const blocked = [];
+      for (const [href, where] of emitted) {
+        for (const candidate of [href, TAGGED(href)]) {
+          if (!isCrawlable('robots.www.txt', candidate)) blocked.push(`  ${where}  ${candidate}`);
+        }
+      }
+      assert.deepEqual(
+        blocked,
+        [],
+        'robots.www.txt blocks links the build emits on generated pages. Blocking a link you keep ' +
+          'publishing does not remove the crawl volume, it relabels it "Blocked by robots.txt" and ' +
+          `tells Google not to follow your own internal graph:\n${blocked.join('\n')}`
+      );
+    });
+
+    it('blocks nothing we declare in the sitemap', () => {
+      // The failure mode worth guarding: a crawl-budget rule that also deletes
+      // part of the 845-URL declared inventory it exists to protect. Resolved
+      // against every <loc> rather than a sample.
+      const sitemap = readFileSync(resolve(__dirname, '../public/sitemap-main.xml'), 'utf-8');
+      const locs = [...sitemap.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1]);
+      assert.ok(locs.length > 100, `expected a populated sitemap, got ${locs.length} entries`);
+      for (const loc of locs) {
+        const { pathname, search } = new URL(loc);
+        assert.equal(
+          isCrawlable('robots.www.txt', `${pathname}${search}`),
+          true,
+          `robots.www.txt blocks a sitemap-declared URL: ${loc}`
+        );
+      }
+    });
   });
 });
 
@@ -3856,15 +4809,15 @@ describe('docs host scoping — Mintlify proxy is www-only (#5345)', () => {
   // proxy. The host list is derived from the /dashboard variant rewrites so a
   // new variant subdomain cannot ship outside the docs redirect.
   const docsHostRedirect = vercelConfig.redirects.find(
-    (r) => r.source === '/docs/:match*' && r.has
+    (r) => r.source === '/docs/:match(.*)' && r.has
   );
   const variantHosts = vercelConfig.rewrites
     .filter((r) => r.source === '/dashboard' && r.has)
     .map((r) => (r.has ?? []).find((h) => h.type === 'host')?.value ?? '');
 
   it('redirects subdomain /docs/* to www permanently', () => {
-    assert.ok(docsHostRedirect, 'expected a host-conditioned redirect for /docs/:match*');
-    assert.equal(docsHostRedirect.destination, 'https://www.worldmonitor.app/docs/:match*');
+    assert.ok(docsHostRedirect, 'expected a host-conditioned redirect for /docs/:match(.*)');
+    assert.equal(docsHostRedirect.destination, 'https://www.worldmonitor.app/docs/:match');
     assert.equal(docsHostRedirect.permanent, true);
   });
 
@@ -3902,7 +4855,7 @@ describe('markdown canonical Link headers (#4999)', () => {
   // agents, so they cannot carry a <link rel="canonical">. RFC 6596 allows the
   // HTTP Link header form; without it these are the only indexable URLs with
   // no canonical signal at all.
-  const MD_PAGES = ['/pricing.md', '/support.md', '/ai-search.md', '/developers.md', '/mcp-server.md', '/openapi.md', '/sdks.md', '/auth.md', '/agents.md', '/home.md'];
+  const MD_PAGES = ['/pricing.md', '/support.md', '/ai-search.md', '/developers.md', '/mcp-server.md', '/openapi.md', '/sdks.md', '/auth.md', '/agents.md', '/home.md', '/world-monitor.md', '/api-versioning.md'];
 
   for (const page of MD_PAGES) {
     it(`${page} declares a self-referencing canonical Link header`, () => {
@@ -3918,7 +4871,7 @@ describe('markdown canonical Link headers (#4999)', () => {
     });
   }
 
-  const CORPUS_PAGES = ['/llms.txt', '/llms-full.txt', '/agent.txt', '/openapi.yaml', '/openapi.json', '/schemamap.xml'];
+  const CORPUS_PAGES = ['/llms.txt', '/llms-full.txt', '/agent.txt', '/openapi.yaml', '/openapi.json', '/plugin.json', '/schemamap.xml'];
 
   for (const page of CORPUS_PAGES) {
     it(`${page} declares a www canonical Link header`, () => {
@@ -3931,11 +4884,11 @@ describe('markdown canonical Link headers (#4999)', () => {
   }
 
   it('every sitemap-listed .md URL has the canonical Link header rule', () => {
-    const sitemap = readFileSync(resolve(__dirname, '../public/sitemap.xml'), 'utf-8');
+    const sitemap = readFileSync(resolve(__dirname, '../public/sitemap-main.xml'), 'utf-8');
     const mdUrls = [...sitemap.matchAll(/<loc>https:\/\/www\.worldmonitor\.app(\/[^<]+\.md)<\/loc>/g)].map((m) => m[1]);
-    assert.ok(mdUrls.length > 0, 'expected .md entries in sitemap.xml');
+    assert.ok(mdUrls.length > 0, 'expected .md entries in sitemap-main.xml');
     for (const path of mdUrls) {
-      assert.ok(MD_PAGES.includes(path), `${path} is in sitemap.xml but has no canonical Link header rule — add it to vercel.json and this test`);
+      assert.ok(MD_PAGES.includes(path), `${path} is in sitemap-main.xml but has no canonical Link header rule — add it to vercel.json and this test`);
     }
   });
 });
@@ -3958,7 +4911,8 @@ describe('agent readiness: named developer-resource pages (#4953)', () => {
   for (const page of DEV_PAGES) {
     it(`public/${page.file} opens with the brand-named H1 "${page.h1}"`, () => {
       const body = readFileSync(resolve(__dirname, `../public/${page.file}`), 'utf-8');
-      assert.ok(body.startsWith(`${page.h1}\n`), `public/${page.file} must open with "${page.h1}"`);
+      const content = body.replace(/^---\n[\s\S]*?\n---\n+/, '');
+      assert.ok(content.startsWith(`${page.h1}\n`), `public/${page.file} must open with "${page.h1}" after metadata`);
     });
 
     it(`${page.path} serves the static page, never the app shell`, () => {
@@ -3992,20 +4946,21 @@ describe('agent readiness: named developer-resource pages (#4953)', () => {
     // web-search discovery surfaces (candidate fixes #1/#3 of the issue) — assert
     // them directly so a dropped sitemap entry or blog cross-link is caught here,
     // not only via the reverse #4999 sitemap->MD_PAGES sweep.
-    const sitemap = readFileSync(resolve(__dirname, '../public/sitemap.xml'), 'utf-8');
+    const sitemap = readFileSync(resolve(__dirname, '../public/sitemap-main.xml'), 'utf-8');
     const blogPost = readFileSync(
       resolve(__dirname, '../blog-site/src/content/blog/build-on-worldmonitor-developer-api-open-source.md'),
       'utf-8'
     );
     for (const page of DEV_PAGES) {
-      const url = `https://worldmonitor.app${page.path}`;
+      // www, not apex (#7660): the developer-resource pages 301 off the apex.
+      const url = `https://www.worldmonitor.app${page.path}`;
       assert.ok(catalogHrefs.includes(url), `api-catalog must advertise ${url}`);
       for (const [name, content] of surfaces) {
         assert.ok(content.includes(page.path), `public/${name} must link ${page.path}`);
       }
       assert.ok(
         sitemap.includes(`https://www.worldmonitor.app${page.path}`),
-        `sitemap.xml must register ${page.path} on the www host`
+        `sitemap-main.xml must register ${page.path} on the www host`
       );
       assert.ok(blogPost.includes(page.path), `the developer blog post must cross-link ${page.path}`);
     }
@@ -4111,9 +5066,9 @@ describe('section-scoped llms.txt files', () => {
   it('the site-wide llms.txt cross-links every section file and the sandbox', () => {
     const llms = readFileSync(resolve(__dirname, '../public/llms.txt'), 'utf-8');
     for (const url of [
-      'https://worldmonitor.app/api/llms.txt',
+      'https://www.worldmonitor.app/api/llms.txt',
       'https://www.worldmonitor.app/docs/llms.txt',
-      'https://worldmonitor.app/developers/llms.txt',
+      'https://www.worldmonitor.app/developers/llms.txt',
       'https://www.worldmonitor.app/blog/llms.txt',
       'https://www.worldmonitor.app/sandbox/index.json',
       'https://www.worldmonitor.app/schemamap.xml',
@@ -4153,7 +5108,7 @@ describe('skeleton brand text extraction (#5541)', () => {
 // alternates (or, for RSS, duplicates with no user-selected canonical).
 describe('variant-host canonicalization (#6833–#6836)', () => {
   const docsHostRedirect = vercelConfig.redirects.find(
-    (r) => r.source === '/docs/:match*' && r.has
+    (r) => r.source === '/docs/:match(.*)' && r.has
   );
   const sharedHostValue = (docsHostRedirect?.has ?? []).find((h) => h.type === 'host')?.value ?? '';
   const sharedHostRe = new RegExp(sharedHostValue);
@@ -4171,8 +5126,10 @@ describe('variant-host canonicalization (#6833–#6836)', () => {
 
   const SHARED_WWW_PREFIXES = [
     'blog',
+    'country-instability-index',
     'countries',
     'chokepoints',
+    'compare',
     'research',
     'tools',
     'crises',
@@ -4192,16 +5149,72 @@ describe('variant-host canonicalization (#6833–#6836)', () => {
 
   for (const prefix of SHARED_WWW_PREFIXES) {
     it(`308s variant/api /${prefix}/* to www (#6833)`, () => {
-      const redirect = hostRedirect(`/${prefix}/:match*`, 'tech');
-      assert.ok(redirect, `expected a host-conditioned 308 for /${prefix}/:match*`);
-      assert.equal(redirect.destination, `https://www.worldmonitor.app/${prefix}/:match*`);
+      const redirect = hostRedirect(`/${prefix}/:match(.*)`, 'tech');
+      assert.ok(redirect, `expected a host-conditioned 308 for /${prefix}/:match(.*)`);
+      assert.equal(redirect.destination, `https://www.worldmonitor.app/${prefix}/:match`);
       assert.equal(redirect.permanent, true);
       const hostValue = (redirect.has ?? []).find((h) => h.type === 'host')?.value;
       assert.equal(
         hostValue,
         sharedHostValue,
-        `/${prefix}/:match* must reuse the /docs host regex so a new variant cannot ship uncovered`
+        `/${prefix}/:match(.*) must reuse the /docs host regex so a new variant cannot ship uncovered`
       );
+    });
+  }
+
+  // The shared corpus canonicalises to a trailing slash, so the trailing-slash
+  // form is the ONLY one a crawler requests. `/${prefix}/:match*` matched
+  // neither `/countries/` nor `/countries/japan/` under Vercel's strict
+  // path-to-regexp, so until #7530 every variant subdomain served the whole
+  // shared corpus as a 200 instead of 308-ing it to www — ~1,250 duplicate
+  // crawlable URLs across five subdomains, held together only by the canonical
+  // tag the pages happen to carry. Assert the canonical form explicitly.
+  for (const prefix of SHARED_WWW_PREFIXES) {
+    it(`308s the trailing-slash form of /${prefix}/ off variant hosts (#7530)`, () => {
+      // Bare `/reference/` is claimed earlier by the host-agnostic hop to
+      // /reference/changelog/, which the shared-content 308 then hands to www.
+      const paths = prefix === 'reference'
+        ? [`/${prefix}/example/`, `/${prefix}/example`]
+        : [`/${prefix}/`, `/${prefix}/example/`, `/${prefix}/example`];
+      for (const path of paths) {
+        const redirect = firstRedirectFor({ host: 'tech.worldmonitor.app', path });
+        assert.ok(redirect, `${path} must 308 off tech.worldmonitor.app, not serve a duplicate 200`);
+        assert.equal(
+          redirect.destination,
+          `https://www.worldmonitor.app/${prefix}/:match`,
+          `${path} must land on the www canonical`,
+        );
+      }
+
+      // The BARE form is the gap this guard missed on its first pass. Because
+      // `:match(.*)` no longer matches `/tools`, that path now escapes the
+      // variant host only via the host-agnostic `/tools` -> `/tools/` hop, and
+      // deleting that hop left the whole suite green while the tracer reported
+      // the page served as a 200 duplicate. Follow the chain to its terminus
+      // instead of asserting a single rule, so whichever rule carries the bare
+      // form, it must still end on www.
+      let path = `/${prefix}`;
+      let landed = null;
+      for (let hop = 0; hop < 4; hop += 1) {
+        const redirect = firstRedirectFor({ host: 'tech.worldmonitor.app', path });
+        assert.ok(
+          redirect,
+          `/${prefix} must not be served as a 200 duplicate on tech.worldmonitor.app`
+            + ` (chain stalled at ${path} after ${hop} hop(s))`,
+        );
+        const destination = String(redirect.destination);
+        if (destination.startsWith('https://www.worldmonitor.app')) {
+          landed = destination;
+          break;
+        }
+        assert.ok(
+          destination.startsWith('/'),
+          `/${prefix} hopped to ${destination}, which is neither www nor a same-host path`,
+        );
+        assert.notEqual(destination, path, `/${prefix} redirect loop at ${path}`);
+        path = destination;
+      }
+      assert.ok(landed, `/${prefix} must reach www.worldmonitor.app within 4 hops`);
     });
   }
 
@@ -4261,7 +5274,7 @@ describe('variant-host canonicalization (#6833–#6836)', () => {
     assert.equal(firstRedirectFor({ host: 'api.worldmonitor.app', path: '/' })?.destination, 'https://www.worldmonitor.app/');
     assert.equal(
       firstRedirectFor({ host: tech, path: '/blog/rss.xml' })?.destination,
-      'https://www.worldmonitor.app/blog/:match*'
+      'https://www.worldmonitor.app/blog/:match'
     );
     assert.equal(firstRedirectFor({ host: tech, path: '/pro' })?.destination, 'https://www.worldmonitor.app/pro');
     assert.equal(firstRedirectFor({ host: tech, path: '/pro/' })?.destination, 'https://www.worldmonitor.app/pro');
@@ -4282,9 +5295,9 @@ describe('variant-host canonicalization (#6833–#6836)', () => {
   });
 
   it('places shared-content 308s before host-agnostic trailing-slash redirects (#6833)', () => {
-    const blogIdx = vercelConfig.redirects.findIndex((r) => r.source === '/blog/:match*' && r.has);
+    const blogIdx = vercelConfig.redirects.findIndex((r) => r.source === '/blog/:match(.*)' && r.has);
     const slashIdx = vercelConfig.redirects.findIndex((r) => r.source === '/countries' && !r.has);
-    assert.ok(blogIdx >= 0, 'missing /blog/:match* host 308');
+    assert.ok(blogIdx >= 0, 'missing /blog/:match(.*) host 308');
     assert.ok(slashIdx >= 0, 'missing /countries trailing-slash redirect');
     assert.ok(blogIdx < slashIdx, 'host 308s must run before same-host slash normalization');
   });
@@ -4342,8 +5355,14 @@ describe('variant-host canonicalization (#6833–#6836)', () => {
     for (const path of ['/pro', '/api/', '/tests/']) {
       assert.match(body, new RegExp(`^Disallow: ${path.replace('/', '\\/')}$`, 'm'), `variant robots must Disallow ${path}`);
     }
-    assert.match(body, /^Allow: \/dashboard$/m);
-    assert.doesNotMatch(body, /^Disallow: \/dashboard$/m);
+    // End-anchored since #7660. Unanchored, `/dashboard` is 10 characters and
+    // out-ranks the 8-9 character `/*?*lat=`, `/*?*lon=`, `/*?*zoom=`,
+    // `/*?*ref=` and `/*?*utm_` rules, so any map URL omitting `layers` slipped
+    // straight through on the one path that generates the space. `$` keeps the
+    // bare document explicitly crawlable without covering its query forms.
+    assert.match(body, /^Allow: \/dashboard\$$/m);
+    assert.doesNotMatch(body, /^Allow: \/dashboard$/m);
+    assert.doesNotMatch(body, /^Disallow: \/dashboard\$?$/m);
     assert.match(body, /^Sitemap: https:\/\/www\.worldmonitor\.app\/sitemap\.xml$/m);
   });
 
@@ -4368,9 +5387,15 @@ describe('variant-host canonicalization (#6833–#6836)', () => {
       firstRedirectFor({ host: 'tech.worldmonitor.app', path: '/reference/' })?.destination,
       '/reference/changelog/',
     );
+    // Bare `/reference` is normalised on the variant host first, then handed to
+    // www by the shared-content 308 — two hops, same destination.
     assert.equal(
       firstRedirectFor({ host: 'tech.worldmonitor.app', path: '/reference' })?.destination,
-      'https://www.worldmonitor.app/reference/:match*',
+      '/reference/changelog/',
+    );
+    assert.equal(
+      firstRedirectFor({ host: 'tech.worldmonitor.app', path: '/reference/changelog/' })?.destination,
+      'https://www.worldmonitor.app/reference/:match',
     );
   });
 
@@ -4381,42 +5406,17 @@ describe('variant-host canonicalization (#6833–#6836)', () => {
     const catchAllHeader = vercelConfig.headers.find((r) => r.source === SPA_HTML_CACHE_SOURCE);
     assert.ok(catchAllHeader, 'expected the pinned SPA cache-header rule');
     assert.equal(getCacheHeaderValue(SPA_HTML_CACHE_SOURCE), 'private, no-cache, must-revalidate');
-    // The enumerated SPA entry routes keep the no-cache policy.
-    for (const path of ['/dashboard', '/stocks', '/stocks/AAPL', '/story']) {
+    // Explicit /dashboard entry uses the stacked public HTML policy; other SPA
+    // pretty-URLs still inherit the catch-all private policy.
+    assertPublicHtmlEntryCache('/dashboard');
+    for (const path of ['/stocks', '/stocks/AAPL', '/story']) {
       assert.equal(effectiveCacheControl(path), 'private, no-cache, must-revalidate', path + ' must stay no-cache');
     }
   });
 
   it('variant and api robots keep AI-group rule parity with their own * group (#6835)', () => {
-    const parseGroups = (source) => {
-      const groups = [];
-      let current = null;
-      for (const raw of source.split('\n')) {
-        const line = raw.trim();
-        if (line === '') {
-          current = null;
-          continue;
-        }
-        if (line.startsWith('#')) continue;
-        const colon = line.indexOf(':');
-        if (colon === -1) continue;
-        const key = line.slice(0, colon).trim().toLowerCase();
-        const value = line.slice(colon + 1).trim();
-        if (key === 'user-agent') {
-          if (!current || current.rules.length > 0) {
-            current = { agents: [], rules: [] };
-            groups.push(current);
-          }
-          current.agents.push(value.toLowerCase());
-        } else if (current && (key === 'allow' || key === 'disallow')) {
-          current.rules.push(`${key}: ${value}`);
-        }
-      }
-      return groups;
-    };
-
     for (const file of ['robots.variant.txt', 'robots.api.txt']) {
-      const groups = parseGroups(readFileSync(resolve(__dirname, `../public/${file}`), 'utf-8'));
+      const groups = parseRobotsGroups(readFileSync(resolve(__dirname, `../public/${file}`), 'utf-8'));
       const star = groups.find((g) => g.agents.includes('*'));
       const ai = groups.find((g) => g.agents.includes('gptbot'));
       const training = groups.find((g) => g.agents.includes('ccbot'));
@@ -4452,5 +5452,51 @@ describe('variant-host canonicalization (#6833–#6836)', () => {
     assert.ok(SPA_HTML_CACHE_SOURCE.includes('|src|'), 'HTML cache catch-all must exclude /src');
     assert.ok(SPA_HTML_CACHE_SOURCE.includes('|tmp|'), 'HTML cache catch-all must exclude /tmp');
     assert.ok(SPA_HTML_CACHE_SOURCE.includes('|server|'), 'HTML cache catch-all must exclude /server');
+  });
+});
+
+describe('cold-load metric evidence reaches the CI artifact (#7837)', () => {
+  const mapBudgetE2eSource = readFileSync(
+    resolve(__dirname, '../e2e/map-overlay-marker-budget.spec.ts'),
+    'utf-8',
+  );
+
+  // The failure this pins is SILENT. `testInfo.attach({ body })` keeps the
+  // bytes in memory for a reporter to persist, and the `list` reporter this
+  // project runs persists nothing — so the spec passed while its cold-load
+  // metrics never reached the uploaded artifact (shard-1 of run 34144452921
+  // contained zero files for this spec). Nothing goes red when that regresses;
+  // the evidence simply stops existing, which is how #7837's own acceptance
+  // criteria became unanswerable.
+  it('attaches the cold-load metrics by path, never by body', () => {
+    assert.match(mapBudgetE2eSource, /testInfo\.outputPath\('cold-dashboard-metrics\.json'\)/);
+    assert.match(mapBudgetE2eSource, /await writeFile\(path, payload, 'utf8'\)/);
+    assert.match(
+      mapBudgetE2eSource,
+      /testInfo\.attach\('cold-dashboard-metrics\.json', \{ path, contentType: 'application\/json' \}\)/,
+    );
+    assert.doesNotMatch(
+      mapBudgetE2eSource,
+      /attach\('cold-dashboard-metrics\.json', \{[\s\S]{0,80}?body:/,
+      'a body attachment is dropped by the list reporter and never reaches test-results/',
+    );
+    // A path attachment only survives a PASSING test because output is kept.
+    assert.match(playwrightConfigSource, /preserveOutput:\s*'always'/);
+    // ...and test-results/ is what the smoke job uploads.
+    assert.match(testWorkflowSource, /path: test-results\//);
+  });
+
+  // #7867 gives the first-paint sample its own CI-derived budget. The settled
+  // diagnostic remains optional because hydration readiness is incomplete on CI.
+  it('asserts the first-paint budgets against the first-paint sample only', () => {
+    assert.match(
+      mapBudgetE2eSource,
+      /assertDashboardMetricBudgets\(samples\.map\(\(sample\) => sample\.firstPaint\.postGc\), FIRST_PAINT_METRIC_BUDGETS\)/,
+    );
+    assert.doesNotMatch(
+      mapBudgetE2eSource,
+      /assertDashboardMetricBudgets\(samples\.map\(\(sample\) => sample\.quiescence/,
+      'the settled sample is recorded, never asserted (#7837)',
+    );
   });
 });

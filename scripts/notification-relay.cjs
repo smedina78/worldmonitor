@@ -24,7 +24,7 @@ const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN ?? '';
 const CONVEX_URL = process.env.CONVEX_URL ?? '';
 // Convex HTTP actions are hosted at *.convex.site (not *.convex.cloud)
 const CONVEX_SITE_URL = process.env.CONVEX_SITE_URL ?? CONVEX_URL.replace('.convex.cloud', '.convex.site');
-const RELAY_SECRET = process.env.RELAY_SHARED_SECRET ?? '';
+const RELAY_SECRET = process.env.CONVEX_NOTIFICATION_RELAY_SECRET ?? '';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? '';
 const RESEND_API_KEY = process.env.RESEND_API_KEY ?? '';
 const RESEND_FROM = process.env.RESEND_FROM_EMAIL ?? 'WorldMonitor <alerts@worldmonitor.app>';
@@ -40,7 +40,7 @@ const WELCOME_V2_POLL_EVERY = 10;
 
 if (!UPSTASH_URL || !UPSTASH_TOKEN) { console.error('[relay] UPSTASH_REDIS_REST_URL/TOKEN not set'); process.exit(1); }
 if (!CONVEX_URL) { console.error('[relay] CONVEX_URL not set'); process.exit(1); }
-if (!RELAY_SECRET) { console.error('[relay] RELAY_SHARED_SECRET not set'); process.exit(1); }
+if (!RELAY_SECRET) { console.error('[relay] CONVEX_NOTIFICATION_RELAY_SECRET not set'); process.exit(1); }
 
 const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
 
@@ -259,7 +259,10 @@ async function drainHeldForUser(userId, variant, allowedChannelTypes) {
   }
 
   const verifiedChannels = channels.filter(c =>
-    c.verified && (allowedChannelTypes == null || allowedChannelTypes.includes(c.channelType)),
+    c.verified &&
+    (c.channelType !== 'email' || c.emailOwnership === 'verified_account') &&
+    (c.channelType !== 'telegram' || c.telegramOwnership === 'verified_callback') &&
+    (allowedChannelTypes == null || allowedChannelTypes.includes(c.channelType)),
   );
   let anyDelivered = false;
   for (const ch of verifiedChannels) {
@@ -949,7 +952,7 @@ async function processWelcome(event) {
 
   const ch = channels.find(c =>
     c.channelType === channelType &&
-    c.verified &&
+    c.verified && (c.channelType !== 'email' || c.emailOwnership === 'verified_account') &&
     // Events created before connection-scoped welcome IDs remain compatible.
     // New events must still target the exact channel document that scheduled
     // them, so a delayed retry cannot welcome a replacement connection.
@@ -1251,7 +1254,11 @@ async function processEvent(event) {
       channels = [];
     }
 
-    const verifiedChannels = channels.filter(c => c.verified && rule.channels.includes(c.channelType));
+    const verifiedChannels = channels.filter(c =>
+      c.verified &&
+      (c.channelType !== 'email' || c.emailOwnership === 'verified_account') &&
+      (c.channelType !== 'telegram' || c.telegramOwnership === 'verified_callback') &&
+      rule.channels.includes(c.channelType));
     if (verifiedChannels.length === 0) continue;
 
     let deliveryText = text;
@@ -1366,6 +1373,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  processEvent,
   sendTelegram,
   checkDedup,
   upstashDedupSetNx,

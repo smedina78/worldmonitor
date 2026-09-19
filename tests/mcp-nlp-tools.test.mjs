@@ -12,6 +12,7 @@ import {
   makeProDeps,
   proReq,
 } from './helpers/mcp-pro-deps.mjs';
+import { documentedOutputSchema } from './helpers/mcp-output-schema.mjs';
 
 const originalFetch = globalThis.fetch;
 const originalEnv = { ...process.env };
@@ -172,7 +173,12 @@ describe('#5697 NLP MCP tools', () => {
     return { response, body, result, pipe };
   }
 
-  async function withDigestCategories(categories, run, feedStatuses = { fixture: 'empty' }) {
+  async function withDigestCategories(
+    categories,
+    run,
+    feedStatuses = { fixture: 'empty' },
+    coverage = undefined,
+  ) {
     const previousFetch = globalThis.fetch;
     globalThis.fetch = async (input, init = {}) => {
       const url = String(input);
@@ -182,6 +188,7 @@ describe('#5697 NLP MCP tools', () => {
           generatedAt: '2026-07-28T12:00:00.000Z',
           feedStatuses,
           categories,
+          ...(coverage ? { coverage } : {}),
         });
       }
       return previousFetch(input, init);
@@ -238,7 +245,7 @@ describe('#5697 NLP MCP tools', () => {
       byName.get('get_news_clusters')?.inputSchema.properties.category.enum?.includes('accelerators'),
       'get_news_clusters category enum must include Tech-only buckets',
     );
-    const clusterSchema = byName.get('get_news_clusters')?.outputSchema.properties.clusters.items;
+    const clusterSchema = documentedOutputSchema(byName.get('get_news_clusters')).properties.clusters.items;
     assert.ok(clusterSchema.required.includes('primarySourceProvenance'));
     assert.ok(clusterSchema.required.includes('sourceProvenance'));
     assert.ok(clusterSchema.required.includes('credibilityScore'));
@@ -248,8 +255,39 @@ describe('#5697 NLP MCP tools', () => {
     assert.equal(clusterSchema.properties.sourceProvenance.items.properties.source.type, 'string');
     assert.equal(clusterSchema.properties.sourceProvenance.items.properties.risk.type, 'string');
     assert.equal(clusterSchema.properties.sourceProvenance.items.properties.stateAffiliated.type, 'string');
+    const digestCoverageFields = [
+      'state',
+      'servedItems',
+      'servedPublishers',
+      'feedsCompleted',
+      'feedsTotal',
+      'categoriesCompleted',
+      'categoriesTotal',
+      'missingCategories',
+      'stale',
+      'staleAgeSeconds',
+      'staleReason',
+    ];
+    for (const toolName of ['extract_entities', 'get_news_clusters']) {
+      const coverageSchema = documentedOutputSchema(byName.get(toolName)).properties.digestCoverage;
+      assert.equal(coverageSchema?.type, 'object', `${toolName} must advertise digestCoverage`);
+      assert.equal(coverageSchema?.additionalProperties, false);
+      assert.deepEqual(coverageSchema?.required, digestCoverageFields);
+      assert.deepEqual(
+        coverageSchema?.properties.state.enum,
+        ['complete', 'partial', 'stale', 'unavailable'],
+      );
+      assert.equal(coverageSchema?.properties.servedItems.type, 'integer');
+      assert.equal(coverageSchema?.properties.servedPublishers.type, 'integer');
+      assert.equal(coverageSchema?.properties.missingCategories.items.type, 'string');
+      assert.equal(coverageSchema?.properties.stale.type, 'boolean');
+      // #7084: the stale flag alone says the evidence is old without saying
+      // HOW old — the declared schema must carry the age and reason too.
+      assert.equal(coverageSchema?.properties.staleAgeSeconds.type, 'integer');
+      assert.equal(coverageSchema?.properties.staleReason.type, 'string');
+    }
     assert.equal(byName.get('get_keyword_spikes')?.inputSchema.properties.window_hours.maximum, 12);
-    const classifyOutput = byName.get('classify_event')?.outputSchema;
+    const classifyOutput = documentedOutputSchema(byName.get('classify_event'));
     assert.deepEqual(classifyOutput.properties.classification.required,
       ['category', 'level', 'severity', 'confidence']);
     assert.deepEqual(classifyOutput.properties.classification.properties.category.enum,
@@ -259,7 +297,7 @@ describe('#5697 NLP MCP tools', () => {
       ['critical', 'high', 'medium', 'low', 'info']);
     assert.deepEqual(classifyOutput.properties.classification.properties.severity.enum,
       ['SEVERITY_LEVEL_HIGH', 'SEVERITY_LEVEL_MEDIUM', 'SEVERITY_LEVEL_LOW']);
-    const spikeOutput = byName.get('get_keyword_spikes')?.outputSchema;
+    const spikeOutput = documentedOutputSchema(byName.get('get_keyword_spikes'));
     assert.ok(
       spikeOutput.required.includes('sample_truncated'),
       'sample_truncated must be required on every get_keyword_spikes response',
@@ -292,6 +330,163 @@ describe('#5697 NLP MCP tools', () => {
       listedSpike?.description ?? '',
       /title, source, link/,
       'tools/list compressed description must still name the sample shape',
+    );
+  });
+
+  it('projects complete digest coverage through both digest-backed tools', async () => {
+    const coverage = {
+      state: 'complete',
+      itemsServed: 3,
+      publisherCount: 3,
+      feedCompleted: 3,
+      feedTotal: 3,
+      categoryCompleted: 2,
+      categoryTotal: 2,
+      categoryStates: { politics: 'ok', tech: 'ok' },
+    };
+    const expected = {
+      state: 'complete',
+      servedItems: 3,
+      servedPublishers: 3,
+      feedsCompleted: 3,
+      feedsTotal: 3,
+      categoriesCompleted: 2,
+      categoriesTotal: 2,
+      missingCategories: [],
+      stale: false,
+      staleAgeSeconds: 0,
+      staleReason: '',
+    };
+
+    await withDigestCategories(
+      digestResponse.categories,
+      async () => {
+        for (const toolName of ['extract_entities', 'get_news_clusters']) {
+          const { body, result } = await callTool(toolName, {});
+          assert.equal(body.error, undefined, `${toolName} must return a normal tool result`);
+          assert.deepEqual(result.digestCoverage, expected);
+        }
+      },
+      digestResponse.feedStatuses,
+      coverage,
+    );
+  });
+
+  it('projects a stale replay with its age and reason -- a bare flag hides how old the evidence is', async () => {
+    // #7084: a stale digest replay is legitimate evidence, but 90 seconds
+    // and 6 hours warrant different conclusions. The tools must pass the
+    // server's age and reason through, not just the boolean.
+    const coverage = {
+      state: 'stale',
+      itemsServed: 3,
+      publisherCount: 3,
+      feedCompleted: 3,
+      feedTotal: 3,
+      categoryCompleted: 2,
+      categoryTotal: 2,
+      categoryStates: { politics: 'ok', tech: 'ok' },
+      servedStale: true,
+      staleAgeSeconds: 5400,
+      staleReason: 'build-error',
+    };
+    const expected = {
+      state: 'stale',
+      servedItems: 3,
+      servedPublishers: 3,
+      feedsCompleted: 3,
+      feedsTotal: 3,
+      categoriesCompleted: 2,
+      categoriesTotal: 2,
+      missingCategories: [],
+      stale: true,
+      staleAgeSeconds: 5400,
+      staleReason: 'build-error',
+    };
+
+    await withDigestCategories(
+      digestResponse.categories,
+      async () => {
+        for (const toolName of ['extract_entities', 'get_news_clusters']) {
+          const { body, result } = await callTool(toolName, {});
+          assert.equal(body.error, undefined, `${toolName} must return a normal tool result`);
+          assert.deepEqual(result.digestCoverage, expected);
+        }
+      },
+      digestResponse.feedStatuses,
+      coverage,
+    );
+  });
+
+  it('returns explicit unavailable coverage as a normal empty result for both tools', async () => {
+    const coverage = {
+      state: 'unavailable',
+      itemsServed: 0,
+      publisherCount: 0,
+      feedCompleted: 0,
+      feedTotal: 4,
+      categoryCompleted: 0,
+      categoryTotal: 1,
+      categoryStates: { accelerators: 'missing' },
+    };
+    const expected = {
+      state: 'unavailable',
+      servedItems: 0,
+      servedPublishers: 0,
+      feedsCompleted: 0,
+      feedsTotal: 4,
+      categoriesCompleted: 0,
+      categoriesTotal: 1,
+      missingCategories: ['accelerators'],
+      stale: false,
+      staleAgeSeconds: 0,
+      staleReason: '',
+    };
+
+    await withDigestCategories(
+      {},
+      async () => {
+        const entities = await callTool('extract_entities', {
+          variant: 'tech',
+          category: 'accelerators',
+        });
+        assert.equal(entities.body.error, undefined);
+        assert.equal(entities.result.mode, 'headlines');
+        assert.equal(entities.result.headlineCount, 0);
+        assert.deepEqual(entities.result.entities, []);
+        assert.deepEqual(entities.result.patternEntities, []);
+        assert.equal(entities.result.note, undefined);
+        assert.deepEqual(entities.result.digestCoverage, expected);
+
+        const clusters = await callTool('get_news_clusters', {
+          variant: 'tech',
+          category: 'accelerators',
+        });
+        assert.equal(clusters.body.error, undefined);
+        assert.equal(clusters.result.headlineCount, 0);
+        assert.equal(clusters.result.totalClusters, 0);
+        assert.deepEqual(clusters.result.clusters, []);
+        assert.equal(clusters.result.note, undefined);
+        assert.deepEqual(clusters.result.digestCoverage, expected);
+      },
+      {},
+      coverage,
+    );
+  });
+
+  it('keeps empty malformed coverage on the retryable source-outage path', async () => {
+    await withDigestCategories(
+      {},
+      async () => {
+        for (const toolName of ['extract_entities', 'get_news_clusters']) {
+          const { body, result } = await callTool(toolName, { variant: 'tech' });
+          assert.equal(result, null);
+          assert.equal(body.error?.code, -32003);
+          assert.equal(body.error?.data?.retryable, true);
+          assert.deepEqual(body.error?.data?.unavailable_inputs, ['news:digest:v1:tech:en']);
+        }
+      },
+      {},
+      { state: 'unknown' },
     );
   });
 

@@ -45,6 +45,14 @@ export class BillingDenialError extends Error {
   }
 }
 
+// Preserve transport backoff without exposing the downstream response body.
+export class ToolBackoffError extends Error {
+  constructor(readonly status: 429 | 503, readonly retryAfter: string | null, label: string) {
+    super(`${label} HTTP ${status}`);
+    this.name = 'ToolBackoffError';
+  }
+}
+
 // Structural subset of Response so test doubles that stub only {ok, status}
 // (several suites do) pass through the non-billing path instead of throwing
 // on a missing headers object. `body` / `text` are optional so those doubles
@@ -68,7 +76,7 @@ export type RpcValidationViolation = {
 // (larger or hostile bodies still truncate and never leak raw content); the
 // surviving projection stays capped independently by MAX_VALIDATION_VIOLATIONS
 // and the per-field length limits below.
-const MAX_VALIDATION_BODY_BYTES = 16384;
+export const MAX_VALIDATION_BODY_BYTES = 16384;
 const MAX_VALIDATION_VIOLATIONS = 8;
 const MAX_VIOLATION_FIELD_LEN = 64;
 const MAX_VIOLATION_DESCRIPTION_LEN = 200;
@@ -126,26 +134,17 @@ function sanitizeViolationDescription(value: unknown): string | null {
 }
 
 /**
- * Extract proto/sebuf `ValidationError.violations` from a sibling 400 body.
- * Only `{field, description}` pairs survive, each length-bounded and
- * character-restricted. Malformed JSON, HTML, oversized leftovers, unknown
- * keys, and credential-like text are dropped — never copied into the error.
+ * Project an already-parsed sibling 400 body down to its safe proto/sebuf
+ * `ValidationError.violations`. Only `{field, description}` pairs survive,
+ * each length-bounded and character-restricted. Unknown keys, non-string
+ * values, and credential-like text are dropped — never copied into the error.
+ *
+ * Kept separate from the reading helper so every caller that has already
+ * consumed the body (a sibling classifier can only read it once) projects it
+ * through this exact function rather than reimplementing the sanitizing —
+ * that divergence is what let the observed-downstream path drop violations.
  */
-export async function extractSafeRpcViolations(
-  response: ToolFetchResponse,
-): Promise<readonly RpcValidationViolation[]> {
-  const type = (response.headers?.get('Content-Type') ?? '').toLowerCase();
-  if (type.includes('html')) return [];
-
-  const detail = await readBoundedResponseText(response, MAX_VALIDATION_BODY_BYTES);
-  if (!detail) return [];
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(detail);
-  } catch {
-    return [];
-  }
+export function parseSafeRpcViolations(parsed: unknown): readonly RpcValidationViolation[] {
   if (!parsed || typeof parsed !== 'object' || !('violations' in parsed)) return [];
   const raw = (parsed as { violations: unknown }).violations;
   if (!Array.isArray(raw)) return [];
@@ -164,18 +163,61 @@ export async function extractSafeRpcViolations(
 }
 
 /**
+ * Extract proto/sebuf `ValidationError.violations` from a sibling 400 body.
+ * Malformed JSON, HTML, and oversized leftovers are dropped; whatever parses
+ * is projected through {@link parseSafeRpcViolations}.
+ */
+export async function extractSafeRpcViolations(
+  response: ToolFetchResponse,
+): Promise<readonly RpcValidationViolation[]> {
+  const type = (response.headers?.get('Content-Type') ?? '').toLowerCase();
+  if (type.includes('html')) return [];
+
+  const detail = await readBoundedResponseText(response, MAX_VALIDATION_BODY_BYTES);
+  if (!detail) return [];
+
+  try {
+    return parseSafeRpcViolations(JSON.parse(detail));
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Standard non-ok handling for tool `_execute` gateway fetches: billing
  * denials become typed errors dispatch can re-emit faithfully; proto 400
- * bodies with safe field violations become RpcValidationError; everything
+ * bodies with safe field violations become RpcValidationError. With
+ * preserveBackoff, 429/503 retain transport backoff through ToolBackoffError; everything
  * else keeps the existing `<label> HTTP <status>` Error contract.
  *
+ * HTTP 401 bodies preserve only confirmed internal-signature rejection codes.
  * HTTP 400 response bodies are consumed only to classify violations. Callers
  * must await this helper — a forgotten await would let execution continue
  * and treat the 400 as success.
  */
-export async function assertToolFetchOk(response: ToolFetchResponse, label: string): Promise<void> {
+export async function assertToolFetchOk(
+  response: ToolFetchResponse,
+  label: string,
+  { preserveBackoff = false }: { preserveBackoff?: boolean } = {},
+): Promise<void> {
   if (response.ok) return;
   throwIfBillingDenial(response, label);
+  if (response.status === 401) {
+    const detail = await readBoundedResponseText(response, 4096);
+    let signatureRejected = false;
+    try {
+      const body = JSON.parse(detail) as { error?: unknown; code?: unknown } | null;
+      signatureRejected = (body?.code ?? body?.error) === 'invalid_internal_mcp_signature';
+    } catch {
+      // Unknown or malformed bodies retain the generic status-only error.
+    }
+    if (signatureRejected) {
+      throw new Error(`${label} HTTP 401: invalid_internal_mcp_signature`);
+    }
+  }
+  if (preserveBackoff && (response.status === 429 || response.status === 503)) {
+    throw new ToolBackoffError(response.status, response.headers?.get('Retry-After') ?? null, label);
+  }
   if (response.status === 400) {
     const violations = await extractSafeRpcViolations(response);
     if (violations.length > 0) {

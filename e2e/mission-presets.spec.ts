@@ -3,6 +3,9 @@ import { expect, test, type Page } from '@playwright/test';
 const PRESET_KEY = 'worldmonitor-mission-preset-v1';
 const STORAGE_READ_TIMEOUT_MS = 1_500;
 const STORAGE_READ_TIMEOUT = '__wm_storage_read_timeout__';
+const ACTIVE_VARIANT = process.env.VITE_VARIANT || 'full';
+const MISSION_CARD_COUNT = ACTIVE_VARIANT === 'finance' ? 9 : 8;
+const DEFAULT_TRADE_ROUTES = ACTIVE_VARIANT === 'finance' || ACTIVE_VARIANT === 'energy' || ACTIVE_VARIANT === 'commodity';
 
 async function installLocalOnlyNetwork(page: Page): Promise<void> {
   await page.route(/^https?:\/\/(?!(127\.0\.0\.1:4173|localhost:4173)(?:\/|$)).*/i, (route) => {
@@ -38,14 +41,15 @@ async function readJsonLocalStorage<T>(page: Page, key: string): Promise<T | nul
   return value ? JSON.parse(value) as T : null;
 }
 
-async function seedFreshFullVariant(page: Page): Promise<void> {
-  await page.addInitScript(() => {
+async function seedFreshVariant(page: Page): Promise<void> {
+  const variant = process.env.VITE_VARIANT || 'full';
+  await page.addInitScript((selectedVariant) => {
     if (sessionStorage.getItem('__mission_presets_e2e_init__')) return;
     localStorage.clear();
     sessionStorage.clear();
-    localStorage.setItem('worldmonitor-variant', 'full');
+    localStorage.setItem('worldmonitor-variant', selectedVariant);
     sessionStorage.setItem('__mission_presets_e2e_init__', '1');
-  });
+  }, variant);
 }
 
 async function openMissionPopover(page: Page): Promise<void> {
@@ -65,7 +69,7 @@ async function waitForEventHandlers(page: Page): Promise<void> {
 
 async function setupMissionPage(page: Page, viewport: { width: number; height: number }): Promise<void> {
   await page.setViewportSize(viewport);
-  await seedFreshFullVariant(page);
+  await seedFreshVariant(page);
   await installLocalOnlyNetwork(page);
 
   await page.goto('/', { waitUntil: 'domcontentloaded' });
@@ -86,6 +90,19 @@ async function applyMission(page: Page, missionId: string, label: string): Promi
   await expect(page.locator('#missionPresetBtn')).toContainText(label);
 }
 
+async function expectFreeMissionPanelLimit(page: Page): Promise<void> {
+  const settings = await readJsonLocalStorage<Record<string, { enabled: boolean }>>(page, 'worldmonitor-panels');
+  expect(settings).not.toBeNull();
+  const counted = Object.entries(settings!).filter(([key, config]) =>
+    config.enabled && key !== 'map' && !key.startsWith('cw-'));
+  expect(counted.length).toBeLessThanOrEqual(40);
+  expect(settings!.map?.enabled).toBe(true);
+  const disabledKeys = Object.entries(settings!).filter(([, config]) => !config.enabled).map(([key]) => key);
+  await expect.poll(() => page.locator('.panel[data-panel]:visible').evaluateAll((panels, disabled) =>
+    panels.filter((panel) => disabled.includes(panel.getAttribute('data-panel') ?? '')).length,
+  disabledKeys)).toBe(0);
+}
+
 test.describe('mission presets', () => {
   test('desktop first-run mission can apply and persist across reload', async ({ page }) => {
     test.setTimeout(150_000);
@@ -94,7 +111,12 @@ test.describe('mission presets', () => {
     await expect(page.locator('#missionPresetBtn')).toBeVisible({ timeout: 30_000 });
     await openMissionPopover(page);
 
-    await expect(page.locator('.mission-preset-card')).toHaveCount(7);
+    await expect(page.locator('.mission-preset-card')).toHaveCount(MISSION_CARD_COUNT);
+    if (ACTIVE_VARIANT === 'finance') {
+      await expect(page.locator('[data-mission-id="nq-day-trader"]')).toContainText('NQ Day Trader');
+    } else {
+      await expect(page.locator('[data-mission-id="nq-day-trader"]')).toHaveCount(0);
+    }
     await applyMission(page, 'supply-chain-risk', 'Supply');
 
     await expect(page.locator('.panel[data-panel="supply-chain"]:not(.hidden)')).toBeVisible({ timeout: 30_000 });
@@ -118,7 +140,7 @@ test.describe('mission presets', () => {
       .toBe(true);
   });
 
-  test('desktop mission can apply and reset to default state', async ({ page }) => {
+  test('desktop mission can apply and reset to default state', async ({ page }, testInfo) => {
     test.setTimeout(150_000);
     await setupMissionPage(page, { width: 1440, height: 900 });
 
@@ -138,15 +160,17 @@ test.describe('mission presets', () => {
     await expect.poll(() => readLocalStorage(page, PRESET_KEY)).toBeNull();
     await expect(page.locator('#missionPresetBtn')).toContainText('Mission');
     await expect(page.locator('#regionSelect')).toHaveValue('global');
+    await expectFreeMissionPanelLimit(page);
     await expect
       .poll(() => readJsonLocalStorage<string[]>(page, 'panel-order').then((order) => order?.[0]))
       .toBe('live-news');
     await expect
-      .poll(() => readJsonLocalStorage<Record<string, boolean>>(page, 'worldmonitor-layers').then((layers) => layers?.tradeRoutes))
-      .toBe(false);
+      .poll(() => readJsonLocalStorage<Record<string, boolean>>(page, 'worldmonitor-layers').then((layers) => layers?.tradeRoutes ?? false))
+      .toBe(DEFAULT_TRADE_ROUTES);
+    await page.screenshot({ path: testInfo.outputPath('desktop-mission-reset-capped.png') });
   });
 
-  test('mobile mission picker stays in viewport and applies from the mobile menu', async ({ page }) => {
+  test('mobile mission picker stays in viewport and applies from the mobile menu', async ({ page }, testInfo) => {
     await setupMissionPage(page, { width: 390, height: 844 });
     const moreTab = page.locator('[data-mobile-tab="more"]');
     await expect(moreTab).toBeVisible({ timeout: 30_000 });
@@ -165,7 +189,7 @@ test.describe('mission presets', () => {
 
     const popover = page.locator('.mission-preset-popover');
     await expect(popover).toBeVisible();
-    await expect(page.locator('.mission-preset-card')).toHaveCount(7);
+    await expect(page.locator('.mission-preset-card')).toHaveCount(MISSION_CARD_COUNT);
     const box = await popover.boundingBox();
     expect(box).not.toBeNull();
     expect(box!.x).toBeGreaterThanOrEqual(0);
@@ -186,5 +210,11 @@ test.describe('mission presets', () => {
     await page.locator('#mobileMenuMission').click();
     await page.locator('[data-mission-reset]').click();
     await expect.poll(() => readLocalStorage(page, PRESET_KEY)).toBeNull();
+    await expectFreeMissionPanelLimit(page);
+    await page.waitForFunction(() => {
+      const menu = document.getElementById('mobileMenu');
+      return !menu || menu.getBoundingClientRect().right <= 0;
+    });
+    await page.screenshot({ path: testInfo.outputPath('mobile-mission-reset-capped.png') });
   });
 });

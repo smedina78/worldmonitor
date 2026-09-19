@@ -9,8 +9,8 @@
  * code for one domain per function, cutting cold-start cost by ~20×.
  */
 
-import { createRouter, type RouteDescriptor } from './router';
-import { getCorsHeaders, isDisallowedOrigin, isAllowedOrigin } from './cors';
+import { createRouter, toHeadResponse, type RouteDescriptor } from './router';
+import { getCorsHeaders, getOriginDeniedCorsHeaders, isDisallowedOrigin, isAllowedOrigin } from './cors';
 import { isPublicSharedRpcRequest } from '../src/shared/public-rpc-cache';
 import { PRO_FRESH_CACHE_RPC_PATHS } from '../src/shared/pro-fresh-rpc';
 // @ts-expect-error — JS module, no declaration file
@@ -31,16 +31,30 @@ import {
   drainRetryableResponse,
   drainSuccessStatusOverride,
 } from './_shared/response-headers';
-import { projectJsonResponse } from './_shared/response-projection';
+import {
+  appendDeprecationPolicyLink,
+  appendDeprecationPolicyLinkToRecord,
+  DEPRECATION_POLICY_LINK,
+} from './_shared/deprecation-policy';
+import {
+  REST_ATTRIBUTION_EXPRESSIONS,
+  buildAttributionRider,
+  mergeAttributionRider,
+} from '../shared/attribution-rider';
+import {
+  enforceRestProjectionOutputLimit,
+  projectJsonResponse,
+} from './_shared/response-projection';
 import { getRpcNoStoreReasonFromJson } from './_shared/cache-contract';
 import {
   checkEntitlementDetailed,
   getBillingVerificationDenial,
   getRequiredTier,
   getEntitlements,
-  isEntitlementBackendConfigured,
   type CachedEntitlements,
 } from './_shared/entitlement-check';
+import { EMBED_KEY_RPC_PATHS } from '../shared/embed-panels';
+import { hasEmbedAccess } from '../shared/embed-access';
 import { checkProMcpAccess } from './_shared/pro-mcp-gate';
 import { resolveClerkSession } from './_shared/auth-session';
 import {
@@ -52,7 +66,8 @@ import {
   INTERNAL_MCP_REPLAY_CACHE_TTL_SECONDS,
   getInternalMcpVerifiedNonce,
   sha256Hex,
-  verifyInternalMcpRequest,
+  verifyInternalMcpRequestDetailed,
+  type InternalMcpVerifyFailure,
 } from './_shared/mcp-internal-hmac';
 import { buildUsageIdentity, hashKeySync, type UsageIdentityInput } from './_shared/usage-identity';
 import { runRedisPipeline } from './_shared/redis';
@@ -130,6 +145,44 @@ const MAX_INTERNAL_MCP_BODY = 256 * 1024;
 
 type InternalMcpReplayClaim = 'fresh' | 'replay' | 'unavailable';
 
+/**
+ * The ONE response every internal-MCP signature rejection returns.
+ *
+ * Routed through a single constructor on purpose: the security property is
+ * that a caller cannot tell a stale timestamp from a forged signature from a
+ * spent nonce, and that property is only as strong as the guarantee that no
+ * branch builds its own subtly different reply. Add a new rejection mode and
+ * it returns this too — status, body and headers, identical.
+ */
+function internalMcpSignatureDenial(corsHeaders: Record<string, string>): Response {
+  return new Response(
+    JSON.stringify({ error: 'invalid_internal_mcp_signature' }),
+    { status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
+  );
+}
+
+/**
+ * Server-side telemetry label for a verification failure. This is the half of
+ * the rejection that IS allowed to differ — it goes to wm_api_usage, never to
+ * the caller.
+ */
+function internalMcpReasonFor(failure: InternalMcpVerifyFailure): RequestReason {
+  switch (failure) {
+    // Cannot normally happen here: the handler returns 500 CONFIGURATION
+    // before reaching the verifier when the secret is absent. Mapped to the
+    // existing config reason so a deploy incident never lands in an auth
+    // dashboard.
+    case 'no_secret': return 'hmac_secret_unconfigured';
+    case 'no_user_id': return 'internal_mcp_no_user';
+    case 'missing_signature':
+    case 'malformed_signature': return 'internal_mcp_malformed_sig';
+    case 'invalid_nonce': return 'internal_mcp_bad_nonce';
+    case 'timestamp_window': return 'internal_mcp_ts_window';
+    case 'malformed_request': return 'internal_mcp_bad_request';
+    case 'signature_mismatch': return 'internal_mcp_sig_mismatch';
+  }
+}
+
 function getRateLimitTelemetryReason(
   response: Response,
   rejectedReason: RequestReason,
@@ -206,7 +259,8 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   '/api/market/v1/list-ai-tokens': 'slow',
   '/api/market/v1/list-other-tokens': 'slow',
   '/api/market/v1/list-commodity-quotes': 'medium',
-  '/api/market/v1/get-physical-premiums': 'daily',
+  '/api/market/v1/get-physical-premiums': 'no-store',
+  '/api/market/v1/get-physical-divergence-index': 'no-store',
   '/api/market/v1/list-stablecoin-markets': 'medium',
   '/api/market/v1/get-sector-summary': 'medium',
   '/api/market/v1/get-fear-greed-index': 'slow',
@@ -312,6 +366,14 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   '/api/market/v1/list-etf-flows': 'slow',
   '/api/research/v1/list-hackernews-items': 'slow',
   '/api/intelligence/v1/get-country-risk': 'slow',
+  // get-country-coverage is premium-gated via PREMIUM_RPC_PATHS, so the gateway
+  // short-circuits to 'slow-browser' before consulting this map — same as
+  // get-regional-snapshot below. This entry exists to satisfy the parity
+  // contract in tests/route-cache-tier.test.mjs and to record the intended tier
+  // if the endpoint ever stops being premium: `medium` rather than the sibling
+  // `slow`, because the response can carry degraded=true and an hour of shared
+  // edge cache would pin a transient upstream failure long after it healed.
+  '/api/intelligence/v1/get-country-coverage': 'medium',
   '/api/intelligence/v1/get-risk-scores': 'slow',
   '/api/intelligence/v1/get-pizzint-status': 'slow',
   '/api/intelligence/v1/classify-event': 'static',
@@ -329,6 +391,7 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   '/api/supply-chain/v1/get-chokepoint-status': 'medium',
   '/api/supply-chain/v1/get-chokepoint-history': 'slow',
   '/api/news/v1/list-feed-digest': 'slow',
+  '/api/news/v1/list-country-headlines': 'fast',
   '/api/intelligence/v1/get-country-facts': 'daily',
   '/api/intelligence/v1/list-security-advisories': 'slow',
   '/api/intelligence/v1/list-satellites': 'static',
@@ -370,6 +433,7 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   '/api/economic/v1/get-china-macro-snapshot': 'slow',
   '/api/economic/v1/get-china-activity-nowcast': 'medium',
   '/api/intelligence/v1/list-market-implications': 'slow',
+  '/api/intelligence/v1/list-wsb-tickers': 'no-store',
   '/api/economic/v1/get-ecb-fx-rates': 'slow',
   '/api/economic/v1/get-eurostat-country-data': 'slow',
   '/api/economic/v1/get-eu-gas-storage': 'slow',
@@ -384,6 +448,11 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   '/api/supply-chain/v1/get-bypass-options': 'slow-browser',
   '/api/supply-chain/v1/get-country-cost-shock': 'slow-browser',
   '/api/supply-chain/v1/get-country-products': 'slow-browser',
+  // These responses differ by caller redistribution rights. The gateway cache
+  // key does not vary on session/API-key audience, so they must never be stored.
+  '/api/supply-chain/v1/get-country-vulnerabilities': 'no-store',
+  '/api/supply-chain/v1/get-chokepoint-dependencies': 'no-store',
+  '/api/supply-chain/v1/list-vulnerability-rankings': 'no-store',
   '/api/supply-chain/v1/get-multi-sector-cost-shock': 'slow-browser',
   '/api/supply-chain/v1/get-sector-dependency': 'slow-browser',
   '/api/supply-chain/v1/get-route-explorer-lane': 'slow-browser',
@@ -417,10 +486,14 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   // reads are POSTs and cache successful results inside their handlers.
   '/api/intelligence/v1/get-intel-timeline': 'slow',
   '/api/resilience/v1/get-resilience-score': 'slow',
+  '/api/resilience/v1/get-resilience-indicators': 'slow',
   '/api/resilience/v1/get-resilience-ranking': 'slow',
   '/api/resilience/v1/get-food-stocks': 'slow',
   '/api/resilience/v1/get-demographics-capability': 'slow',
   '/api/resilience/v1/get-runtime-manifest': 'no-store',
+  '/api/scorecard/v1/get-five-factor-scorecard': 'slow',
+  '/api/scorecard/v1/list-five-factor-scorecards': 'slow',
+  '/api/scorecard/v1/get-bloc-scorecard': 'slow',
 
   // Partner-facing shipping/v2. route-intelligence is premium-gated; gateway
   // short-circuits to slow-browser. Entry required by tests/route-cache-tier.test.mjs.
@@ -443,12 +516,8 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
 import { PREMIUM_RPC_PATHS } from '../src/shared/premium-paths';
 
 export const PUBLIC_NO_AUTH_RPC_PATHS = new Set<string>([
-  '/api/conflict/v1/list-acled-events',
-  '/api/natural/v1/list-natural-events',
   '/api/intelligence/v1/get-china-decision-signals',
   '/api/resilience/v1/get-runtime-manifest',
-  '/api/seismology/v1/list-earthquakes',
-  '/api/unrest/v1/list-unrest-events',
   // Lead-capture RPCs serve ANONYMOUS prospects by definition: the /pro
   // marketing page contact form and the waitlist/desktop signup both POST
   // without a wms_ session or API key (see pro-test/src/App.tsx onSubmit and
@@ -481,6 +550,10 @@ export const RELAY_WARM_PING_PATHS = new Set<string>([
   '/api/infrastructure/v1/list-temporal-anomalies',
   '/api/intelligence/v1/get-risk-scores',
   '/api/supply-chain/v1/get-chokepoint-status',
+  // Classify reads the same public digest a session holder can already trigger
+  // so self-host / Railway can send WORLDMONITOR_RELAY_KEY instead of an
+  // enterprise key (#7437).
+  '/api/news/v1/list-feed-digest',
 ]);
 
 /**
@@ -512,6 +585,113 @@ function isPostToGetCompatibleBodySize(headers: Headers): boolean {
 
   const contentLength = Number(rawContentLength);
   return Number.isSafeInteger(contentLength) && contentLength < POST_TO_GET_MAX_BODY_BYTES;
+}
+
+type PostToGetScalar = string | number | boolean;
+
+function isPostToGetScalar(value: unknown): value is PostToGetScalar {
+  return typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean';
+}
+
+function isPostToGetPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+type PostToGetCompatField =
+  | { kind: 'scalar'; name: string; value: string }
+  | { kind: 'array'; name: string; values: string[] };
+
+type PostToGetCompatParse =
+  | { status: 'ok'; fields: PostToGetCompatField[] }
+  | { status: 'too_large' }
+  | { status: 'malformed_json' }
+  | { status: 'unsupported_body' }
+  | { status: 'unsupported_value'; parameter: string }
+  | { status: 'oversized_array'; parameter: string };
+
+/**
+ * Decode a legacy POST body into GET query fields.
+ *
+ * Empty / whitespace-only bodies stay on the silent GET fallback for stale
+ * clients that POST with no payload. Any other body is all-or-nothing: a
+ * JSON object of scalars and scalar arrays becomes query parameters; mixed
+ * or nested values, non-object JSON, and malformed JSON return 400 without
+ * applying a partial translation. Compatibility-body errors are only
+ * returned when a GET handler exists for the path; unknown routes still
+ * 404/405. Body-read failures return 400. The 1 MB byte cap and
+ * 200-values-per-key cap from #3550 still bound expansion cost.
+ */
+function parsePostToGetCompatBody(bodyText: string): PostToGetCompatParse {
+  if (new TextEncoder().encode(bodyText).byteLength >= POST_TO_GET_MAX_BODY_BYTES) {
+    return { status: 'too_large' };
+  }
+  if (bodyText.trim().length === 0) {
+    return { status: 'ok', fields: [] };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bodyText);
+  } catch {
+    return { status: 'malformed_json' };
+  }
+
+  if (!isPostToGetPlainObject(parsed)) {
+    return { status: 'unsupported_body' };
+  }
+
+  const fields: PostToGetCompatField[] = [];
+  for (const [name, value] of Object.entries(parsed)) {
+    if (Array.isArray(value)) {
+      if (value.length > POST_TO_GET_MAX_ARRAY_VALUES_PER_KEY) {
+        return { status: 'oversized_array', parameter: name };
+      }
+      const values: string[] = [];
+      for (const item of value) {
+        if (!isPostToGetScalar(item)) {
+          return { status: 'unsupported_value', parameter: name };
+        }
+        values.push(String(item));
+      }
+      fields.push({ kind: 'array', name, values });
+      continue;
+    }
+    if (isPostToGetScalar(value)) {
+      fields.push({ kind: 'scalar', name, value: String(value) });
+      continue;
+    }
+    return { status: 'unsupported_value', parameter: name };
+  }
+  return { status: 'ok', fields };
+}
+
+function applyPostToGetCompatFields(searchParams: URLSearchParams, fields: PostToGetCompatField[]): void {
+  for (const field of fields) {
+    if (field.kind === 'scalar') {
+      searchParams.set(field.name, field.value);
+      continue;
+    }
+    for (const value of field.values) {
+      searchParams.append(field.name, value);
+    }
+  }
+}
+
+function postToGetCompatErrorBody(parsed: Exclude<PostToGetCompatParse, { status: 'ok' }>): Record<string, unknown> {
+  if (parsed.status === 'too_large') return { error: 'malformed_request' };
+  if (parsed.status === 'malformed_json') return { error: 'Invalid JSON body for POST compatibility' };
+  if (parsed.status === 'unsupported_body') return { error: 'Unsupported POST compatibility body' };
+  if (parsed.status === 'oversized_array') {
+    return {
+      error: 'Too many values for POST compatibility parameter',
+      parameter: parsed.parameter,
+      maxValues: POST_TO_GET_MAX_ARRAY_VALUES_PER_KEY,
+    };
+  }
+  return {
+    error: 'Unsupported value for POST compatibility parameter',
+    parameter: parsed.parameter,
+  };
 }
 
 function getRequiredBboxQueryProblems(searchParams: URLSearchParams): { missing: string[]; invalid: string[]; allZero: boolean } {
@@ -621,6 +801,7 @@ function createGatewayAuthErrorResponse(
       'Content-Type': 'application/json',
       'Cache-Control': 'no-store',
       ...corsHeaders,
+      Link: DEPRECATION_POLICY_LINK,
     },
   });
 }
@@ -635,9 +816,13 @@ const GATEWAY_DIRECT_LLM_QUOTA_METHODS: Record<string, string> = {
 
 const COUNTRY_INTEL_BRIEF_PATH = '/api/intelligence/v1/get-country-intel-brief';
 
+function methodForGetEquivalentPolicy(method: string): string {
+  return method === 'HEAD' ? 'GET' : method;
+}
+
 async function shouldReserveGatewayDirectLlmQuota(request: Request, pathname: string): Promise<boolean> {
   if (!DIRECT_LLM_GATEWAY_QUOTA_PATHS.has(pathname)) return false;
-  if (GATEWAY_DIRECT_LLM_QUOTA_METHODS[pathname] !== request.method) return false;
+  if (GATEWAY_DIRECT_LLM_QUOTA_METHODS[pathname] !== methodForGetEquivalentPolicy(request.method)) return false;
   if (pathname !== '/api/news/v1/summarize-article') return true;
 
   const contentLength = Number(request.headers.get('Content-Length') ?? '0');
@@ -746,7 +931,7 @@ export function createDomainGateway(
   assertProMcpGatewayHmacConfig();
   const router = createRouter(routes);
 
-  return async function handler(originalRequest: Request, ctx?: GatewayCtx): Promise<Response> {
+  async function dispatch(originalRequest: Request, ctx?: GatewayCtx): Promise<Response> {
     const originalPathname = new URL(originalRequest.url).pathname;
 
     // Vercel resolves versioned API paths such as
@@ -878,22 +1063,15 @@ export function createDomainGateway(
       })());
     }
 
-    // Origin check — skip CORS headers for disallowed origins
-    if (isDisallowedOrigin(request)) {
-      emitRequest(403, 'origin_403', null);
-      return new Response(JSON.stringify({ error: 'Origin not allowed' }), {
-        status: 403,
-        headers: { 'Content-Type': 'application/json' },
-      });
-    }
-
     // Fail closed on CORS-header generation errors. Previous behaviour fell
     // back to a wildcard ACAO, which converted the allowlist into wildcard
     // CORS on the error path. Now we omit CORS headers and surface a 500
     // so the browser blocks any cross-origin read. See issue #3705.
     let corsHeaders: Record<string, string>;
     try {
-      corsHeaders = getCorsHeaders(request);
+      corsHeaders = isDisallowedOrigin(request)
+        ? getOriginDeniedCorsHeaders(request)
+        : getCorsHeaders(request);
     } catch (err) {
       // Pass the Sentry delivery promise through ctx.waitUntil so the
       // Vercel Edge isolate survives long enough to actually flush the
@@ -916,10 +1094,31 @@ export function createDomainGateway(
       });
     }
 
-    // OPTIONS preflight
+    // RFC 9745 policy discovery on every CORS-bearing response, including
+    // 401/403/404/405 early returns. Idempotent if a handler already set
+    // rel="deprecation". Absolute URL: api.worldmonitor.app would 404 a
+    // root-relative /api-versioning.md.
+    appendDeprecationPolicyLinkToRecord(corsHeaders);
+
+    // OPTIONS preflight must succeed even for origins we refuse on the actual
+    // request — otherwise the browser never sends POST/GET and origin_403 is
+    // an opaque network error (#6411).
     if (request.method === 'OPTIONS') {
       emitRequest(204, 'preflight', null);
       return new Response(null, { status: 204, headers: corsHeaders });
+    }
+
+    // Origin check — refuse with readable CORS so the browser can surface the
+    // 403 instead of an opaque network error (#6411).
+    if (isDisallowedOrigin(request)) {
+      emitRequest(403, 'origin_403', null);
+      return new Response(JSON.stringify({ error: 'Origin not allowed' }), {
+        status: 403,
+        headers: {
+          'Content-Type': 'application/json',
+          ...corsHeaders,
+        },
+      });
     }
 
     // ----------------------------------------------------------------------
@@ -1026,7 +1225,10 @@ export function createDomainGateway(
         // CONFIGURATION so operators see it; legacy wm_ key path is
         // unaffected because we only enter this branch when the caller
         // explicitly tried to use the internal-MCP route.
-        emitRequest(500, 'auth_401', null);
+        // Telemetry must not use auth_401 here: that reason is for caller
+        // authentication failure, and a missing HMAC secret is a deploy
+        // configuration incident (#7277).
+        emitRequest(500, 'hmac_secret_unconfigured', null);
         return new Response(
           JSON.stringify({ error: 'CONFIGURATION', detail: 'MCP_INTERNAL_HMAC_SECRET not configured' }),
           { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
@@ -1057,11 +1259,8 @@ export function createDomainGateway(
         try {
           bodyBytes = await request.clone().arrayBuffer();
         } catch {
-          emitRequest(401, 'auth_401', null);
-          return new Response(
-            JSON.stringify({ error: 'invalid_internal_mcp_signature' }),
-            { status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-          );
+          emitRequest(401, 'internal_mcp_bad_request', null);
+          return internalMcpSignatureDenial(corsHeaders);
         }
         if (bodyBytes.byteLength > MAX_INTERNAL_MCP_BODY) {
           emitRequest(413, 'malformed_request', null);
@@ -1078,19 +1277,18 @@ export function createDomainGateway(
           body: bodyBytes,
         });
       }
-      // verifyInternalMcpRequest returns null when X-WM-MCP-User-Id is
-      // missing, signature header is malformed, timestamp is out of
-      // window, or the HMAC compare fails. All collapse to a single 401 —
-      // intentionally do NOT distinguish (don't leak which piece failed
-      // to a forge probe).
-      const verified = await verifyInternalMcpRequest(request, hmacSecret);
-      if (!verified) {
-        emitRequest(401, 'auth_401', null);
-        return new Response(
-          JSON.stringify({ error: 'invalid_internal_mcp_signature' }),
-          { status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-        );
+      // X-WM-MCP-User-Id missing, malformed signature header, timestamp out of
+      // window, and a failed HMAC compare all collapse to ONE 401 — telling a
+      // forge probe which piece failed is exactly the oracle this must not be.
+      // That stays true below: every branch returns the identical response
+      // built in one place. Only the emitted telemetry reason differs, and it
+      // never leaves the server.
+      const verifyResult = await verifyInternalMcpRequestDetailed(request, hmacSecret);
+      if (!verifyResult.ok) {
+        emitRequest(401, internalMcpReasonFor(verifyResult.failure), null);
+        return internalMcpSignatureDenial(corsHeaders);
       }
+      const verified = verifyResult.verified;
       const replayClaim = await claimInternalMcpReplayNonce(verified.userId, verified.nonce);
       if (replayClaim === 'unavailable') {
         // Fail closed: without an atomic replay-cache claim, a valid captured
@@ -1102,11 +1300,10 @@ export function createDomainGateway(
         );
       }
       if (replayClaim === 'replay') {
-        emitRequest(401, 'auth_401', null);
-        return new Response(
-          JSON.stringify({ error: 'invalid_internal_mcp_signature' }),
-          { status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-        );
+        // Same response as a bad signature, by design — a probe must not learn
+        // that its nonce was the thing that was already spent.
+        emitRequest(401, 'internal_mcp_replay', null);
+        return internalMcpSignatureDenial(corsHeaders);
       }
       // Entitlement re-check at the gateway: the MCP edge already verifies
       // tier ≥ 1 + mcpAccess + validUntil before signing the outbound
@@ -1189,7 +1386,20 @@ export function createDomainGateway(
       || isPublicSharedRpcRequest(request.url, request.method);
     const seedRefreshVerified = await isResilienceRankingSeedRefreshRequest(request, pathname);
     const relayWarmPingVerified = await isRelayWarmPingRequest(request, pathname);
-    const requiresDirectLlmQuota = !internalMcpVerified && await shouldReserveGatewayDirectLlmQuota(request, pathname);
+    // Resolve the quota policy against the route POST compatibility will use.
+    // Keep body validation after auth and abuse limiting; invalid bodies still
+    // return before reservation or dispatch.
+    let directLlmPolicyRequest = request;
+    if (
+      request.method === 'POST'
+      && GATEWAY_DIRECT_LLM_QUOTA_METHODS[pathname] === 'GET'
+      && isPostToGetCompatibleBodySize(request.headers)
+      && !router.match(request)
+    ) {
+      const getProbe = new Request(request.url, { method: 'GET', headers: request.headers });
+      if (router.match(getProbe)) directLlmPolicyRequest = getProbe;
+    }
+    const requiresDirectLlmQuota = !internalMcpVerified && await shouldReserveGatewayDirectLlmQuota(directLlmPolicyRequest, pathname);
     const isTierGated = !internalMcpVerified && !isPublicNoAuthRpc && !seedRefreshVerified && !relayWarmPingVerified && getRequiredTier(pathname) !== null;
     // Docker self-hosting has no Clerk/Convex entitlement backend. Its browser
     // still obtains and presents a server-signed anonymous session, so that
@@ -1197,7 +1407,7 @@ export function createDomainGateway(
     // Cloud deployments do not set LOCAL_API_MODE=docker, and every other
     // premium route retains forceKey + entitlement enforcement below.
     const isDockerSelfHostCountryBrief =
-      request.method === 'GET' &&
+      (request.method === 'GET' || request.method === 'HEAD') &&
       pathname === COUNTRY_INTEL_BRIEF_PATH &&
       process.env.LOCAL_API_MODE === 'docker';
     const needsLegacyProBearerGate = !internalMcpVerified && !isPublicNoAuthRpc && PREMIUM_RPC_PATHS.has(pathname) && !isTierGated;
@@ -1336,6 +1546,86 @@ export function createDomainGateway(
       }
     }
 
+    // ── Partner-embed keys (`wme_`) ─────────────────────────────────────────
+    // Accepted ONLY on the RPC paths a paid embed panel declares in the panel
+    // registry, and nowhere else. `EMBED_KEY_RPC_PATHS` is derived from those
+    // declarations, so this surface cannot widen without a panel owning it.
+    //
+    // Not an escalation: neither declared path is tier-gated or in
+    // PREMIUM_RPC_PATHS, so both already answer an anonymous wms_ session
+    // token. What this buys is a credential SHAPE the gateway understands for
+    // a frame that has no session and must stop being handed a wm_ key — the
+    // over-powered credential the whole embed-key stack exists to retire.
+    // Without it, /api/embed/entitlement answers 200 for a wme_ key and the
+    // panel's own data read still 401s, which is a feature that does not work.
+    //
+    // `isUserApiKey` deliberately stays false: an embed key must not enter the
+    // per-account REST meter (#3199) or the apiAccess gate (#4611), and must
+    // not become the request's rate-limit principal — an embed is read by many
+    // viewers on many IPs, so the per-IP bucket is the correct one.
+    if (
+      keyCheck.required &&
+      !keyCheck.valid &&
+      wmKey.startsWith('wme_') &&
+      EMBED_KEY_RPC_PATHS.has(pathname)
+    ) {
+      // Same amplification guard, and the same reasoning, as the wm_ branch
+      // above: an unknown wme_ key costs a Convex lookup, and rotating keys
+      // defeats the per-hash negative cache. Fails closed when Redis is down.
+      const embedGuardResponse = await checkFailClosedScopedIpRateLimit(
+        request,
+        'embed-key:pre-auth-validation',
+        600,
+        '60 s',
+        corsHeaders,
+      );
+      if (embedGuardResponse) {
+        const reason = getRateLimitTelemetryReason(embedGuardResponse, 'rate_limit_429');
+        emitRequest(embedGuardResponse.status, reason, null);
+        return embedGuardResponse;
+      }
+
+      const { validateEmbedKey } = await import('./_shared/embed-key');
+      try {
+        const embedKeyResult = await validateEmbedKey(wmKey);
+        if (embedKeyResult) {
+          const embedEntitlement = await getEntitlements(embedKeyResult.userId);
+          const embedCovered = hasEmbedAccess(embedEntitlement, Date.now());
+          // A transient billing lookup failure must stay retryable rather than
+          // collapse into "invalid key" — the frame backs off on 503 and keeps
+          // its last render, but treats 401/403 as terminal.
+          const billingDenial = denyForBillingVerification(
+            embedEntitlement,
+            corsHeaders,
+            embedCovered,
+          );
+          if (billingDenial) return billingDenial;
+          if (embedCovered) {
+            keyCheck = { valid: true, required: true };
+          }
+        }
+      } catch (err) {
+        const code =
+          typeof err === 'object' && err !== null
+            ? (err as { code?: unknown }).code
+            : undefined;
+        if (code === 'validation_unavailable') {
+          emitRequest(503, 'validation_unavailable', null);
+          return new Response(JSON.stringify({ error: 'Service temporarily unavailable' }), {
+            status: 503,
+            headers: {
+              'Content-Type': 'application/json',
+              'Cache-Control': 'no-store',
+              'Retry-After': '5',
+              'X-Validation-Mode': 'degraded',
+              ...corsHeaders,
+            },
+          });
+        }
+        throw err;
+      }
+    }
+
     // Clerk session is itself proof of authentication (validated at line 410).
     // validateApiKey is strict-no-trust-of-headers per #3541 and would 401 every
     // Clerk-authenticated user who hasn't also minted a wms_ session token.
@@ -1401,38 +1691,25 @@ export function createDomainGateway(
         apiAccessCovered,
       );
       if (billingDenial) return billingDenial;
-      // A validated wm_ key proves key ownership, not current paid access.
-      // Transient lookup failures now arrive as a verificationUnavailable
-      // marker and were already answered with the retryable 503 by
-      // denyForBillingVerification above; a null here means the backend is
-      // unconfigured or gave a confirmed/malformed answer, and allowing it
-      // would turn that state into paid API access. Fail closed with a 503
-      // — EXCEPT when the entitlement backend itself is unconfigured: that is
-      // a deploy defect, not customer billing state, and 503ing every wm_ key
-      // fleet-wide would convert a config regression into a total API outage.
-      // Misconfig serves fail-open (pre-#4770 behavior) and logs loudly.
+      // Key ownership does not prove paid access. Missing configuration and
+      // unresolved entitlements must remain retryable failures, not grants.
       if (!userKeyEntitlement) {
-        if (isEntitlementBackendConfigured()) {
-          emitRequest(503, 'billing_verification_503', null);
-          return new Response(
-            JSON.stringify({
-              error: 'Unable to verify API access',
-              code: 'entitlement_verification_unavailable',
-            }),
-            {
-              status: 503,
-              headers: {
-                ...corsHeaders,
-                'Content-Type': 'application/json',
-                'Cache-Control': 'no-store',
-                'Retry-After': '5',
-                'X-Billing-Verification': 'entitlement_verification_unavailable',
-              },
+        emitRequest(503, 'billing_verification_503', null);
+        return new Response(
+          JSON.stringify({
+            error: 'Unable to verify API access',
+            code: 'entitlement_verification_unavailable',
+          }),
+          {
+            status: 503,
+            headers: {
+              ...corsHeaders,
+              'Content-Type': 'application/json',
+              'Cache-Control': 'no-store',
+              'Retry-After': '5',
+              'X-Billing-Verification': 'entitlement_verification_unavailable',
             },
-          );
-        }
-        console.error(
-          '[gateway] entitlement backend unconfigured (CONVEX_SITE_URL / shared secret missing) — serving wm_-key request fail-open',
+          },
         );
       } else if (
         !userKeyEntitlement.features.apiAccess ||
@@ -1634,48 +1911,45 @@ export function createDomainGateway(
       }
     }
 
-    // Route matching — if POST doesn't match, convert to GET for stale clients
+    // Route matching — if POST doesn't match, convert to GET for stale clients.
+    // Strict compatibility 400s stay pending until the normal endpoint/global
+    // limiter path runs so malformed or nested bodies still consume the GET
+    // route's abuse budget. The pending response is returned before
+    // direct-LLM quota and handler dispatch.
     let matchedHandler = router.match(request);
+    let pendingPostToGetCompatError: Response | null = null;
     if (!matchedHandler && request.method === 'POST') {
       if (isPostToGetCompatibleBodySize(request.headers)) {
         const url = new URL(request.url);
-        let oversizedKey: string | null = null;
-        try {
-          const bodyText = await request.clone().text();
-          if (new TextEncoder().encode(bodyText).byteLength >= POST_TO_GET_MAX_BODY_BYTES) {
-            emitRequest(400, 'malformed_request', null);
-            return new Response(JSON.stringify({ error: 'malformed_request' }), {
+        const getProbe = new Request(url.toString(), { method: 'GET', headers: request.headers });
+        const getProbeHandler = router.match(getProbe);
+        if (getProbeHandler) {
+          let compatErrorBody: Record<string, unknown> | null = null;
+          let compatFields: PostToGetCompatField[] = [];
+          try {
+            const parsed = parsePostToGetCompatBody(await request.clone().text());
+            if (parsed.status === 'ok') {
+              compatFields = parsed.fields;
+            } else {
+              compatErrorBody = postToGetCompatErrorBody(parsed);
+            }
+          } catch {
+            compatErrorBody = { error: 'malformed_request' };
+          }
+          if (compatErrorBody) {
+            pendingPostToGetCompatError = new Response(JSON.stringify(compatErrorBody), {
               status: 400,
               headers: { 'Content-Type': 'application/json', ...corsHeaders },
             });
+            matchedHandler = getProbeHandler;
+            request = getProbe;
+          } else {
+            applyPostToGetCompatFields(url.searchParams, compatFields);
+            const getReq = new Request(url.toString(), { method: 'GET', headers: request.headers });
+            matchedHandler = router.match(getReq);
+            if (matchedHandler) request = getReq;
           }
-          const body = JSON.parse(bodyText);
-          const isScalar = (x: unknown): x is string | number | boolean =>
-            typeof x === 'string' || typeof x === 'number' || typeof x === 'boolean';
-          for (const [k, v] of Object.entries(body as Record<string, unknown>)) {
-            if (Array.isArray(v)) {
-              if (v.length > POST_TO_GET_MAX_ARRAY_VALUES_PER_KEY) {
-                oversizedKey = k;
-                break;
-              }
-              v.forEach((item) => { if (isScalar(item)) url.searchParams.append(k, String(item)); });
-            } else if (isScalar(v)) url.searchParams.set(k, String(v));
-          }
-        } catch { /* non-JSON body — preserve legacy POST→GET fallback */ }
-        if (oversizedKey !== null) {
-          emitRequest(400, 'malformed_request', null);
-          return new Response(JSON.stringify({
-            error: 'Too many values for POST compatibility parameter',
-            parameter: oversizedKey,
-            maxValues: POST_TO_GET_MAX_ARRAY_VALUES_PER_KEY,
-          }), {
-            status: 400,
-            headers: { 'Content-Type': 'application/json', ...corsHeaders },
-          });
         }
-        const getReq = new Request(url.toString(), { method: 'GET', headers: request.headers });
-        matchedHandler = router.match(getReq);
-        if (matchedHandler) request = getReq;
       }
     }
     if (!matchedHandler) {
@@ -1746,14 +2020,36 @@ export function createDomainGateway(
     // Gateway rate limiting — two-phase: endpoint-specific first, then global fallback.
     // Confirmed paid principals use per-user buckets; other traffic uses IP.
     //
-    // Internal-MCP verified requests skip this gateway layer: the MCP edge
+    // Google searches need their tighter upstream budget even after MCP admission.
+    if (internalMcpVerified && (pathname === '/api/aviation/v1/search-google-flights'
+      || pathname === '/api/aviation/v1/search-google-dates')) {
+      const endpointRlResponse = await checkEndpointRateLimit(request, pathname, corsHeaders, {
+        principalUserId: request.headers.get(TRUSTED_USER_ID_HEADER)!,
+        principalScope: 'session',
+      });
+      if (endpointRlResponse) {
+        const reason = getRateLimitTelemetryReason(endpointRlResponse, 'rate_limit_429_endpoint');
+        emitRequest(endpointRlResponse.status, reason, null);
+        return endpointRlResponse;
+      }
+    }
+
+    // Internal-MCP verified requests skip the remaining gateway layer: the MCP edge
     // already enforced 50/day + 60/min per userId in api/mcp.ts. A second
     // limiter here would create misleading double-counting and could 429
     // legitimate Pro tool fetches that pass the upstream cap.
     if (!internalMcpVerified) {
-      const endpointRlResponse = rateLimitPrincipalUserId
+      // These local provider lookups use the sidecar cache without Upstash.
+      // Keep these exceptions exact-path; cloud requests retain the provider cap.
+      const isSidecarProviderLookup = process.env.LOCAL_API_MODE === 'tauri-sidecar'
+        && (pathname === '/api/aviation/v1/track-aircraft'
+          || pathname === '/api/military/v1/get-wingbits-live-flight'
+          || pathname === '/api/imagery/v1/search-imagery'
+          || pathname === '/api/webcam/v1/get-webcam-image');
+      const endpointRlResponse = isSidecarProviderLookup ? null : rateLimitPrincipalUserId
         ? await checkEndpointRateLimit(request, pathname, corsHeaders, {
             principalUserId: rateLimitPrincipalUserId,
+            principalScope: isUserApiKey ? 'api_key' : 'session',
           })
         : await checkEndpointRateLimit(request, pathname, corsHeaders);
       if (endpointRlResponse) {
@@ -1770,13 +2066,14 @@ export function createDomainGateway(
       // keyCheck.kind, so `isUserApiKey` is the discriminator) or an enterprise
       // env key — are governed by a per-account burst + daily meter (enforced
       // at the sold allowance, #4635) instead of the global fallback. In ENFORCE
-      // they bypass that fallback below; in SHADOW they only record telemetry
+      // confirmed burst admission bypasses that fallback; in SHADOW they record telemetry
       // and still fall through to it. Validated user keys use their trusted
       // principal there, while enterprise keys retain IP attribution.
       // Limits are NOT in scope here (checkEntitlement discards `features`), so
       // user keys resolve getEntitlements explicitly (cached); enterprise keys
       // carry no entitlement and use hardcoded limits.
       let governedByApiKeyLayer = false;
+      let rollbackDailyMeter: (() => Promise<void>) | undefined;
       if (keyCheck.valid && (isUserApiKey || isEnterpriseAuth)) {
         const enforce = process.env.API_RATE_LIMIT_ENFORCE === 'true';
         let perMinute = 0;
@@ -1831,7 +2128,7 @@ export function createDomainGateway(
             planKey && planKey !== 'enterprise' ? 'https://worldmonitor.app/' : undefined;
           // 1. Per-minute burst (hard limit).
           const burst = await checkBurst(perMinute, identity);
-          if (!burst.ok) {
+          if (burst.ok === false) {
             if (enforce) {
               const retryAfterSec = Math.max(1, Math.ceil((burst.reset - Date.now()) / 1000));
               emitRequest(429, 'rl_min_429', null);
@@ -1861,6 +2158,7 @@ export function createDomainGateway(
               allowance,
               pipeline: (cmds) => runRedisPipeline(cmds),
             });
+            if (meter.metered) rollbackDailyMeter = meter.rollback;
             if (meter.overLimit) {
               if (enforce) {
                 await meter.rollback();
@@ -1892,21 +2190,28 @@ export function createDomainGateway(
               pendingShadowReason = 'rl_ceiling_shadow';
             }
           }
-          // Eligible + enforce + not rejected ⇒ the per-account layer governs
-          // this request and skips the global fallback. In shadow, keep that
+          // Confirmed burst admission + enforce ⇒ the per-account layer governs
+          // this request and skips the global fallback. If unavailable or in shadow, keep that
           // fallback active: validated user keys use their trusted principal,
           // while enterprise keys retain IP attribution.
-          if (enforce) governedByApiKeyLayer = true;
+          if (enforce && burst.ok === true) governedByApiKeyLayer = true;
         }
       }
 
       if (!governedByApiKeyLayer && !hasEndpointRatePolicy(pathname)) {
+        // WORLDMONITOR-12A: scope the bucket to the credential, not just the
+        // user. An API key and a browser session resolve to the same Clerk id,
+        // so without this a customer's own scraper drains the 600/min budget
+        // and their dashboard 429s. In production on 2026-09-11 that was 598
+        // scraper successes against 2 for the same person's browser.
         const rateLimitResponse = rateLimitPrincipalUserId
           ? await checkRateLimit(request, corsHeaders, {
               principalUserId: rateLimitPrincipalUserId,
+              principalScope: isUserApiKey ? 'api_key' : 'session',
             })
           : await checkRateLimit(request, corsHeaders);
         if (rateLimitResponse) {
+          await rollbackDailyMeter?.();
           const reason = getRateLimitTelemetryReason(
             rateLimitResponse,
             'rate_limit_429_global',
@@ -1915,6 +2220,11 @@ export function createDomainGateway(
           return rateLimitResponse;
         }
       }
+    }
+
+    if (pendingPostToGetCompatError) {
+      emitRequest(400, 'malformed_request', null);
+      return pendingPostToGetCompatError;
     }
 
     if (requiresDirectLlmQuota && !isEnterpriseAuth) {
@@ -2039,6 +2349,7 @@ export function createDomainGateway(
         mergedHeaders.set(key, value);
       }
     }
+    appendDeprecationPolicyLink(mergedHeaders);
     const retryableResponse = drainRetryableResponse(request);
     attachRequiredBboxDiagnosticHeaders(mergedHeaders, pathname, requiredBboxDiagnostic);
 
@@ -2056,7 +2367,7 @@ export function createDomainGateway(
 
     // For GET 200 responses: read body once for cache-header decisions + ETag
     let resolvedCacheTier: CacheTier | null = null;
-    if (response.status === 200 && request.method === 'GET' && response.body) {
+    if (response.status === 200 && (request.method === 'GET' || request.method === 'HEAD') && response.body) {
       const bodyBytes = await response.arrayBuffer();
 
       const bodyStr = new TextDecoder().decode(bodyBytes);
@@ -2133,7 +2444,34 @@ export function createDomainGateway(
       let responseView = new Uint8Array(bodyBytes);
       const jmespathExpr = new URL(request.url).searchParams.get('jmespath');
       if (jmespathExpr && (mergedHeaders.get('Content-Type') ?? '').includes('application/json')) {
-        const projection = projectJsonResponse(bodyStr, jmespathExpr);
+        let projection = projectJsonResponse(bodyStr, jmespathExpr);
+        if (projection.ok) {
+          // Attribution accompaniment — REST parity with the MCP dispatch rider
+          // (shared/attribution-rider.ts). These paths were refused outright
+          // before; refusal protected two supply-chain paths that carry no
+          // licence field at all while `/api/safety/v1/get-toronto-safety`, which
+          // does, was never on the list. The rider replaces the roster: the
+          // sources are extracted from the UNPROJECTED body and merged AROUND
+          // the projected document, so no expression can reach or remove them.
+          //
+          // Merged BEFORE the ETag hash below, so the ETag covers the rider.
+          // Only the success path carries it: a failed projection is an HTTP 400
+          // that serves no data, so there is nothing to accompany.
+          const attributionExpr = REST_ATTRIBUTION_EXPRESSIONS[pathname];
+          if (attributionExpr !== undefined) {
+            let unprojected: unknown;
+            try {
+              unprojected = JSON.parse(bodyStr);
+            } catch {
+              unprojected = null;
+            }
+            const rider = buildAttributionRider(unprojected, attributionExpr);
+            if (rider !== null) {
+              const projectedBody = mergeAttributionRider(projection.body, rider);
+              projection = enforceRestProjectionOutputLimit(projectedBody, unprojected);
+            }
+          }
+        }
         if (!projection.ok) {
           const errorBody = JSON.stringify(projection.envelope);
           emitRequest(400, 'malformed_request', null, errorBody.length);
@@ -2181,7 +2519,7 @@ export function createDomainGateway(
       });
     }
 
-    if (response.status === 200 && request.method === 'GET') {
+    if (response.status === 200 && (request.method === 'GET' || request.method === 'HEAD')) {
       if (mergedHeaders.get('X-No-Cache')) {
         mergedHeaders.set('Cache-Control', 'no-store');
       }
@@ -2228,5 +2566,10 @@ export function createDomainGateway(
       statusText: response.statusText,
       headers: mergedHeaders,
     });
+  }
+
+  return async function handler(originalRequest: Request, ctx?: GatewayCtx): Promise<Response> {
+    const response = await dispatch(originalRequest, ctx);
+    return originalRequest.method === 'HEAD' ? toHeadResponse(response) : response;
   };
 }

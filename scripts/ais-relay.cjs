@@ -25,15 +25,49 @@ const crypto = require('crypto');
 const v8 = require('v8');
 const { WebSocketServer, WebSocket } = require('ws');
 const { parseProxyConfig, resolveProxyString, resolveProxyStringForAttempt } = require('./_proxy-utils.cjs');
+const { parseWidgetAgentResponse } = require('./_widget-response-parser.cjs');
+const {
+  cooldownKeyForAccount,
+  OPENSKY_LEGACY_COOLDOWN_KEY,
+  OPENSKY_MAX_COOLDOWN_MS,
+  OPENSKY_SHARED_FALLBACK_COOLDOWN_MS,
+  OPENSKY_MAX_DEADLINE_SET_LUA,
+  accountFingerprint: openSkyAccountFingerprint,
+  clampCooldownMs,
+  ttlSecondsForCooldown,
+  inspectCooldownRecord,
+  buildCooldownRecord,
+  maxDeadlineSetCommand,
+  legacyCooldownCompatibilityEnabled,
+} = require('./_opensky-account-cooldown.cjs');
+const OPENSKY_ACCOUNT_FINGERPRINT = openSkyAccountFingerprint(process.env.OPENSKY_CLIENT_ID);
+const OPENSKY_COOLDOWN_KEY = cooldownKeyForAccount(OPENSKY_ACCOUNT_FINGERPRINT);
 const {
   GROQ_DEFAULT_MODEL,
+  GROQ_REASONING_EXTRA_BODY,
   OPENROUTER_FREE_BACKUP_MODEL,
   OPENROUTER_FREE_PRIMARY_MODEL,
   OPENROUTER_PROVIDER_ROUTING,
 } = require('./lib/llm-model-policy.cjs');
 const xNewsAccounts = require('./lib/x-news-accounts.cjs');
+const { SAUDI_CIVIL_DEFENSE, MAX_POST_CHARS, publishSaudiCivilDefenseAlerts } = require('./lib/saudi-civil-defense-alerts.cjs');
 const { createPollGenerationGuard } = require('./lib/poll-generation-guard.cjs');
-const { createXPollCycle } = require('./lib/x-poll-cycle.cjs');
+const { createXPollCycle, xPollSlot } = require('./lib/x-poll-cycle.cjs');
+const {
+  createXPostBudget,
+  DEFAULT_X_CURATED_DAILY_COVERAGE_POSTS,
+  xPostBudgetServiceStatus,
+} = require('./lib/x-post-budget.cjs');
+const { buildClassifyCandidateMap, isStaleDigestReplay } = require('./lib/digest-stale-gate.cjs');
+const {
+  buildClassifyDigestUrl,
+  classifyDigestTransport,
+  buildClassifyDigestHeaders,
+  formatClassifyDigestFetchFailure,
+  shouldWriteClassifySeedMeta,
+  CLASSIFY_DIGEST_RETRY_DELAYS_MS,
+  classifyDigestRetryDecision,
+} = require('./lib/classify-digest-request.cjs');
 const {
   YahooQuoteSummaryClient,
   buildSectorSeedMeta,
@@ -56,7 +90,7 @@ const {
 } = require('./_ingestion-coverage.cjs');
 const { maintainClosedMarketEquityKeys: maintainClosedMarketEquityKeysWithDeps } = require('./shared/closed-market-equity-maintenance.cjs');
 const { getUsEquitySession, isMultiMarketEquityTradingDay } = require('./shared/market-hours.cjs');
-const { mergeLastGoodQuotes, planYahooRefresh } = require('./shared/market-quote-refresh.cjs');
+const { mergeLastGoodQuotes, planYahooRefresh, resolveMergedQuotesAsOf } = require('./shared/market-quote-refresh.cjs');
 // ESM module loaded via require(esm) (Node >= 22.12; relay image is node:24).
 // Same implementation the RPC handler scores with — see the module header for
 // why it lives in shared/ rather than beside the other scoring helpers.
@@ -187,9 +221,53 @@ const RELAY_GOOGLE_FLIGHTS_RATE_LIMIT_MAX = Number.isFinite(Number(process.env.R
 const RELAY_LOG_THROTTLE_MS = Math.max(1000, Number(process.env.RELAY_LOG_THROTTLE_MS || 10000));
 const ALLOW_VERCEL_PREVIEW_ORIGINS = process.env.ALLOW_VERCEL_PREVIEW_ORIGINS === 'true';
 
-// OpenSky proxy — routes through residential proxy to avoid Railway IP blocks
+// OpenSky route selection — ONE selected route, never a cascade.
+//
+// OpenSky's rate limit is per ACCOUNT (4,000 credits/day, keyed on OPENSKY_CLIENT_ID —
+// see scripts/_opensky-account-cooldown.cjs and
+// docs/solutions/integration-issues/opensky-bbox-area-billing-flat-top-tier.md), NOT per
+// exit IP. A residential exit therefore buys no extra quota, and an automatic
+// proxy-on-failure fallback would spend a SECOND account credit retrying the one error
+// class a different IP cannot fix (429). That is strictly worse on both axes: more paid
+// proxy bytes AND faster quota exhaustion. So the route is selected once, the way
+// _gdelt-fetch.mjs selects its own.
+//
+// `direct` is the default because it is free — OpenSky was 82.5% of the residential
+// proxy bill (24.86 GB / $136.75 of a ~$165 quarter) for no quota benefit. `proxy` is
+// the operator escape hatch for a genuine IP-level rejection, which is counted
+// separately as openskyRouteRejection (403/451) so the health surface can tell
+// "flip the route" apart from "wait for credits".
+const OPENSKY_ROUTE_DEFAULT = 'direct';
+const OPENSKY_ROUTES = Object.freeze(['direct', 'proxy']);
+
+function resolveOpenSkyRoute(raw) {
+  const value = String(raw || '').trim().toLowerCase();
+  if (!value) return OPENSKY_ROUTE_DEFAULT;
+  if (OPENSKY_ROUTES.includes(value)) return value;
+  console.warn(
+    `[Relay] Ignoring unknown OPENSKY_ROUTE="${raw}" — expected ${OPENSKY_ROUTES.join(' or ')}; `
+    + `using "${OPENSKY_ROUTE_DEFAULT}"`,
+  );
+  return OPENSKY_ROUTE_DEFAULT;
+}
+
+const OPENSKY_ROUTE_REQUESTED = resolveOpenSkyRoute(process.env.OPENSKY_ROUTE);
 const OPENSKY_PROXY_AUTH = process.env.OPENSKY_PROXY_AUTH || process.env.PROXY_URL || '';
-const OPENSKY_PROXY_ENABLED = !!OPENSKY_PROXY_AUTH;
+// Fail OPEN to the free route: an unconfigured escape hatch must not take OpenSky down.
+if (OPENSKY_ROUTE_REQUESTED === 'proxy' && !OPENSKY_PROXY_AUTH) {
+  console.warn(
+    '[Relay] OPENSKY_ROUTE=proxy but neither OPENSKY_PROXY_AUTH nor PROXY_URL is set — '
+    + 'using the direct route.',
+  );
+}
+const OPENSKY_PROXY_ENABLED = OPENSKY_ROUTE_REQUESTED === 'proxy' && !!OPENSKY_PROXY_AUTH;
+// The EFFECTIVE route — what requests actually do, which is the only thing an operator
+// can act on. Derived from OPENSKY_PROXY_ENABLED rather than tracked separately so the
+// two can never disagree: `OPENSKY_ROUTE=proxy` with no credential silently falls back
+// to direct, and reporting the REQUESTED value there would send an operator hunting a
+// proxy that was never in the request path — in exactly the misconfiguration this
+// telemetry exists to diagnose. The requested value stays available for the mismatch.
+const OPENSKY_ROUTE = OPENSKY_PROXY_ENABLED ? 'proxy' : 'direct';
 
 const PROXY_URL = process.env.PROXY_URL || ''; // generic residential proxy (US exit) — http://user:pass@host:port or host:port:user:pass (Decodo)
 
@@ -319,7 +397,7 @@ if (UPSTASH_ENABLED) {
   console.log(`[Relay] Upstash Redis enabled (key: ${OREF_REDIS_KEY}${UPSTASH_REDIS_REST_URL.startsWith('http://') ? ', insecure-http opt-in' : ''})`);
 }
 
-function upstashGet(key, onFailure) {
+function upstashGet(key, onFailure, timeoutMs = 5000) {
   return new Promise((resolve) => {
     if (!UPSTASH_ENABLED) return resolve(null);
     let settled = false;
@@ -334,11 +412,12 @@ function upstashGet(key, onFailure) {
       if (onFailure) onFailure(reason);
       resolve(null);
     };
+    const requestTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 5000;
     const url = new URL(`/get/${encodeURIComponent(key)}`, UPSTASH_REDIS_REST_URL);
     const req = UPSTASH_HTTP_MODULE.request(url, {
       method: 'GET',
       headers: { Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}` },
-      timeout: 5000,
+      timeout: requestTimeoutMs,
     }, (resp) => {
       if (resp.statusCode < 200 || resp.statusCode >= 300) {
         resp.resume();
@@ -623,6 +702,31 @@ function upstashDel(key) {
   });
 }
 
+function upstashEval(script, keys, args) {
+  return new Promise((resolve) => {
+    if (!UPSTASH_ENABLED) return resolve(null);
+    const url = new URL('/', UPSTASH_REDIS_REST_URL);
+    const body = JSON.stringify(['EVAL', script, String(keys.length), ...keys, ...args.map((arg) => String(arg))]);
+    const req = UPSTASH_HTTP_MODULE.request(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      timeout: 5000,
+    }, (resp) => {
+      let data = '';
+      resp.on('data', (chunk) => { data += chunk; });
+      resp.on('end', () => {
+        try { resolve(JSON.parse(data)?.result); } catch { resolve(null); }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.end(body);
+  });
+}
+
 function upstashReleaseLockIfOwner(key, owner) {
   return new Promise((resolve) => {
     if (!UPSTASH_ENABLED) return resolve(false);
@@ -744,33 +848,6 @@ function normalizeNotificationCountryCode(raw) {
 function marketAlertCoalesceKey(assetClass, identifier, direction, severity) {
   const stableIdentifier = String(identifier || 'unknown').trim().toLowerCase();
   return `market:${assetClass}:${stableIdentifier}:${direction}:${severity}`;
-}
-
-/**
- * Slot B helper: derive a coalesce-family key from an NWS VTEC string.
- *
- * NWS VTEC format (https://www.weather.gov/vtec/):
- *   /O.NEW.KSGF.SV.W.0034.250427T1257Z-250427T1330Z/
- *    │  │   │   │  │  │
- *    │  │   │   │  │  └── event tracking number (per-office, per-phenomenon, per-significance)
- *    │  │   │   │  └───── significance: W=warning, A=watch, Y=advisory, etc.
- *    │  │   │   └──────── phenomenon: SV=severe thunderstorm, TO=tornado, FF=flash flood, etc.
- *    │  │   └──────────── forecast office (4-letter ICAO)
- *    │  └──────────────── action: NEW, CON (continued), CAN (cancel), EXP (expired), etc.
- *    └─────────────────── product status: O=operational, T=test, E=exercise, X=experimental
- *
- * The (office, phenomenon, significance, eventID) tuple identifies one logical
- * event across adjacent zones — exactly what we want to coalesce. We drop the
- * action so NEW + CON + CAN bulletins for the same event also collapse.
- *
- * Returns a stable family key like "nws:KSGF.SV.W.0034" or undefined if the
- * VTEC string is missing or malformed.
- */
-function deriveWeatherCoalesceKey(vtec) {
-  if (typeof vtec !== 'string') return undefined;
-  const m = vtec.match(/\/[OTEX]\.[A-Z]+\.([A-Z]{4})\.([A-Z]{2})\.([A-Z])\.(\d{4})\./);
-  if (!m) return undefined;
-  return `nws:${m[1]}.${m[2]}.${m[3]}.${m[4]}`;
 }
 
 function nwsVtec(p) {
@@ -958,7 +1035,7 @@ function safeEnd(res, statusCode, headers, body) {
     res.end(body);
     return true;
   } catch {
-    return false;
+    return;
   }
 }
 
@@ -1045,13 +1122,28 @@ function sendPreGzipped(req, res, statusCode, headers, rawBody, gzippedBody, bro
 // - TELEGRAM_API_HASH
 // - TELEGRAM_SESSION (StringSession)
 // ─────────────────────────────────────────────────────────────
+function readTelegramNumberEnv(name, fallback, min = 0, max = Number.POSITIVE_INFINITY) {
+  const raw = process.env[name];
+  const parsed = raw == null || raw === '' ? fallback : Number(raw);
+  const finite = Number.isFinite(parsed) ? parsed : fallback;
+  return Math.min(max, Math.max(min, finite));
+}
+
 const TELEGRAM_ENABLED = Boolean(process.env.TELEGRAM_API_ID && process.env.TELEGRAM_API_HASH && process.env.TELEGRAM_SESSION);
-const TELEGRAM_POLL_INTERVAL_MS = Math.max(15_000, Number(process.env.TELEGRAM_POLL_INTERVAL_MS || 60_000));
+const TELEGRAM_POLL_INTERVAL_FLOOR_MS = RELAY_TEST_MODE ? 10 : 15_000;
+const TELEGRAM_POLL_INTERVAL_MS = Math.max(
+  TELEGRAM_POLL_INTERVAL_FLOOR_MS,
+  Number(process.env.TELEGRAM_POLL_INTERVAL_MS || 60_000),
+);
 const TELEGRAM_MAX_FEED_ITEMS = Math.max(50, Number(process.env.TELEGRAM_MAX_FEED_ITEMS || 200));
 const TELEGRAM_MAX_TEXT_CHARS = Math.max(200, Number(process.env.TELEGRAM_MAX_TEXT_CHARS || 800));
+const TELEGRAM_STARTUP_DELAY_MS = readTelegramNumberEnv('TELEGRAM_STARTUP_DELAY_MS', 120_000);
+const TELEGRAM_CONNECT_TIMEOUT_MS = readTelegramNumberEnv('TELEGRAM_CONNECT_TIMEOUT_MS', 30_000, 10);
 
 const telegramState = {
   client: null,
+  api: null,
+  initPromise: null,
   channels: [],
   cursorByHandle: Object.create(null),
   items: [],
@@ -1059,6 +1151,54 @@ const telegramState = {
   lastError: null,
   startedAt: Date.now(),
 };
+
+const TELEGRAM_RESOLVE_CACHE_TTL_MS = 60 * 60 * 1000;
+const TELEGRAM_CHANNEL_CACHE_TTL_MS = 30_000;
+const TELEGRAM_LOOKUP_CACHE_MAX_ENTRIES = 512;
+const TELEGRAM_NEGATIVE_CACHE_TTL_MS = readTelegramNumberEnv('TELEGRAM_NEGATIVE_CACHE_TTL_MS', 300_000, 1_000);
+const TELEGRAM_RPC_MAX_CONCURRENCY = Math.floor(readTelegramNumberEnv('TELEGRAM_RPC_MAX_CONCURRENCY', 2, 1, 4));
+const TELEGRAM_RPC_MAX_QUEUE = Math.floor(readTelegramNumberEnv('TELEGRAM_RPC_MAX_QUEUE', 32, 1, 128));
+const TELEGRAM_RPC_QUEUE_TIMEOUT_MS = readTelegramNumberEnv('TELEGRAM_RPC_QUEUE_TIMEOUT_MS', 5_000, 10);
+// The 300ms floor is load-bearing and predates the RPC queue: it used to live in
+// the poll loop as Math.max(300, TELEGRAM_RATE_LIMIT_MS). Reusing that env var
+// without the floor silently re-pointed an existing production value at a burst
+// posture the old code forbade, so keep the floor here. Tests need sub-floor
+// spacing to stay fast, and RELAY_TEST_MODE is already this file's test seam.
+const TELEGRAM_RPC_MIN_INTERVAL_FLOOR_MS = RELAY_TEST_MODE ? 0 : 300;
+const TELEGRAM_RPC_MIN_INTERVAL_MS = readTelegramNumberEnv(
+  'TELEGRAM_RPC_MIN_INTERVAL_MS',
+  readTelegramNumberEnv('TELEGRAM_RATE_LIMIT_MS', 800, TELEGRAM_RPC_MIN_INTERVAL_FLOOR_MS),
+  TELEGRAM_RPC_MIN_INTERVAL_FLOOR_MS,
+);
+// Backstop for a hostile or absurd upstream FLOOD_WAIT value. The cooldown is
+// process-wide and only ever raised, so an uncapped value is an outage.
+const TELEGRAM_MAX_FLOOD_WAIT_MS = readTelegramNumberEnv('TELEGRAM_MAX_FLOOD_WAIT_MS', 15 * 60 * 1000, 1_000);
+// gramjs disconnect() can hang; the shutdown path already races it against a
+// timer. The reconnect path must too, because initTelegramClientIfNeeded awaits
+// this promise before anything else.
+const TELEGRAM_DISCONNECT_TIMEOUT_MS = readTelegramNumberEnv('TELEGRAM_DISCONNECT_TIMEOUT_MS', 10_000, 10);
+// Whole-lookup budget. Individual RPC timeouts compose (queue wait + exec, x3
+// for a channel read), so only an outer deadline keeps the relay's worst case
+// under the Edge runtime's 25s begin-response ceiling.
+const TELEGRAM_LOOKUP_DEADLINE_MS = readTelegramNumberEnv('TELEGRAM_LOOKUP_DEADLINE_MS', 18_000, 100);
+// One slow channel is not a dead socket. Only a run of timeouts justifies
+// resetting the client that every other caller (and the curated poll) shares.
+const TELEGRAM_MAX_CONSECUTIVE_RPC_TIMEOUTS = Math.floor(
+  readTelegramNumberEnv('TELEGRAM_MAX_CONSECUTIVE_RPC_TIMEOUTS', 3, 1, 20),
+);
+const TELEGRAM_USERNAME_RE = /^[a-zA-Z][a-zA-Z0-9_]{4,31}$/;
+const telegramResolveCache = new Map();
+const telegramChannelCache = new Map();
+const telegramNegativeCache = new Map();
+const telegramLookupInflight = new Map();
+const telegramRpcQueue = [];
+const telegramRpcActiveEntries = new Set();
+let telegramRpcNextStartAt = 0;
+let telegramRpcDrainTimer = null;
+let telegramFloodWaitUntil = 0;
+let telegramDisconnectPromise = null;
+let telegramConsecutiveRpcTimeouts = 0;
+let telegramTestConnectAttempts = 0;
 
 const orefState = {
   lastAlerts: [],
@@ -1097,7 +1237,17 @@ function loadTelegramChannels() {
         enabled: c.enabled !== false,
         maxMessages: c.maxMessages != null ? Number(c.maxMessages) : undefined,
       }))
-      .filter(c => c.enabled);
+      .filter(c => c.enabled)
+      // normalizeTelegramMessage runs every handle through
+      // sanitizeTelegramUsername, which THROWS on anything outside the strict
+      // username grammar. That throw lands after getEntity and getMessages have
+      // already been spent, so an unusable handle would burn 2 RPCs per cycle
+      // forever and never advance its cursor. Reject it loudly, once, at load.
+      .filter(c => {
+        if (TELEGRAM_USERNAME_RE.test(c.handle)) return true;
+        console.warn(`[Relay] Ignoring Telegram channel with invalid handle: ${JSON.stringify(c.handle)}`);
+        return false;
+      });
 
     if (!telegramState.channels.length) {
       console.warn(`[Relay] Telegram channel set "${set}" is empty — no channels to poll`);
@@ -1112,30 +1262,482 @@ function loadTelegramChannels() {
 }
 
 function normalizeTelegramMessage(msg, channel) {
+  const handle = sanitizeTelegramUsername(channel.handle);
+  const isSaudiCivilDefense = handle.toLowerCase() === SAUDI_CIVIL_DEFENSE.handle.toLowerCase();
   const textRaw = String(msg?.message || '');
-  const text = textRaw.slice(0, TELEGRAM_MAX_TEXT_CHARS);
-  const ts = msg?.date ? new Date(msg.date * 1000).toISOString() : new Date().toISOString();
+  const text = textRaw.slice(0, isSaudiCivilDefense
+    ? MAX_POST_CHARS : TELEGRAM_MAX_TEXT_CHARS);
+  const ts = msg?.date ? new Date(msg.date * 1000).toISOString() : isSaudiCivilDefense ? '' : new Date().toISOString();
   return {
-    id: `${channel.handle}:${msg.id}`,
+    id: `${handle}:${msg.id}`,
     source: 'telegram',
-    channel: channel.handle,
-    channelTitle: channel.label || channel.handle,
-    url: `https://t.me/${channel.handle}/${msg.id}`,
+    channel: handle,
+    channelTitle: channel.label || handle,
+    url: `https://t.me/${handle}/${msg.id}`,
     ts,
     text,
+    textTruncated: text.length < textRaw.length,
     topic: channel.topic || 'other',
     tags: [channel.region].filter(Boolean),
     earlySignal: true,
   };
 }
 
+function sanitizeTelegramUsername(raw) {
+  const value = String(raw || '')
+    .trim()
+    .replace(/^https?:\/\/t\.me\//i, '')
+    .replace(/^@+/, '')
+    .replace(/[?#].*$/, '')
+    .replace(/\/+$/, '')
+    .trim();
+
+  if (!TELEGRAM_USERNAME_RE.test(value)) {
+    throw new Error('Invalid Telegram username');
+  }
+
+  return value.toLowerCase();
+}
+
+function getCachedTelegramValue(cache, key) {
+  const cached = cache.get(key);
+  if (!cached) return null;
+  if (cached.expiresAt <= Date.now()) {
+    cache.delete(key);
+    return null;
+  }
+  return cached.value;
+}
+
+function setCachedTelegramValue(cache, key, value, ttlMs) {
+  const now = Date.now();
+  for (const [cachedKey, cached] of cache) {
+    if (cached.expiresAt <= now) cache.delete(cachedKey);
+  }
+  while (cache.size >= TELEGRAM_LOOKUP_CACHE_MAX_ENTRIES) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey == null) break;
+    cache.delete(oldestKey);
+  }
+  cache.set(key, { value, expiresAt: Date.now() + ttlMs });
+}
+
+function getTelegramErrorStatus(error) {
+  if (Number.isInteger(error?.statusCode)) return error.statusCode;
+  // Structured first: a genuine flood carries `seconds` / `errorMessage`. The
+  // message text is attacker-influenced (it embeds the requested username), so
+  // it must never be what promotes an error to 429 — see parseTelegramFloodWaitMs.
+  if (parseTelegramFloodWaitMs(error) > 0) return 429;
+  const message = String(error?.message || error || '');
+  if (/^TIMEOUT after \d+ms:/.test(message)) return 504;
+  if (/invalid telegram username/i.test(message)) return 400;
+  if (/USERNAME_NOT_OCCUPIED|No user has|No channel has|Cannot find any entity/i.test(message)) return 404;
+  if (/not active|not installed|invalidated/i.test(message)) return 503;
+  return 502;
+}
+
+// Public-facing copy. The relay's own error strings describe internal state
+// ('session invalidated (AUTH_KEY_DUPLICATED)', 'Telegram RPC queue is full',
+// raw MTProto/transport text) and used to be returned verbatim to any browser
+// holding a free session token. Map to status-shaped copy instead.
+//
+// 400-for-not-a-public-channel is deliberately folded into 404: distinguishing
+// "no such username" from "exists, but is a user account" turned the endpoint
+// into a Telegram username-existence oracle, with each probe also spending the
+// shared account's tightly-limited resolve budget.
+const TELEGRAM_PUBLIC_ERROR_MESSAGES = {
+  400: 'Invalid Telegram username',
+  404: 'Public Telegram channel not found',
+  429: 'Telegram lookup is rate limited',
+  502: 'Telegram lookup failed',
+  503: 'Telegram lookup is temporarily unavailable',
+  504: 'Telegram lookup timed out',
+};
+
+function getTelegramPublicErrorMessage(statusCode) {
+  return TELEGRAM_PUBLIC_ERROR_MESSAGES[statusCode] || 'Telegram lookup failed';
+}
+
+function createTelegramStatusError(message, statusCode, retryAfterMs = 0) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  if (retryAfterMs > 0) error.retryAfterMs = retryAfterMs;
+  return error;
+}
+
+function getTelegramErrorHeaders(error) {
+  const headers = { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' };
+  if (Number(error?.retryAfterMs) > 0) {
+    headers['Retry-After'] = String(Math.max(1, Math.ceil(error.retryAfterMs / 1000)));
+  }
+  return headers;
+}
+
+function getCachedTelegramNegative(key) {
+  const cached = getCachedTelegramValue(telegramNegativeCache, key);
+  if (!cached) return null;
+  const retryAfterMs = cached.retryAfterUntil
+    ? Math.max(1, cached.retryAfterUntil - Date.now())
+    : 0;
+  return createTelegramStatusError(cached.message, cached.statusCode, retryAfterMs);
+}
+
+function setCachedTelegramNegative(key, error) {
+  const statusCode = getTelegramErrorStatus(error);
+  // 504 is included so a chronically slow channel backs itself off instead of
+  // being retried on every 60s panel refresh. 503 stays out: it means "client
+  // reset / starting up", which is transient relay state, not a bad username.
+  if (![400, 404, 429, 504].includes(statusCode)) return;
+  const retryAfterMs = Number(error?.retryAfterMs) || 0;
+  const ttlMs = statusCode === 429 && retryAfterMs > 0
+    ? retryAfterMs
+    : TELEGRAM_NEGATIVE_CACHE_TTL_MS;
+  setCachedTelegramValue(telegramNegativeCache, key, {
+    message: String(error?.message || error || 'Telegram lookup failed'),
+    statusCode,
+    retryAfterUntil: retryAfterMs > 0 ? Date.now() + retryAfterMs : 0,
+  }, ttlMs);
+}
+
+// Derive the flood wait ONLY from structured error fields.
+//
+// Never parse error.message: GramJS builds its lookup errors by interpolating
+// the caller-supplied username verbatim — `No user has "${username}" as
+// username` (telegram/client/users.js) — and the username grammar allows
+// underscores and digits. A watchlist entry of `flood_wait_99999999` therefore
+// used to be read back as a flood duration, and because telegramFloodWaitUntil
+// is process-wide and only ever raised, one request could park the whole
+// Telegram subsystem (curated poll included) effectively forever.
+//
+// `seconds` is set by GramJS on FloodWaitError; `errorMessage` is the MTProto
+// error CODE (e.g. 'FLOOD_WAIT_42'), never free text, so an anchored match on
+// it cannot be spoofed. The cap is the backstop: no single upstream value may
+// wedge the process for longer than an operator would tolerate unattended.
+function parseTelegramFloodWaitMs(error) {
+  const seconds = Number(error?.seconds);
+  let waitMs = Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 0;
+
+  if (waitMs <= 0) {
+    const code = typeof error?.errorMessage === 'string' ? error.errorMessage : '';
+    const match = code.match(/^FLOOD_WAIT_(\d+)$/);
+    if (match) {
+      const parsed = Number(match[1]);
+      if (Number.isFinite(parsed) && parsed > 0) waitMs = parsed * 1000;
+    }
+  }
+
+  if (!Number.isFinite(waitMs) || waitMs <= 0) return 0;
+  return Math.min(waitMs, TELEGRAM_MAX_FLOOD_WAIT_MS);
+}
+
+function getTelegramFloodWaitRemainingMs(now = Date.now()) {
+  return Math.max(0, telegramFloodWaitUntil - now);
+}
+
+function assertTelegramRpcAllowed() {
+  const retryAfterMs = getTelegramFloodWaitRemainingMs();
+  if (retryAfterMs > 0) {
+    throw createTelegramStatusError('Telegram FLOOD_WAIT cooldown active', 429, retryAfterMs);
+  }
+}
+
+function normalizeTelegramRpcError(error) {
+  const retryAfterMs = parseTelegramFloodWaitMs(error);
+  if (retryAfterMs <= 0) return error;
+  telegramFloodWaitUntil = Math.max(telegramFloodWaitUntil, Date.now() + retryAfterMs);
+  return createTelegramStatusError(String(error?.message || error), 429, retryAfterMs);
+}
+
+function rejectTelegramRpcQueue(error) {
+  while (telegramRpcQueue.length) {
+    const entry = telegramRpcQueue.shift();
+    clearTimeout(entry.waitTimer);
+    entry.reject(error);
+  }
+}
+
+function drainTelegramRpcQueue() {
+  if (telegramRpcDrainTimer) return;
+
+  const cooldownMs = getTelegramFloodWaitRemainingMs();
+  if (cooldownMs > 0) {
+    const error = createTelegramStatusError('Telegram FLOOD_WAIT cooldown active', 429, cooldownMs);
+    rejectTelegramRpcQueue(error);
+    return;
+  }
+
+  while (telegramRpcActiveEntries.size < TELEGRAM_RPC_MAX_CONCURRENCY && telegramRpcQueue.length) {
+    const delayMs = Math.max(0, telegramRpcNextStartAt - Date.now());
+    if (delayMs > 0) {
+      telegramRpcDrainTimer = setTimeout(() => {
+        telegramRpcDrainTimer = null;
+        drainTelegramRpcQueue();
+      }, delayMs);
+      telegramRpcDrainTimer.unref?.();
+      return;
+    }
+
+    const entry = telegramRpcQueue.shift();
+    clearTimeout(entry.waitTimer);
+    telegramRpcActiveEntries.add(entry);
+    telegramRpcNextStartAt = Date.now() + TELEGRAM_RPC_MIN_INTERVAL_MS;
+    const operation = Promise.resolve().then(entry.operation);
+    let completed = false;
+    let released = false;
+    let timeout = null;
+    const release = () => {
+      if (released) return;
+      released = true;
+      telegramRpcActiveEntries.delete(entry);
+      drainTelegramRpcQueue();
+    };
+    const settle = (callback, value) => {
+      if (completed) return;
+      completed = true;
+      if (timeout) clearTimeout(timeout);
+      callback(value);
+      release();
+    };
+    entry.cancel = error => settle(entry.reject, error);
+    const entryTimeoutMs = entry.timeoutMs || TELEGRAM_CHANNEL_TIMEOUT_MS;
+    timeout = setTimeout(() => {
+      // One slow channel is not a dead socket. Tearing the client down here
+      // meant an arbitrary user-supplied channel could clear both lookup
+      // caches, reject every queued RPC and abort the curated poll mid-cycle,
+      // every 60s. Fail just this entry; only a RUN of timeouts (which implies
+      // the transport, not the channel) justifies resetting shared state.
+      const timeoutError = createTelegramStatusError(
+        `TIMEOUT after ${entryTimeoutMs}ms: ${entry.label}`,
+        504,
+      );
+      telegramConsecutiveRpcTimeouts++;
+      if (telegramConsecutiveRpcTimeouts >= TELEGRAM_MAX_CONSECUTIVE_RPC_TIMEOUTS) {
+        console.warn(`[Relay] Telegram RPC timed out ${telegramConsecutiveRpcTimeouts}x consecutively — resetting client`);
+        destroyTelegramClient(timeoutError, entry);
+        return;
+      }
+      settle(entry.reject, timeoutError);
+    }, entryTimeoutMs);
+    timeout.unref?.();
+    operation.then(
+      value => {
+        telegramConsecutiveRpcTimeouts = 0;
+        settle(entry.resolve, value);
+      },
+      error => settle(entry.reject, normalizeTelegramRpcError(error)),
+    );
+  }
+}
+
+// `priority` reserves the curated poll's place ahead of on-demand user lookups.
+// Both share one MTProto session and one global start interval, so without a
+// lane the product-managed feed competes on equal FIFO terms with arbitrary
+// user traffic and gets pushed past its own queue-wait timeout.
+function runTelegramRpc(label, operation, { priority = false, timeoutMs = 0 } = {}) {
+  assertTelegramRpcAllowed();
+  if (!priority && telegramRpcQueue.length >= TELEGRAM_RPC_MAX_QUEUE) {
+    throw createTelegramStatusError('Telegram RPC queue is full', 429, TELEGRAM_RPC_MIN_INTERVAL_MS);
+  }
+  return new Promise((resolve, reject) => {
+    const entry = { label, operation, resolve, reject, waitTimer: null, priority, timeoutMs };
+    if (priority) {
+      // No wait timer: the poll must not be evicted from its own queue by
+      // user-driven congestion. Its work is bounded by the cycle timeout.
+      const firstNonPriority = telegramRpcQueue.findIndex(queued => !queued.priority);
+      if (firstNonPriority < 0) telegramRpcQueue.push(entry);
+      else telegramRpcQueue.splice(firstNonPriority, 0, entry);
+    } else {
+      entry.waitTimer = setTimeout(() => {
+        const index = telegramRpcQueue.indexOf(entry);
+        if (index < 0) return;
+        telegramRpcQueue.splice(index, 1);
+        reject(createTelegramStatusError('Telegram RPC queue wait timed out', 429, TELEGRAM_RPC_MIN_INTERVAL_MS));
+      }, TELEGRAM_RPC_QUEUE_TIMEOUT_MS);
+      entry.waitTimer.unref?.();
+      telegramRpcQueue.push(entry);
+    }
+    drainTelegramRpcQueue();
+  });
+}
+
+async function withTelegramLookupSingleFlight(key, operation) {
+  const cachedError = getCachedTelegramNegative(key);
+  if (cachedError) throw cachedError;
+
+  const inflight = telegramLookupInflight.get(key);
+  if (inflight) return inflight;
+
+  const request = Promise.resolve()
+    .then(operation)
+    .catch(error => {
+      setCachedTelegramNegative(key, error);
+      throw error;
+    });
+  telegramLookupInflight.set(key, request);
+  try {
+    return await request;
+  } finally {
+    if (telegramLookupInflight.get(key) === request) telegramLookupInflight.delete(key);
+  }
+}
+
+function buildTelegramChannelPreview(entity, fallbackUsername, memberCount = null) {
+  const username = sanitizeTelegramUsername(entity?.username || fallbackUsername);
+  const title = String(entity?.title || entity?.firstName || username);
+  return {
+    username,
+    title,
+    memberCount: Number.isFinite(memberCount) ? memberCount : null,
+    url: `https://t.me/${username}`,
+  };
+}
+
+function assertTelegramConnectionCurrent(connection) {
+  if (telegramState.client !== connection.client || telegramState.api !== connection.Api) {
+    throw createTelegramStatusError('Telegram client reset during request', 503);
+  }
+}
+
+async function resolveTelegramChannelWithConnection(normalized, connection) {
+  assertTelegramConnectionCurrent(connection);
+  const cached = getCachedTelegramValue(telegramResolveCache, normalized);
+  if (cached) return cached;
+
+  return withTelegramLookupSingleFlight(`resolve:${normalized}`, async () => {
+    assertTelegramConnectionCurrent(connection);
+    const freshCached = getCachedTelegramValue(telegramResolveCache, normalized);
+    if (freshCached) return freshCached;
+
+    const entity = await runTelegramRpc(
+      `getEntity(${normalized})`,
+      () => connection.client.getEntity(normalized),
+    );
+
+    const TelegramChannel = connection.Api?.Channel;
+    if (!TelegramChannel || !(entity instanceof TelegramChannel) || !entity.username) {
+      // 404, not 400: a distinct status here told the caller that a username
+      // exists but belongs to a user/basic group, which is a username-existence
+      // oracle over Telegram paid for out of our own resolve budget.
+      throw createTelegramStatusError('Only public Telegram channels are supported', 404);
+    }
+
+    let memberCount = null;
+    if (connection.Api?.channels?.GetFullChannel) {
+      try {
+        const full = await runTelegramRpc(
+          `getFullChannel(${normalized})`,
+          () => connection.client.invoke(new connection.Api.channels.GetFullChannel({ channel: entity })),
+        );
+        const ChannelFull = connection.Api?.ChannelFull;
+        if (ChannelFull && full?.fullChat instanceof ChannelFull) {
+          memberCount = full?.fullChat?.participantsCount ?? null;
+        }
+      } catch (error) {
+        console.warn('[Relay] Telegram resolve participants count failed:', error?.message || error);
+      }
+    }
+
+    assertTelegramConnectionCurrent(connection);
+    const value = {
+      preview: buildTelegramChannelPreview(entity, normalized, memberCount),
+      entity,
+    };
+    setCachedTelegramValue(telegramResolveCache, normalized, value, TELEGRAM_RESOLVE_CACHE_TTL_MS);
+    return value;
+  });
+}
+
+async function resolveTelegramChannel(username) {
+  const normalized = sanitizeTelegramUsername(username);
+  const cached = getCachedTelegramValue(telegramResolveCache, normalized);
+  if (cached) return cached;
+  const cachedError = getCachedTelegramNegative(`resolve:${normalized}`);
+  if (cachedError) throw cachedError;
+  const connection = await initTelegramClientIfNeeded();
+  return resolveTelegramChannelWithConnection(normalized, connection);
+}
+
+async function fetchTelegramChannelFeed(username, limit = 20) {
+  const normalized = sanitizeTelegramUsername(username);
+  const safeLimit = Math.max(1, Math.min(50, Number(limit) || 20));
+  const cacheKey = `${normalized}:${safeLimit}`;
+  const cached = getCachedTelegramValue(telegramChannelCache, cacheKey);
+  if (cached) return cached;
+
+  return withTelegramLookupSingleFlight(`channel:${cacheKey}`, async () => {
+    const freshCached = getCachedTelegramValue(telegramChannelCache, cacheKey);
+    if (freshCached) return freshCached;
+
+    const connection = await initTelegramClientIfNeeded();
+    const { preview, entity } = await resolveTelegramChannelWithConnection(normalized, connection);
+    assertTelegramConnectionCurrent(connection);
+    const msgs = await runTelegramRpc(
+      `getMessages(${normalized})`,
+      () => connection.client.getMessages(entity, { limit: safeLimit }),
+    );
+    assertTelegramConnectionCurrent(connection);
+
+    const items = [];
+    const channel = { handle: preview.username, label: preview.title, topic: 'osint', region: 'watchlist' };
+    for (const msg of msgs || []) {
+      if (!msg || !msg.id || !msg.message) continue;
+      items.push(normalizeTelegramMessage(msg, channel));
+    }
+
+    items.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+
+    const value = {
+      source: 'telegram',
+      earlySignal: true,
+      enabled: TELEGRAM_ENABLED,
+      count: items.length,
+      updatedAt: new Date().toISOString(),
+      items,
+    };
+    setCachedTelegramValue(telegramChannelCache, cacheKey, value, TELEGRAM_CHANNEL_CACHE_TTL_MS);
+    return value;
+  });
+}
+
 let telegramPermanentlyDisabled = false;
 
-function destroyTelegramClient() {
+function destroyTelegramClient(
+  activeError = createTelegramStatusError('Telegram client not active', 503),
+  errorEntry = null,
+) {
   const client = telegramState.client;
   telegramState.client = null;
-  if (!client) return;
-  try { client.disconnect(); } catch {}
+  telegramState.api = null;
+  telegramResolveCache.clear();
+  telegramChannelCache.clear();
+  telegramLookupInflight.clear();
+  if (telegramRpcDrainTimer) clearTimeout(telegramRpcDrainTimer);
+  telegramRpcDrainTimer = null;
+  telegramRpcNextStartAt = 0;
+  telegramConsecutiveRpcTimeouts = 0;
+  const resetError = createTelegramStatusError('Telegram client reset after RPC timeout', 503);
+  rejectTelegramRpcQueue(resetError);
+  for (const entry of [...telegramRpcActiveEntries]) {
+    entry.cancel(entry === errorEntry ? activeError : resetError);
+  }
+  if (!client) return telegramDisconnectPromise;
+  try {
+    // Must be bounded: initTelegramClientIfNeeded awaits this promise before
+    // any other work, so a gramjs disconnect() that never settles would wedge
+    // every future lookup AND the poll loop permanently (and leak one pending
+    // poll per cycle once guardedTelegramPoll force-clears its in-flight flag).
+    // The shutdown path at the bottom of this file already races disconnect
+    // against a timer for the same reason; the socket is force-destroyed just
+    // below regardless, so abandoning a hung disconnect is safe.
+    telegramDisconnectPromise = withTimeout(
+      Promise.resolve(client.disconnect()),
+      TELEGRAM_DISCONNECT_TIMEOUT_MS,
+      'disconnectTelegramClient',
+    );
+  } catch (error) {
+    telegramDisconnectPromise = Promise.reject(error);
+  }
+  telegramDisconnectPromise.catch(() => {});
   try {
     if (client._sender) {
       client._sender._reconnecting = false;
@@ -1146,40 +1748,231 @@ function destroyTelegramClient() {
       }
     }
   } catch {}
+  return telegramDisconnectPromise;
 }
 
 async function initTelegramClientIfNeeded() {
-  if (!TELEGRAM_ENABLED) return false;
-  if (telegramState.client) return true;
-  if (telegramPermanentlyDisabled) return false;
+  if (!TELEGRAM_ENABLED) {
+    throw createTelegramStatusError('Telegram relay not configured', 503);
+  }
+  assertTelegramRpcAllowed();
+  if (telegramState.client && telegramState.api) {
+    return { client: telegramState.client, Api: telegramState.api };
+  }
+  if (telegramPermanentlyDisabled) {
+    throw createTelegramStatusError(telegramState.lastError || 'Telegram relay not active', 503);
+  }
 
+  if (telegramDisconnectPromise) {
+    const pendingDisconnect = telegramDisconnectPromise;
+    try {
+      await pendingDisconnect;
+    } catch (error) {
+      telegramState.lastError = `telegram disconnect failed: ${error?.message || error}`;
+      console.warn('[Relay] Telegram disconnect failed after forced socket teardown:', telegramState.lastError);
+    } finally {
+      // Clear in `finally` so a rejected/abandoned disconnect can never latch
+      // the variable and block every subsequent reconnect.
+      if (telegramDisconnectPromise === pendingDisconnect) telegramDisconnectPromise = null;
+    }
+  }
+
+  const retryAfterMs = (telegramState.startedAt + TELEGRAM_STARTUP_DELAY_MS) - Date.now();
+  if (retryAfterMs > 0) {
+    throw createTelegramStatusError('Telegram client startup delay active', 503, retryAfterMs);
+  }
+
+  if (telegramState.initPromise) return telegramState.initPromise;
+
+  const initPromise = connectTelegramClient();
+  telegramState.initPromise = initPromise;
+  try {
+    return await initPromise;
+  } finally {
+    if (telegramState.initPromise === initPromise) telegramState.initPromise = null;
+  }
+}
+
+async function connectTelegramClient() {
   const apiId = parseInt(String(process.env.TELEGRAM_API_ID || ''), 10);
   const apiHash = String(process.env.TELEGRAM_API_HASH || '');
   const sessionStr = String(process.env.TELEGRAM_SESSION || '');
 
-  if (!apiId || !apiHash || !sessionStr) return false;
+  if (!apiId || !apiHash || !sessionStr) {
+    throw createTelegramStatusError('Telegram relay not configured', 503);
+  }
 
   let client;
   try {
-    const { TelegramClient } = await import('telegram');
-    const { StringSession } = await import('telegram/sessions/index.js');
+    let Api;
+    if (RELAY_TEST_MODE && process.env.RELAY_TEST_TELEGRAM === 'true') {
+      class TestTelegramChannel {
+        constructor(username) {
+          this.username = username;
+          this.title = `Test ${username}`;
+        }
+      }
+      class TestTelegramChannelFull {
+        constructor(participantsCount) {
+          this.participantsCount = participantsCount;
+        }
+      }
+      class TestGetFullChannel {
+        constructor({ channel }) {
+          this.channel = channel;
+        }
+      }
+      const rpcDelay = async () => {
+        const delayMs = readTelegramNumberEnv('RELAY_TEST_TELEGRAM_RPC_DELAY_MS', 0);
+        if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
+      };
+      const pendingLookupRejects = new Set();
+      const maybeFailLookup = username => {
+        const floodUsername = String(process.env.RELAY_TEST_TELEGRAM_FLOOD_USERNAME || '').toLowerCase();
+        if (floodUsername && username === floodUsername) {
+          const seconds = Math.max(1, Number(process.env.RELAY_TEST_TELEGRAM_FLOOD_SECONDS || 3));
+          // Shaped like a real gramjs FloodWaitError: the duration lives in the
+          // structured `seconds` / `errorMessage` fields, NOT in free-text
+          // message. A fake that only set `message` meant every flood test
+          // exercised a parse branch production never takes.
+          const error = new Error(`A wait of ${seconds} seconds is required (caused by ResolveUsername)`);
+          error.seconds = seconds;
+          error.errorMessage = `FLOOD_WAIT_${seconds}`;
+          throw error;
+        }
+        const invalid = String(process.env.RELAY_TEST_TELEGRAM_INVALID_USERNAMES || '')
+          .split(',')
+          .map(value => value.trim().toLowerCase())
+          .filter(Boolean);
+        // Real gramjs interpolates the requested username into this message.
+        // Reproducing that verbatim is what lets a test prove a username like
+        // `flood_wait_99999999` cannot be read back as a flood duration.
+        if (invalid.includes(username)) throw new Error(`No user has "${username}" as username`);
+      };
+      Api = {
+        Channel: TestTelegramChannel,
+        ChannelFull: TestTelegramChannelFull,
+        ...(process.env.RELAY_TEST_TELEGRAM_SKIP_FULL_CHANNEL === 'true'
+          ? {}
+          : { channels: { GetFullChannel: TestGetFullChannel } }),
+      };
+      client = {
+        connect: async () => {
+          telegramTestConnectAttempts++;
+          console.log(`[Relay][TestTelegram] connect ${telegramTestConnectAttempts}`);
+          const hangAttempts = Math.max(0, Number(process.env.RELAY_TEST_TELEGRAM_CONNECT_HANG_ATTEMPTS || 0));
+          if (
+            process.env.RELAY_TEST_TELEGRAM_CONNECT_NEVER === 'true'
+            || telegramTestConnectAttempts <= hangAttempts
+          ) {
+            await new Promise(() => {});
+          }
+          const delayMs = Math.max(0, Number(process.env.RELAY_TEST_TELEGRAM_CONNECT_DELAY_MS || 0));
+          if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
+        },
+        disconnect: async () => {
+          for (const reject of pendingLookupRejects) reject(new Error('TEST_TELEGRAM_DISCONNECTED'));
+          pendingLookupRejects.clear();
+          // Models a gramjs disconnect that never settles, which used to wedge
+          // every later reconnect on an unbounded await.
+          if (process.env.RELAY_TEST_TELEGRAM_DISCONNECT_NEVER === 'true') {
+            await new Promise(() => {});
+          }
+          const delayMs = readTelegramNumberEnv('RELAY_TEST_TELEGRAM_DISCONNECT_DELAY_MS', 0);
+          if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
+          if (process.env.RELAY_TEST_TELEGRAM_DISCONNECT_REJECT === 'true') {
+            throw new Error('TEST_TELEGRAM_DISCONNECT_FAILED');
+          }
+        },
+        getEntity: async username => {
+          console.log(`[Relay][TestTelegram] getEntity ${username}`);
+          maybeFailLookup(username);
+          const never = String(process.env.RELAY_TEST_TELEGRAM_RPC_NEVER_USERNAMES || '')
+            .split(',')
+            .map(value => value.trim().toLowerCase())
+            .filter(Boolean);
+          if (never.includes(username)) {
+            return new Promise((_, reject) => pendingLookupRejects.add(reject));
+          }
+          await rpcDelay();
+          const delayedRejects = String(process.env.RELAY_TEST_TELEGRAM_RPC_REJECT_USERNAMES || '')
+            .split(',')
+            .map(value => value.trim().toLowerCase())
+            .filter(Boolean);
+          if (delayedRejects.includes('*') || delayedRejects.includes(String(username).toLowerCase())) {
+            throw new Error('TEST_TELEGRAM_RPC_FAILED');
+          }
+          const csvEnv = name => String(process.env[name] || '')
+            .split(',')
+            .map(value => value.trim().toLowerCase())
+            .filter(Boolean);
+          // Without these two hooks the fake could only ever produce a public
+          // channel, so the `instanceof Api.Channel` / `!entity.username` gate
+          // — the only thing rejecting user accounts and private channels —
+          // was unreachable from the suite and could be deleted while green.
+          if (csvEnv('RELAY_TEST_TELEGRAM_USER_USERNAMES').includes(username)) {
+            return { className: 'User', username, firstName: `Test ${username}` };
+          }
+          if (csvEnv('RELAY_TEST_TELEGRAM_PRIVATE_USERNAMES').includes(username)) {
+            const channel = new TestTelegramChannel(username);
+            channel.username = undefined;
+            return channel;
+          }
+          return new TestTelegramChannel(username);
+        },
+        invoke: async request => {
+          console.log(`[Relay][TestTelegram] getFullChannel ${request.channel.username}`);
+          const never = String(process.env.RELAY_TEST_TELEGRAM_FULL_NEVER_USERNAMES || '')
+            .split(',')
+            .map(value => value.trim().toLowerCase())
+            .filter(Boolean);
+          if (never.includes(request.channel.username)) {
+            return new Promise((_, reject) => pendingLookupRejects.add(reject));
+          }
+          await rpcDelay();
+          return {
+            fullChat: new TestTelegramChannelFull(
+              Math.max(0, Number(process.env.RELAY_TEST_TELEGRAM_MEMBER_COUNT || 1234)),
+            ),
+          };
+        },
+        getMessages: async (entity, { limit }) => {
+          console.log(`[Relay][TestTelegram] getMessages ${limit} ${entity.username}`);
+          await rpcDelay();
+          const messages = JSON.parse(process.env.RELAY_TEST_TELEGRAM_MESSAGES || '[]');
+          return Array.isArray(messages) ? messages.slice(0, limit) : [];
+        },
+      };
+    } else {
+      const telegram = await import('telegram');
+      const sessions = await import('telegram/sessions/index.js');
+      Api = telegram.Api;
+      client = new telegram.TelegramClient(new sessions.StringSession(sessionStr), apiId, apiHash, {
+        connectionRetries: 3,
+        // gramjs defaults this to 60 and SWALLOWS any flood shorter than the
+        // threshold by sleeping inside _call (telegram/client/users.js) before
+        // retrying. That sleep outlives TELEGRAM_CHANNEL_TIMEOUT_MS, so a
+        // routine sub-60s flood surfaced to us as an RPC timeout — bypassing
+        // the cooldown machinery below entirely and resetting the client
+        // instead. 0 makes every flood propagate immediately, which is what
+        // normalizeTelegramRpcError and telegramFloodWaitUntil expect.
+        floodSleepThreshold: 0,
+      });
+    }
 
-    client = new TelegramClient(new StringSession(sessionStr), apiId, apiHash, {
-      connectionRetries: 3,
-    });
-
-    await client.connect();
+    await withTimeout(client.connect(), TELEGRAM_CONNECT_TIMEOUT_MS, 'connectTelegramClient');
     telegramState.client = client;
+    telegramState.api = Api;
     telegramState.lastError = null;
     console.log('[Relay] Telegram client connected');
-    return true;
+    return { client, Api };
   } catch (e) {
     const em = e?.message || String(e);
     if (e?.code === 'ERR_MODULE_NOT_FOUND' || /Cannot find package|Directory import/.test(em)) {
       telegramPermanentlyDisabled = true;
       telegramState.lastError = 'telegram package not installed';
       console.warn('[Relay] Telegram package not installed — disabling permanently for this session');
-      return false;
+      throw createTelegramStatusError(telegramState.lastError, 503);
     }
     // Destroy the locally-created client directly — telegramState.client
     // is still null because connect() failed before the assignment. Without
@@ -1192,16 +1985,23 @@ async function initTelegramClientIfNeeded() {
       telegramPermanentlyDisabled = true;
       telegramState.lastError = 'session invalidated (AUTH_KEY_DUPLICATED) — generate a new TELEGRAM_SESSION';
       console.error('[Relay] Telegram session permanently invalidated (AUTH_KEY_DUPLICATED). Generate a new session with: node scripts/telegram/session-auth.mjs');
-      return false;
+      throw createTelegramStatusError(telegramState.lastError, 503);
     }
     telegramState.lastError = `telegram init failed: ${em}`;
     console.warn('[Relay] Telegram init failed:', telegramState.lastError);
-    return false;
+    throw e instanceof Error ? e : new Error(em);
   }
 }
 
-const TELEGRAM_CHANNEL_TIMEOUT_MS = 15_000; // 15s timeout per channel (getEntity + getMessages)
+const TELEGRAM_CHANNEL_TIMEOUT_MS = readTelegramNumberEnv('TELEGRAM_CHANNEL_TIMEOUT_MS', 15_000, 10);
 const TELEGRAM_POLL_CYCLE_TIMEOUT_MS = 180_000; // 3min max for entire poll cycle
+const TELEGRAM_POLL_STUCK_AFTER_MS = RELAY_TEST_MODE
+  ? readTelegramNumberEnv(
+    'RELAY_TEST_TELEGRAM_POLL_STUCK_AFTER_MS',
+    TELEGRAM_POLL_CYCLE_TIMEOUT_MS + 30_000,
+    10,
+  )
+  : TELEGRAM_POLL_CYCLE_TIMEOUT_MS + 30_000;
 
 function withTimeout(promise, ms, label) {
   return new Promise((resolve, reject) => {
@@ -1214,13 +2014,18 @@ function withTimeout(promise, ms, label) {
 }
 
 async function pollTelegramOnce() {
-  const ok = await initTelegramClientIfNeeded();
-  if (!ok) return;
+  let connection;
+  try {
+    connection = await initTelegramClientIfNeeded();
+  } catch (error) {
+    if (!telegramState.lastError) telegramState.lastError = error?.message || String(error);
+    return;
+  }
 
   const channels = telegramState.channels.length ? telegramState.channels : loadTelegramChannels();
   if (!channels.length) return;
 
-  const client = telegramState.client;
+  const client = connection.client;
   const newItems = [];
   const pollStart = Date.now();
   let channelsPolled = 0;
@@ -1228,6 +2033,7 @@ async function pollTelegramOnce() {
   let mediaSkipped = 0;
 
   for (const channel of channels) {
+    if (telegramState.client !== client || telegramState.api !== connection.Api) break;
     if (Date.now() - pollStart > TELEGRAM_POLL_CYCLE_TIMEOUT_MS) {
       console.warn(`[Relay] Telegram poll cycle timeout (${Math.round(TELEGRAM_POLL_CYCLE_TIMEOUT_MS / 1000)}s), polled ${channelsPolled}/${channels.length} channels`);
       break;
@@ -1237,15 +2043,25 @@ async function pollTelegramOnce() {
     const minId = telegramState.cursorByHandle[handle] || 0;
 
     try {
-      const entity = await withTimeout(client.getEntity(handle), TELEGRAM_CHANNEL_TIMEOUT_MS, `getEntity(${handle})`);
-      const msgs = await withTimeout(
-        client.getMessages(entity, {
-          limit: Math.max(1, Math.min(50, channel.maxMessages || 25)),
-          minId,
-        }),
-        TELEGRAM_CHANNEL_TIMEOUT_MS,
-        `getMessages(${handle})`
+      // One queue entry per CHANNEL, not per RPC. The global start interval is
+      // applied per dequeue, so enqueueing getEntity and getMessages separately
+      // doubled the pacing cost of a cycle (56 channels x 2 x 800ms = ~90s,
+      // against a 60s poll interval and a 180s cycle timeout) versus the single
+      // per-channel sleep this replaced. Priority keeps user lookups from
+      // interleaving into the middle of the poll's own pacing budget.
+      const msgs = await runTelegramRpc(
+        `poll(${handle})`,
+        async () => {
+          const entity = await client.getEntity(handle);
+          assertTelegramConnectionCurrent(connection);
+          return client.getMessages(entity, {
+            limit: Math.max(1, Math.min(50, channel.maxMessages || 25)),
+            minId,
+          });
+        },
+        { priority: true, timeoutMs: TELEGRAM_CHANNEL_TIMEOUT_MS * 2 },
       );
+      assertTelegramConnectionCurrent(connection);
 
       for (const msg of msgs) {
         if (!msg || !msg.id) continue;
@@ -1258,7 +2074,6 @@ async function pollTelegramOnce() {
       }
 
       channelsPolled++;
-      await new Promise(r => setTimeout(r, Math.max(300, Number(process.env.TELEGRAM_RATE_LIMIT_MS || 800))));
     } catch (e) {
       const em = e?.message || String(e);
       channelsFailed++;
@@ -1277,6 +2092,14 @@ async function pollTelegramOnce() {
         break;
       }
     }
+
+    // Rest AFTER the channel, not merely between RPC dispatches. The queue
+    // paces start-to-start, so leaning on it alone would make this loop's
+    // effective spacing `max(interval, pair latency)` instead of the
+    // `pair latency + interval` that main ships — roughly 1.75x the request
+    // rate against a shared account whose FLOOD_WAIT takes the curated feed
+    // down with it. Outside the try so a failing channel rests too.
+    await new Promise(resolve => setTimeout(resolve, TELEGRAM_RPC_MIN_INTERVAL_MS));
   }
 
   if (newItems.length) {
@@ -1314,27 +2137,26 @@ async function pollTelegramOnce() {
   }
 }
 
-let telegramPollInFlight = false;
-let telegramPollStartedAt = 0;
+let telegramPollRun = null;
 
 function guardedTelegramPoll() {
-  if (telegramPollInFlight) {
-    const stuck = Date.now() - telegramPollStartedAt;
-    if (stuck > TELEGRAM_POLL_CYCLE_TIMEOUT_MS + 30_000) {
-      console.warn(`[Relay] Telegram poll stuck for ${Math.round(stuck / 1000)}s — force-clearing in-flight flag`);
-      telegramPollInFlight = false;
-    } else {
-      return;
+  if (telegramPollRun) {
+    const stuck = Date.now() - telegramPollRun.startedAt;
+    if (stuck > TELEGRAM_POLL_STUCK_AFTER_MS && !telegramPollRun.warned) {
+      console.warn(`[Relay] Telegram poll stuck for ${Math.round(stuck / 1000)}s, waiting for the current poll to settle`);
+      telegramPollRun.warned = true;
     }
+    return false;
   }
-  telegramPollInFlight = true;
-  telegramPollStartedAt = Date.now();
+
+  const run = { startedAt: Date.now(), warned: false };
+  telegramPollRun = run;
   pollTelegramOnce()
     .catch(e => console.warn('[Relay] Telegram poll error:', e?.message || e))
-    .finally(() => { telegramPollInFlight = false; });
+    .finally(() => {
+      if (telegramPollRun === run) telegramPollRun = null;
+    });
 }
-
-const TELEGRAM_STARTUP_DELAY_MS = Math.max(0, Number(process.env.TELEGRAM_STARTUP_DELAY_MS || 120_000));
 
 function startTelegramPollLoop() {
   if (!TELEGRAM_ENABLED) return;
@@ -1355,12 +2177,14 @@ function startTelegramPollLoop() {
 
 // ─────────────────────────────────────────────────────────────
 // Curated X news-account monitoring (Track A / #6654)
-// Official X API user-timeline + since_id. Cadence 5–15 min.
-// Requires env: X_BEARER_TOKEN (same Bearer as company-monitoring-worker).
+// One public X List page in each fixed 15-minute UTC slot.
+// Requires the app bearer and the verified public List ID.
 // ─────────────────────────────────────────────────────────────
 const X_BEARER_TOKEN = String(process.env.X_BEARER_TOKEN || '').trim();
-const X_ENABLED = Boolean(X_BEARER_TOKEN);
-const X_POLL_INTERVAL_MS = xNewsAccounts.clampPollIntervalMs(process.env.X_POLL_INTERVAL_MS || xNewsAccounts.DEFAULT_POLL_INTERVAL_MS);
+const X_CURATED_LIST_ID = String(process.env.X_CURATED_LIST_ID || '').trim();
+const X_CURATED_LIST_CONFIGURED = /^[1-9]\d{0,18}$/.test(X_CURATED_LIST_ID);
+const X_ENABLED = Boolean(X_BEARER_TOKEN && X_CURATED_LIST_CONFIGURED);
+const X_POLL_INTERVAL_MS = 15 * 60 * 1000;
 // `Number('abc')` is NaN, and Math.max(50, NaN) is NaN — which reaches
 // mergeAndDedup as `.slice(0, NaN)` and silently publishes an EMPTY feed every
 // cycle with no error anywhere. Coerce non-numeric env values to the default.
@@ -1373,38 +2197,44 @@ const X_FEED_POLL_STATE_KEY = 'intelligence:x-feed:poll-state:v1';
 const X_FEED_POLL_LOCK_KEY = 'intelligence:x-feed:poll-lock:v1';
 const X_FEED_TTL_SECONDS = 5400;
 const X_FEED_META_TTL_SECONDS = 3600;
-const X_FEED_POLL_LOCK_TTL_SECONDS = Math.ceil((X_POLL_INTERVAL_MS + 120_000) / 1000);
-// The stuck-poll abort has to fire while the Redis lease above is still HELD,
-// and the guard only re-evaluates when a scheduled tick calls it. A threshold at
-// or above the cadence therefore pushes the first evaluation out to 2x the
-// cadence — well past the lease TTL — so between TTL expiry and that tick this
-// replica keeps issuing requests on a lapsed lease while a peer's SETNX
-// succeeds: both drain the shared bearer's quota and both write the whole cursor
-// map. Sitting a minute under the cadence (clamped to 5-15min, so 4-14min here)
-// makes the very next tick abort the run, with the lease still ours to release.
-// Derived from the same constant as the TTL so the invariant
-// X_POLL_STUCK_AFTER_MS < X_POLL_INTERVAL_MS < X_FEED_POLL_LOCK_TTL_SECONDS * 1000
-// cannot drift the way two independently tuned literals can.
-const X_POLL_STUCK_AFTER_MS = X_POLL_INTERVAL_MS - 60_000;
+// Two bounded 15-second X calls plus Redis work fit inside two minutes. A short
+// lease lets another replica recover at the next quarter-hour boundary after an
+// owner crash instead of losing two slots to the old cadence-sized lease.
+const X_FEED_POLL_LOCK_TTL_SECONDS = 120;
+// The process-local guard is checked on each scheduled boundary. If a request
+// somehow outlives the normal timeout, the next boundary aborts that generation
+// before it starts a replacement run.
+const X_POLL_STUCK_AFTER_MS = 60_000;
+const xPostBudget = createXPostBudget({
+  evalCommand: upstashEval,
+  dailyCoveragePosts: DEFAULT_X_CURATED_DAILY_COVERAGE_POSTS,
+});
 
 const xState = {
   accounts: [],
-  cursorByAccountId: Object.create(null),
-  accountIdByHandle: Object.create(null),
-  catchupByAccountId: Object.create(null),
+  lastMembershipCheckAt: 0,
   items: [],
   lookupOffset: 0,
-  accountOffset: 0,
   // Persisted snapshot version, published to Redis and to /status. NOT the poll
   // guard's run counter — see xPollGeneration below for why the two must stay
   // apart.
   generation: 0,
   lastPollAt: 0,
   lastHealthyAt: 0,
+  lastAttemptAt: 0,
+  lastProviderSuccessAt: 0,
+  lastAcceptedPublicationAt: 0,
+  lastAttemptSlot: null,
+  lastProviderSuccessSlot: null,
+  lastPublishedSlot: null,
   lastCoverage: null,
   lastError: null,
   rateLimitedUntil: 0,
   rateLimitAttempt: 0,
+  backoffCause: null,
+  lastDeletionAuditAt: 0,
+  lastCycleUsage: null,
+  postBudget: null,
   // True when a Redis read failed, so last-good state is present but unreadable.
   // Blocks polling/publishing until a clean read (see the cycle's hydrate()).
   hydrationFailed: false,
@@ -1423,18 +2253,15 @@ let xPollGeneration = 0;
 
 function loadXAccounts() {
   const p = path.join(__dirname, '..', 'data', 'x-accounts.json');
-  const set = String(process.env.X_CHANNEL_SET || '').trim().toLowerCase();
   try {
     const raw = JSON.parse(readFileSync(p, 'utf8'));
     const enabledTotal = xNewsAccounts.countEnabledAccounts(raw);
     if (enabledTotal > X_TRACK_A_ACCOUNT_BUDGET) {
       console.warn(`[Relay] X registry has ${enabledTotal} enabled accounts; Track A budget is ~${X_TRACK_A_ACCOUNT_BUDGET}. Re-run spend math before growing the set.`);
     }
-    xState.accounts = set
-      ? xNewsAccounts.loadXAccounts(raw, { set })
-      : xNewsAccounts.loadXAccounts(raw);
+    xState.accounts = xNewsAccounts.loadXAccounts(raw);
     if (!xState.accounts.length) {
-      console.warn(`[Relay] X account set "${set || 'all'}" is empty — no accounts to poll`);
+      console.warn('[Relay] X account registry is empty — no accounts to poll');
     }
     return xState.accounts;
   } catch (e) {
@@ -1455,6 +2282,7 @@ function loadXAccounts() {
 const xPollCycle = createXPollCycle({
   xState,
   xNewsAccounts,
+  xPostBudget,
   loadXAccounts,
   upstashGet,
   upstashSetNx,
@@ -1468,6 +2296,8 @@ const xPollCycle = createXPollCycle({
   randomId: () => crypto.randomBytes(4).toString('hex'),
   X_ENABLED,
   X_BEARER_TOKEN,
+  X_CURATED_LIST_ID,
+  X_POLL_INTERVAL_MS,
   X_FEED_CACHE_KEY,
   X_FEED_META_KEY,
   X_FEED_POLL_STATE_KEY,
@@ -1496,32 +2326,40 @@ const xPollGuard = createPollGenerationGuard({
 });
 
 function guardedXPoll(retryAfterLeaseConflict = false) {
-  xPollGuard.run({ retryAfterLeaseConflict });
+  return xPollGuard.run({ retryAfterLeaseConflict });
 }
 
 async function startXPollLoop() {
   loadXAccounts();
   await xPollCycle.hydrate();
   if (!X_ENABLED) {
-    console.warn('[Relay] X news-account poll skipped — X_BEARER_TOKEN is not configured on ais-relay');
+    const missing = [
+      !X_BEARER_TOKEN ? 'X_BEARER_TOKEN' : null,
+      !X_CURATED_LIST_CONFIGURED ? 'valid X_CURATED_LIST_ID' : null,
+    ].filter(Boolean);
+    xState.lastError = `X List poll disabled: missing ${missing.join(' and ')}`;
+    console.warn(`[Relay] ${xState.lastError}`);
     return;
   }
+  const slot = xPollSlot(Date.now(), X_POLL_INTERVAL_MS);
   const nextDueAt = Math.max(
-    xState.lastPollAt ? xState.lastPollAt + X_POLL_INTERVAL_MS : 0,
+    xState.lastAttemptSlot === slot.id ? slot.endsAt : Date.now(),
     xState.rateLimitedUntil || 0,
   );
   const startupDelayMs = Math.max(0, nextDueAt - Date.now());
-  const startInterval = () => {
-    guardedXPoll();
-    setInterval(guardedXPoll, X_POLL_INTERVAL_MS).unref?.();
+  const pollAndScheduleNextSlot = () => {
+    const started = guardedXPoll();
+    const activeSlot = xPollSlot(Date.now(), X_POLL_INTERVAL_MS);
+    const delayMs = started ? Math.max(1000, activeSlot.endsAt - Date.now()) : 1000;
+    setTimeout(pollAndScheduleNextSlot, delayMs).unref?.();
   };
   if (startupDelayMs > 0) {
-    const timer = setTimeout(startInterval, startupDelayMs);
+    const timer = setTimeout(pollAndScheduleNextSlot, startupDelayMs);
     timer.unref?.();
   } else {
-    startInterval();
+    pollAndScheduleNextSlot();
   }
-  console.log(`[Relay] X poll loop started (${Math.round(X_POLL_INTERVAL_MS / 60000)} min cadence)`);
+  console.log('[Relay] X List poll loop started (fixed 15-minute UTC slots)');
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -2429,9 +3267,12 @@ const MARKET_YAHOO_REFRESH_INTERVAL_MS = Math.max(
     : 900_000,
 );
 
+const { loadMarketSeedUniverse } = require('./shared/market-seed-universe.cjs');
 const _stockCfg = requireShared('stocks.json');
-const MARKET_SYMBOLS = _stockCfg.symbols.map((s) => s.symbol);
-const MARKET_META = new Map(_stockCfg.symbols.map((s) => [s.symbol, { name: s.name, display: s.display }]));
+const _stockUniverse = loadMarketSeedUniverse(_stockCfg);
+const MARKET_SYMBOLS = _stockUniverse.allSymbols;
+const MARKET_AUXILIARY_SYMBOLS = _stockUniverse.auxiliarySymbols;
+const MARKET_META = _stockUniverse.metaBySymbol;
 
 const _commodityCfg = requireShared('commodities.json');
 const COMMODITY_SYMBOLS = _commodityCfg.commodities.map(c => c.symbol);
@@ -2449,33 +3290,32 @@ const YAHOO_ONLY = new Set([
   ...COMMODITY_SYMBOLS.filter(s => s.endsWith('=X')),
 ]);
 
+// CommonJS cannot import finiteObservation from _seed-utils.mjs. The relay test
+// keeps this boundary guard aligned with the cron seeder.
+function _finiteObservation(value) {
+  if (typeof value !== 'number' && (typeof value !== 'string' || !value.trim())) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
 function _parseYahooChartJson(body) {
   try {
     const data = JSON.parse(body);
     const result = data?.chart?.result?.[0];
     const meta = result?.meta;
     if (!meta) return null;
-    const price = meta.regularMarketPrice;
-    const prevClose = meta.chartPreviousClose || meta.previousClose || price;
+    const price = _finiteObservation(meta.regularMarketPrice);
+    if (price == null) return null;
+    const prevClose = [meta.chartPreviousClose, meta.previousClose]
+      .map(_finiteObservation)
+      .find((value) => value != null && value !== 0) ?? price;
     const change = prevClose ? ((price - prevClose) / prevClose) * 100 : 0;
-    // Round to 7 significant digits like the cron seeders' roundSparkline
-    // (_seed-utils.mjs). Raw float64 noise made these FAST-tier keys ~2x the
-    // rounded size, and whichever writer wins the relay/cron race decides
-    // what every visitor downloads on cold load.
-    //
-    // The guard below MIRRORS toSignificantDigits in _seed-utils.mjs exactly:
-    // non-numbers, non-finite values and 0 pass through untouched so a malformed
-    // upstream degrades identically on both writers. Without it a string close
-    // ("N/A") becomes NaN and serialises to null, denting the curve on the relay
-    // path only. CJS cannot import the ESM helper, so the copy is deliberate and
-    // tests/ais-relay-sparkline-precision.test.mjs pins the two in lockstep.
     const closes = result.indicators?.quote?.[0]?.close;
     const sparkline = Array.isArray(closes)
-      ? closes.filter((v) => v != null).map((v) => (
-        typeof v === 'number' && Number.isFinite(v) && v !== 0
-          ? Number(v.toPrecision(7))
-          : v
-      ))
+      ? closes
+        .map(_finiteObservation)
+        .filter((value) => value != null)
+        .map((value) => (value !== 0 ? Number(value.toPrecision(7)) : value))
       : [];
     return { price, change, sparkline };
   } catch { return null; }
@@ -2659,6 +3499,7 @@ async function seedMarketQuotes() {
     : finnhubSymbols;
   const yahooPlan = planYahooRefresh({
     mandatoryYahooSymbols: yahooSymbols,
+    everyCycleSymbols: MARKET_AUXILIARY_SYMBOLS.filter((s) => YAHOO_ONLY.has(s)),
     missedPrimarySymbols: missedFinnhub,
     nowMs: Date.now(),
     lastRefreshAt: _lastYahooMarketRefreshAt,
@@ -2688,12 +3529,18 @@ async function seedMarketQuotes() {
   const yahooSuccessCount = freshQuotes.length - freshCountBeforeYahoo;
   const coveredByYahoo = finnhubSymbols.every((s) => quotes.some((q) => q.symbol === s));
   const skipped = !FINNHUB_API_KEY && !coveredByYahoo;
-  const payload = { quotes, finnhubSkipped: skipped, skipReason: skipped ? 'FINNHUB_API_KEY not configured' : '', rateLimited: false };
   const redisKey = `market:quotes:v1:${[...MARKET_SYMBOLS].sort().join(',')}`;
   // Compute once and thread through every write below so the envelopes'
   // _seed.fetchedAt and seed-meta.fetchedAt agree for this one publish,
   // instead of each awaited round-trip sampling Date.now() independently.
   const fetchedAt = Date.now();
+  const payload = {
+    quotes,
+    finnhubSkipped: skipped,
+    skipReason: skipped ? 'FINNHUB_API_KEY not configured' : '',
+    rateLimited: false,
+    asOf: resolveMergedQuotesAsOf(freshQuotes, quotes, previousPayload?.asOf, fetchedAt),
+  };
   const ok = await envelopeWrite(redisKey, payload, MARKET_SEED_TTL, { fetchedAt, recordCount: quotes.length, sourceVersion: 'market-stocks' });
   // Bootstrap-friendly fixed key — frontend hydrates from /api/bootstrap without RPC
   const ok2 = await envelopeWrite('market:stocks-bootstrap:v1', payload, MARKET_SEED_TTL, { fetchedAt, recordCount: quotes.length, sourceVersion: 'market-stocks' });
@@ -3783,6 +4630,7 @@ const RELAY_RECENCY_MS = 15 * 60 * 1000; // 15 min — matches client-side recen
 const RELAY_SOURCE_TIERS = {
   ...requireShared('source-tiers.json'),
   ...requireShared('x-account-source-tiers.json'),
+  [SAUDI_CIVIL_DEFENSE.name]: SAUDI_CIVIL_DEFENSE.tier,
 };
 const {
   createExplicitTierFourSourceSet,
@@ -3934,6 +4782,15 @@ Key distinction: "critical" requires GEOPOLITICAL scope — events that destabil
 - "Man killed his estranged wife" → domestic crime → info
 - "How to Crack the SAM Database in Kali Linux" → tutorial → info
 
+Do not under-rate "high". The EVENT itself is high even when nobody is hurt and even when the headline reports a vote, an approval or an announcement:
+- a sanctions package or sanctions bill passed, signed or imposed
+- a major arms sale or weapons transfer approved between states
+- a military deployment or force movement ahead of an operation
+- an armed attack, raid or clash with deaths, including one that was repelled
+- many deaths in state custody or by state action
+- a natural disaster that floods, destroys or displaces on a regional scale
+Use medium for analysis of or reaction to such an event, not for the event itself.
+
 Input: numbered lines "index|Title"
 Output: [{"i":0,"l":"high","c":"conflict"}, ...]
 
@@ -4056,7 +4913,14 @@ const CLASSIFY_LLM_PROVIDERS = [
     name: 'openrouter',
     envKey: 'OPENROUTER_API_KEY',
     apiUrl: 'https://openrouter.ai/api/v1/chat/completions',
-    model: 'deepseek/deepseek-v4-flash',
+    // Classification only — NOT the shared Flash default. Against 413 blind-judged
+    // headlines v4-flash raised 51 false critical/high labels for 42 real ones; v4.1
+    // with the "Do not under-rate high" prompt block raised 15-21 for 41 (three runs).
+    // Both halves are load-bearing: v4.1 without the block misses 7 of 44 real alerts
+    // instead of 3, and the block on v4-flash still raises 56 false ones.
+    // Pinned to that evidence by tests/classify-alert-label-precision.test.mjs;
+    // re-measure with scripts/eval-classify-labels.mjs before changing either.
+    model: 'deepseek/deepseek-v4.1-flash',
     headers: (key) => ({ Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'https://worldmonitor.app', 'X-Title': 'World Monitor', 'User-Agent': CHROME_UA }),
     extraBody: { reasoning: { enabled: false }, provider: OPENROUTER_PROVIDER_ROUTING },
     timeout: 30000,
@@ -4084,14 +4948,15 @@ const CLASSIFY_LLM_PROVIDERS = [
     envKey: 'GROQ_API_KEY',
     apiUrl: 'https://api.groq.com/openai/v1/chat/completions',
     model: GROQ_DEFAULT_MODEL,
+    extraBody: GROQ_REASONING_EXTRA_BODY,
     headers: (key) => ({ Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'User-Agent': CHROME_UA }),
     timeout: 30000,
   },
 ];
 
-function classifyFetchLlmSingle(titles, _apiKey, apiUrl, model, headers, extraBody, timeout) {
+function classifyFetchLlmSingle(titles, _apiKey, apiUrl, model, headers, extraBody, timeout, maxTextChars = 200) {
   return new Promise((resolve) => {
-    const sanitized = titles.map((t) => t.replace(/[\n\r]/g, ' ').replace(/\|/g, '/').slice(0, 200).trim());
+    const sanitized = titles.map((t) => t.replace(/[\n\r]/g, ' ').replace(/\|/g, '/').slice(0, maxTextChars).trim());
     const prompt = sanitized.map((t, i) => `${i}|${t}`).join('\n');
     const bodyStr = JSON.stringify({
       model,
@@ -4134,7 +4999,7 @@ function classifyFetchLlmSingle(titles, _apiKey, apiUrl, model, headers, extraBo
   });
 }
 
-async function classifyFetchLlm(titles) {
+async function classifyFetchLlm(titles, maxTextChars = 200) {
   for (const provider of CLASSIFY_LLM_PROVIDERS) {
     const envVal = process.env[provider.envKey];
     if (!envVal) continue;
@@ -4143,7 +5008,7 @@ async function classifyFetchLlm(titles) {
     const model = typeof provider.model === 'function' ? provider.model() : provider.model;
     const headers = provider.headers(envVal);
 
-    const result = await classifyFetchLlmSingle(titles, envVal, apiUrl, model, headers, provider.extraBody || {}, provider.timeout);
+    const result = await classifyFetchLlmSingle(titles, envVal, apiUrl, model, headers, provider.extraBody || {}, provider.timeout, maxTextChars);
     if (result) {
       return result;
     }
@@ -4152,61 +5017,89 @@ async function classifyFetchLlm(titles) {
   return null;
 }
 
+// Jev shadow (scripts/lib/jev-classify-relay.cjs): observes the labels the LLM
+// chain already cached, and records disagreements. It decides nothing, and is
+// inert without TYPESAFE_API_KEY.
+const jevShadow = require('./lib/jev-classify-relay.cjs');
+const JEV_SHADOW_PUSH_SCRIPT = "redis.call('LPUSH', KEYS[1], ARGV[1]) redis.call('LTRIM', KEYS[1], 0, tonumber(ARGV[2]) - 1) redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3])) return 1";
+const observeJevShadow = jevShadow.createShadowObserver({
+  fetchJevLabel: (title, maxTextChars) => jevShadow.fetchJevLabel(title, maxTextChars, { apiKey: jevShadow.jevApiKey() }),
+  record: (row) => upstashEval(JEV_SHADOW_PUSH_SCRIPT, [jevShadow.SHADOW_LOG_KEY], [JSON.stringify(row), jevShadow.SHADOW_LOG_MAX, jevShadow.SHADOW_LOG_TTL_S]),
+});
+
 let classifyInFlight = false;
 
 async function seedClassifyForVariant(variant, seenTitles) {
-  const digestUrl = `https://api.worldmonitor.app/api/news/v1/list-feed-digest?variant=${variant}&lang=en`;
+  const digestUrl = buildClassifyDigestUrl(variant);
+  const transport = classifyDigestTransport(digestUrl) === 'http' ? http : https;
   let digest;
-  try {
-    const resp = await new Promise((resolve, reject) => {
-      const req = https.get(digestUrl, {
-        headers: { Accept: 'application/json', 'User-Agent': CHROME_UA },
-        timeout: 15000,
-      }, resolve);
-      req.on('error', reject);
-      req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
-    });
-    if (resp.statusCode !== 200) { resp.resume(); return { total: 0, classified: 0, skipped: 0 }; }
-    const body = await new Promise((resolve) => {
-      let d = '';
-      resp.on('data', (c) => { d += c; });
-      resp.on('end', () => resolve(d));
-    });
-    digest = JSON.parse(body);
-  } catch {
-    return { total: 0, classified: 0, skipped: 0 };
+  const maxDigestAttempts = CLASSIFY_DIGEST_RETRY_DELAYS_MS.length + 1;
+  for (let attempt = 0; attempt < maxDigestAttempts; attempt++) {
+    try {
+      const resp = await new Promise((resolve, reject) => {
+        const req = transport.get(digestUrl, {
+          headers: buildClassifyDigestHeaders({
+            userAgent: CHROME_UA,
+            relayKey: RELAY_API_KEY,
+          }),
+          timeout: 15000,
+        }, resolve);
+        req.on('error', reject);
+        req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+      });
+      if (resp.statusCode !== 200) {
+        resp.resume();
+        const retry = classifyDigestRetryDecision({ attempt, status: resp.statusCode });
+        if (retry.retry) {
+          console.warn(`[Classify] digest fetch HTTP ${resp.statusCode}; retrying in ${retry.delayMs}ms`);
+          await new Promise((r) => setTimeout(r, retry.delayMs));
+          continue;
+        }
+        console.warn(formatClassifyDigestFetchFailure(resp.statusCode, RELAY_API_KEY));
+        return { total: 0, classified: 0, skipped: 0, fetchFailed: true };
+      }
+      const body = await new Promise((resolve) => {
+        let d = '';
+        resp.on('data', (c) => { d += c; });
+        resp.on('end', () => resolve(d));
+      });
+      digest = JSON.parse(body);
+      break;
+    } catch (e) {
+      const retry = classifyDigestRetryDecision({ attempt, error: e });
+      if (retry.retry) {
+        console.warn(`[Classify] digest fetch error: ${e?.message || e}; retrying in ${retry.delayMs}ms`);
+        await new Promise((r) => setTimeout(r, retry.delayMs));
+        continue;
+      }
+      console.warn('[Classify] digest fetch error:', e?.message || e);
+      return { total: 0, classified: 0, skipped: 0, fetchFailed: true };
+    }
+  }
+  if (!digest) {
+    console.warn('[Classify] digest fetch error: exhausted retries');
+    return { total: 0, classified: 0, skipped: 0, fetchFailed: true };
   }
 
-  // Map of title → item metadata; recency gate: skip articles older than 6h
+  // #7084: stale RSS titles already had their alert pass when served fresh.
+  // Exclude only those digest-derived candidates; fresh X candidates remain
+  // eligible because they are an independent input to the combined pass.
+  if (isStaleDigestReplay(digest)) {
+    console.log(`[Classify] digest is a stale replay (${digest.coverage.staleReason || 'unknown'}, ${digest.coverage.staleAgeSeconds ?? 0}s) — skipping digest-derived candidates for ${variant}`);
+  }
+
+  // Map of title → item metadata; recency gate: skip articles older than 6h.
+  // The pure helper keeps the stale-RSS plus fresh-X behavior executable in
+  // tests without importing this boot-on-require relay.
   const RECENCY_GATE_MS = 6 * 60 * 60 * 1000;
-  const now6h = Date.now() - RECENCY_GATE_MS;
-  const allTitles = new Map();
-  if (digest?.categories) {
-    for (const bucket of Object.values(digest.categories)) {
-      for (const item of bucket?.items ?? []) {
-        if (!item?.title) continue;
-        if (item.publishedAt && item.publishedAt < now6h) continue; // stale item
-        if (!allTitles.has(item.title)) {
-          allTitles.set(item.title, {
-            source: item.source ?? variant,
-            publishedAt: item.publishedAt ?? Date.now(),
-            corroborationCount: item.corroborationCount ?? 1,
-            link: item.link ?? '',
-          });
-        }
-      }
-    }
-  }
-  for (const candidate of xNewsAccounts.collectXAlertCandidates(xState.items, RELAY_SOURCE_TIERS, Date.now(), RECENCY_GATE_MS)) {
-    if (!allTitles.has(candidate.title)) {
-      allTitles.set(candidate.title, {
-        source: candidate.source,
-        publishedAt: candidate.publishedAt,
-        corroborationCount: candidate.corroborationCount,
-        link: candidate.link,
-      });
-    }
-  }
+  const classifyNow = Date.now();
+  const xCandidates = xNewsAccounts.collectXAlertCandidates(
+    xState.items,
+    RELAY_SOURCE_TIERS,
+    classifyNow,
+    RECENCY_GATE_MS,
+  );
+  const allTitles = buildClassifyCandidateMap(digest, xCandidates, variant, classifyNow, RECENCY_GATE_MS);
   if (allTitles.size === 0) return { total: 0, classified: 0, skipped: 0 };
 
   const titleArr = [...allTitles.keys()];
@@ -4241,6 +5134,7 @@ async function seedClassifyForVariant(variant, seenTitles) {
 
   let classified = 0;
   let skipped = 0;
+  const shadow = { asked: 0, answered: 0, agreed: 0, alertFlips: 0 };
 
   for (let b = 0; b < misses.length; b += CLASSIFY_BATCH_SIZE) {
     const chunk = misses.slice(b, b + CLASSIFY_BATCH_SIZE);
@@ -4255,6 +5149,7 @@ async function seedClassifyForVariant(variant, seenTitles) {
     }
 
     const classifiedSet = new Set();
+    const labelled = [];
     for (const entry of llmResult) {
       const idx = entry?.i;
       if (typeof idx !== 'number' || idx < 0 || idx >= chunk.length) continue;
@@ -4265,6 +5160,7 @@ async function seedClassifyForVariant(variant, seenTitles) {
       classifiedSet.add(idx);
       await upstashSet(classifyCacheKey(chunk[idx]), { level, category, timestamp: Date.now() }, CLASSIFY_CACHE_TTL);
       classified++;
+      labelled.push({ title: chunk[idx], level });
       // Attribute newly classified title to country stats (global dedup via seenTitles)
       if (!seenTitles.has(chunk[idx])) {
         seenTitles.add(chunk[idx]);
@@ -4333,8 +5229,17 @@ async function seedClassifyForVariant(variant, seenTitles) {
         skipped++;
       }
     }
+
+    // Last, and read-only: every label above is already cached and published.
+    const observed = await observeJevShadow(variant, labelled).catch(() => null);
+    if (observed) {
+      for (const k of Object.keys(shadow)) shadow[k] += observed[k];
+    }
   }
 
+  if (shadow.asked > 0) {
+    console.log(`[Classify] Jev shadow ${variant}: asked ${shadow.asked}, answered ${shadow.answered}, agreed ${shadow.agreed}, alert flips ${shadow.alertFlips}`);
+  }
   return { total: titleArr.length, classified, skipped, byCountry };
 }
 
@@ -4349,14 +5254,39 @@ async function seedClassify() {
       return;
     }
 
+    try {
+      await publishSaudiCivilDefenseAlerts(telegramState.items, {
+        now: Date.now,
+        readCache: upstashGet,
+        writeCache: upstashSet,
+        classify: (posts) => classifyFetchLlm(posts, MAX_POST_CHARS),
+        publish: (event) => publishNotificationEvent({
+          ...event,
+          payload: {
+            ...event.payload,
+            importanceScore: relayComputeImportanceScore(
+              event.severity, event.payload.source, 1, event.payload.publishedAt,
+              { title: event.payload.title, classSource: 'llm', entityCorroborationCount: 0 },
+            ),
+          },
+        }),
+      });
+    } catch (e) {
+      console.warn('[Classify] Saudi Civil Defense alerts failed:', e?.message || e);
+    }
+
     let totalClassified = 0;
     let totalSkipped = 0;
+    let fetchOk = 0;
+    let fetchFailed = 0;
     const mergedByCountry = {};
     const seenTitles = new Set();
     for (let v = 0; v < CLASSIFY_VARIANTS.length; v++) {
       if (v > 0) await new Promise((r) => setTimeout(r, CLASSIFY_VARIANT_STAGGER_MS));
       try {
         const stats = await seedClassifyForVariant(CLASSIFY_VARIANTS[v], seenTitles);
+        if (stats.fetchFailed) fetchFailed += 1;
+        else fetchOk += 1;
         totalClassified += stats.classified;
         totalSkipped += stats.skipped;
         console.log(`[Classify] ${CLASSIFY_VARIANTS[v]}: ${stats.total} titles, ${stats.classified} classified, ${stats.skipped} skipped`);
@@ -4369,6 +5299,11 @@ async function seedClassify() {
       } catch (e) {
         console.warn(`[Classify] ${CLASSIFY_VARIANTS[v]} error:`, e?.message || e);
       }
+    }
+
+    if (!shouldWriteClassifySeedMeta({ fetchOk, fetchFailed })) {
+      console.warn('[Classify] Digest fetch failed for every variant — not writing seed-meta:classify');
+      return;
     }
 
     await upstashSet('seed-meta:news:threat-summary', { fetchedAt: Date.now(), recordCount: Object.keys(mergedByCountry).length }, 604800);
@@ -5286,6 +6221,8 @@ async function seedWeatherAlerts() {
       requireAlertFeatures,
       selectEcccAlerts,
       selectSwicAlerts,
+      selectWeatherNotificationAlerts,
+      weatherAlertFamilyKey,
       weatherAlertNotifyCountryCode,
       weatherAlertNotifyLocation,
       weatherAlertNotifySource,
@@ -5340,10 +6277,16 @@ async function seedWeatherAlerts() {
       maxBytes: SWIC_MAX_BYTES,
     });
 
+    const sourceSuccessAt = {};
+    const fetchSource = async (source, fetchFn) => {
+      const value = await fetchFn();
+      sourceSuccessAt[source] = Date.now();
+      return value;
+    };
     const [nwsResult, ecccResult, swicResult] = await Promise.allSettled([
-      fetchNwsFeatures(),
-      fetchEcccFeatures(),
-      fetchSwicCatalog(),
+      fetchSource('nws', fetchNwsFeatures),
+      fetchSource('eccc', fetchEcccFeatures),
+      fetchSource('swic', fetchSwicCatalog),
     ]);
     if (nwsResult.status === 'rejected') {
       console.warn(`[Weather] NWS fetch failed: ${nwsResult.reason?.message || nwsResult.reason}`);
@@ -5354,10 +6297,9 @@ async function seedWeatherAlerts() {
     if (swicResult.status === 'rejected') {
       console.warn(`[Weather] SWIC fetch failed: ${swicResult.reason?.message || swicResult.reason}`);
     }
-    if (nwsResult.status === 'rejected' && ecccResult.status === 'rejected' && swicResult.status === 'rejected') {
-      console.warn('[Weather] Seed failed: NWS, ECCC, and SWIC fetches all failed');
-      return;
-    }
+    const results = { nws: nwsResult, eccc: ecccResult, swic: swicResult };
+    const failedSources = Object.keys(results).filter((source) => results[source].status === 'rejected');
+    const attemptedAt = Date.now();
 
     const nwsFeatures = nwsResult.status === 'fulfilled' ? nwsResult.value : [];
     const nwsAlerts = nwsResult.status === 'fulfilled'
@@ -5380,9 +6322,21 @@ async function seedWeatherAlerts() {
     let carriedNws = [];
     let carriedEccc = [];
     let carriedSwic = [];
-    if (nwsResult.status === 'rejected' || ecccResult.status === 'rejected' || swicResult.status === 'rejected') {
-      const prev = await envelopeRead(WEATHER_REDIS_KEY, () => null);
-      const prevAlerts = Array.isArray(prev?.alerts) ? prev.alerts : [];
+    let previousMeta = null;
+    let previousPayloadAt = null;
+    if (failedSources.length > 0) {
+      const [raw, meta] = await Promise.all([
+        upstashGet(WEATHER_REDIS_KEY, () => null),
+        upstashGet('seed-meta:weather:alerts', () => null),
+      ]);
+      previousMeta = meta;
+      // Inspect the envelope clock as well as its data: the two writes can fail independently.
+      const enveloped = raw && typeof raw === 'object' && !Array.isArray(raw) && '_seed' in raw && 'data' in raw;
+      const prev = enveloped ? raw.data : raw;
+      previousPayloadAt = enveloped ? raw._seed?.fetchedAt : null;
+      // Failed providers cannot tell us which alerts ended since the last fetch.
+      const prevAlerts = (Array.isArray(prev?.alerts) ? prev.alerts : [])
+        .filter((alert) => Date.parse(alert?.expires) > attemptedAt);
       if (nwsResult.status === 'rejected') carriedNws = prevAlerts.filter((a) => a?.source === 'nws');
       if (ecccResult.status === 'rejected') carriedEccc = prevAlerts.filter((a) => a?.source === 'eccc');
       if (swicResult.status === 'rejected') carriedSwic = prevAlerts.filter((a) => a?.source === 'swic');
@@ -5396,62 +6350,70 @@ async function seedWeatherAlerts() {
       eccc: ecccResult.status === 'fulfilled' ? ecccAlerts : carriedEccc,
       swic: swicResult.status === 'fulfilled' ? swicAlerts : carriedSwic,
     });
+    const sourceHealth = Object.fromEntries(Object.keys(results).map((source) => {
+      if (results[source].status === 'fulfilled') {
+        return [source, { lastSuccessAt: sourceSuccessAt[source], consecutiveFailures: 0, firstFailureAt: null, retainedUntil: null }];
+      }
+      const previous = previousMeta?.sourceHealth?.[source];
+      const known = previousMeta?.status !== 'error'
+        && Number.isSafeInteger(previousPayloadAt) && previousPayloadAt > 0
+        && previousPayloadAt === previousMeta?.fetchedAt
+        && Number.isSafeInteger(previous?.consecutiveFailures) && previous.consecutiveFailures >= 0;
+      const retained = alerts.filter((alert) => alert.source === source);
+      return [source, {
+        lastSuccessAt: previous?.lastSuccessAt ?? null,
+        consecutiveFailures: known ? Math.min(previous.consecutiveFailures + 1, 100) : null,
+        firstFailureAt: known && previous.consecutiveFailures === 0 ? attemptedAt : (previous?.firstFailureAt ?? null),
+        retainedUntil: retained.length > 0 ? Math.min(...retained.map((alert) => Date.parse(alert.expires))) : null,
+      }];
+    }));
+    const sourceMeta = {
+      sourceHealth,
+      lastSourceAttemptAt: attemptedAt,
+      ...(failedSources.length > 0
+        ? { sourceState: 'degraded', errorCode: 'WEATHER_ALERT_SOURCE_INCOMPLETE', failedSources }
+        : { sourceState: 'ok' }),
+    };
+    if (failedSources.length === 3) {
+      await upstashSet('seed-meta:weather:alerts', {
+        fetchedAt: previousMeta?.fetchedAt ?? 0,
+        recordCount: previousMeta?.recordCount ?? 0,
+        ...sourceMeta,
+      }, 604800);
+      console.warn('[Weather] Seed failed: NWS, ECCC, and SWIC fetches all failed');
+      return;
+    }
 
     // Always write the merged active set (#6607 purge). Do not skip overwrite
     // when a live source returns 0 — that would leave ended CA alerts cached.
     const payload = { alerts };
+    const publishedAt = Date.now();
     const ok1 = await envelopeWrite(WEATHER_REDIS_KEY, payload, WEATHER_CACHE_TTL, {
+      fetchedAt: publishedAt,
       recordCount: alerts.length,
       sourceVersion: WEATHER_ALERTS_SOURCE_VERSION,
       zeroOk: true,
     });
-    // A permanently dead source must be visible to /api/health. Without a
-    // sourceState the seed-meta stays fresh forever and the outage is invisible.
-    const failedSources = [
-      nwsResult.status === 'rejected' ? 'nws' : null,
-      ecccResult.status === 'rejected' ? 'eccc' : null,
-      swicResult.status === 'rejected' ? 'swic' : null,
-    ].filter(Boolean);
     const ok2 = await upstashSet('seed-meta:weather:alerts', {
-      fetchedAt: Date.now(),
+      fetchedAt: publishedAt,
       recordCount: alerts.length,
-      ...(failedSources.length > 0
-        ? {
-          sourceState: 'degraded',
-          errorCode: 'WEATHER_ALERT_SOURCE_INCOMPLETE',
-          failedSources,
-        }
-        : { sourceState: 'ok' }),
+      ...sourceMeta,
+      ...(!ok1 ? { status: 'error' } : {}),
     }, 604800);
     console.log(`[Weather] Seeded ${alerts.length} alerts (nws=${nwsAlerts.length} eccc=${ecccAlerts.length} swic=${swicAlerts.length}, redis: ${ok1 && ok2 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
-    const highSeverityAlerts = alerts.filter(a => a.severity === 'Extreme' || a.severity === 'Severe');
-    // Pick up to 3 DISTINCT event families before publishing. The naive
-    // `slice(0, 3)` would silently lose distinct families: if the first 3 raw
-    // alerts are adjacent-zone duplicates for one VTEC family (one storm
-    // crossing 3 counties), the publisher-side dedup collapses them to 1
-    // notification and a 4th genuinely-distinct family (tornado / flood /
-    // different storm) sitting at index 3+ would NEVER be considered.
-    // Dedupe by coalesceKey FIRST, then take the top 3 distinct families.
-    // Slot B regression fix from PR #3467 review.
-    const seenFamilyKeys = new Set();
-    const distinctFamilyAlerts = [];
-    for (const a of highSeverityAlerts) {
-      // Family key: prefer VTEC-derived coalesce key; fall back to a stable
-      // identity from the alert so VTEC-less / ECCC alerts still deduplicate
-      // against themselves.
-      const familyKey = deriveWeatherCoalesceKey(a.vtec)
-        ?? `${a.source || 'weather'}:${a.id || a.headline || a.event || ''}`;
-      if (seenFamilyKeys.has(familyKey)) continue;
-      seenFamilyKeys.add(familyKey);
-      distinctFamilyAlerts.push(a);
-      if (distinctFamilyAlerts.length >= 3) break;
-    }
+    // Which high-severity alerts this tick notifies on. Distinct families,
+    // partitioned per country so a single-country burst cannot spend every
+    // slot (#7243). Selection rules live in _weather-alert-select.mjs so they
+    // are unit-testable without booting the relay.
+    const distinctFamilyAlerts = selectWeatherNotificationAlerts(alerts);
     for (const a of distinctFamilyAlerts) {
-      // Slot B: derive a coalesceKey from the NWS VTEC string (when present)
-      // so adjacent-zone bulletins for the same logical event collapse to one
-      // notification per user. Falls back to title-based dedup when VTEC is
-      // absent (ECCC, rare advisory types, or missing parameters).
-      const coalesceKey = deriveWeatherCoalesceKey(a.vtec);
+      // The SAME family key the selector partitioned by. Publishing a narrower
+      // key (VTEC only) let publishNotificationEvent fall back to its global
+      // `weather_alert:<title>` dedup hash for every VTEC-less SWIC/ECCC
+      // alert, so two countries sharing a generic WMO title ("Heavy rain",
+      // "Forestfire") collided on SET NX and only the first survived —
+      // recreating the #7243 starvation one layer below the selector.
+      const coalesceKey = weatherAlertFamilyKey(a);
       const countryCode = weatherAlertNotifyCountryCode(a);
       publishNotificationEvent({
         eventType: 'weather_alert',
@@ -5903,6 +6865,7 @@ const WB_TTL_SECONDS = 7 * 24 * 3600; // 7 days
 const WB_BOOTSTRAP_KEY = 'economic:worldbank-techreadiness:v1';
 const WB_PROGRESS_KEY = 'economic:worldbank-progress:v1';
 const WB_RENEWABLE_KEY = 'economic:worldbank-renewable:v1';
+const { buildWorldBankTechObservations } = require('./_wb-tech-readiness-projection.cjs');
 
 const WB_WEIGHTS = { internet: 30, mobile: 15, broadband: 20, rdSpend: 35 };
 const WB_NORMALIZE_MAX = { internet: 100, mobile: 150, broadband: 50, rdSpend: 5 };
@@ -6001,7 +6964,13 @@ function wbComputeRankings(indicatorData) {
     }
     const score = totalWeight > 0 ? weightedSum / totalWeight : 0;
     const name = indicatorData.internet[cc]?.name || indicatorData.mobile[cc]?.name || cc;
-    scores.push({ country: cc, countryName: name, score: Math.round(score * 10) / 10, rank: 0, components });
+    const observations = buildWorldBankTechObservations({
+      internet: indicatorData.internet[cc],
+      mobile: indicatorData.mobile[cc],
+      broadband: indicatorData.broadband[cc],
+      rdSpend: indicatorData.rdSpend[cc],
+    });
+    scores.push({ country: cc, countryName: name, score: Math.round(score * 10) / 10, rank: 0, components, observations });
   }
   scores.sort((a, b) => b.score - a.score);
   scores.forEach((s, i) => { s.rank = i + 1; });
@@ -6205,8 +7174,9 @@ async function seedCorridorRisk() {
         eventCount7d: Number(corridor.event_count_7d ?? 0),
         disruptionPct: Number(corridor.disruption_pct ?? 0),
         vesselCount: Number(corridor.vessel_count ?? 0),
-        riskSummary: String(corridor.risk_summary || '').slice(0, 200),
-        riskReportAction: String((corridor.risk_report?.action) || '').slice(0, 500),
+        // Generated prose has no verified routing or cost basis.
+        riskSummary: '',
+        riskReportAction: '',
       };
     }
     if (Object.keys(result).length === 0) {
@@ -6223,7 +7193,7 @@ async function seedCorridorRisk() {
       const label = corridorId.replace(/_/g, ' ').replace(/\b\w/g, ch => ch.toUpperCase());
       publishNotificationEvent({
         eventType: 'corridor_risk',
-        payload: { title: `${label}: risk score ${c.riskScore}${c.riskSummary ? ' — ' + c.riskSummary.slice(0, 80) : ''}`, source: 'Corridor Risk' },
+        payload: { title: `${label}: risk score ${c.riskScore}`, source: 'Corridor Risk' },
         severity: c.riskScore >= 70 ? 'critical' : 'high',
         variant: undefined,
         dedupTtl: 3600,
@@ -6704,9 +7674,19 @@ async function seedSocialVelocity() {
       await new Promise(r => setTimeout(r, 500));
       const posts = await fetchRedditHot(sub, fetchFailures);
       for (const p of posts) {
+        if (!p || typeof p.permalink !== 'string' || !p.permalink.startsWith('/r/')) continue;
+        let postUrl;
+        try {
+          postUrl = new URL(p.permalink, 'https://reddit.com');
+          if (postUrl.origin !== 'https://reddit.com'
+            || !/^\/r\/[A-Za-z0-9_]+\/comments\/[A-Za-z0-9]+(?:\/|$)/.test(postUrl.pathname)
+            || postUrl.href.length > 2048) continue;
+        } catch { continue; }
         // Deduplicate cross-subreddit reposts of the same article URL.
         const articleUrl = p.url || '';
-        const isExternal = articleUrl && !articleUrl.includes('reddit.com');
+        let articleHostname = '';
+        try { articleHostname = new URL(articleUrl).hostname; } catch { /* invalid URLs are not deduplicated */ }
+        const isExternal = articleHostname && articleHostname !== 'reddit.com' && !articleHostname.endsWith('.reddit.com');
         if (isExternal && seenUrls.has(articleUrl)) continue;
         if (isExternal) seenUrls.add(articleUrl);
         const ageSec = Math.max(1, nowSec - (p.created_utc || nowSec));
@@ -6716,7 +7696,7 @@ async function seedSocialVelocity() {
           id: String(p.id || ''),
           title: String(p.title || '').slice(0, 300),
           subreddit: sub,
-          url: `https://reddit.com${p.permalink || ''}`,
+          url: postUrl.href,
           score: p.score || 0,
           upvoteRatio: p.upvote_ratio || 0,
           numComments: p.num_comments || 0,
@@ -7512,6 +8492,7 @@ const relayMetricsLifetime = {
   openskyThrottle: 0,
   openskyTimeout: 0,
   openskyAuthRejection: 0,
+  openskyRouteRejection: 0,
   openskyFallback: 0,
   openskyTerminalFailure: 0,
   drops: 0,
@@ -7565,6 +8546,7 @@ function createRelayMetricsBucket() {
     openskyThrottle: 0,
     openskyTimeout: 0,
     openskyAuthRejection: 0,
+    openskyRouteRejection: 0,
     openskyFallback: 0,
     openskyTerminalFailure: 0,
     drops: 0,
@@ -7650,6 +8632,10 @@ const RELAY_OUTCOME_FIELDS = Object.freeze({
     throttle: 'openskyThrottle',
     timeout: 'openskyTimeout',
     authRejection: 'openskyAuthRejection',
+    // OpenSky-only: the exit IP was refused, not the credentials. Every other route
+    // keeps folding 403 into authRejection, so this key is deliberately absent from
+    // their maps — recordRelayOutcome drops an outcome a route does not declare.
+    routeRejection: 'openskyRouteRejection',
     fallback: 'openskyFallback',
     terminalFailure: 'openskyTerminalFailure',
   }),
@@ -7685,6 +8671,23 @@ function recordRelayOutcome(route, outcome, amount = 1) {
   incrementRelayMetric(metricField, amount);
 }
 
+// OpenSky-specific refinement of the shared classifier.
+//
+// classifyUpstreamOutcome collapses 401 and 403 into 'authRejection'. That is right for
+// every other route, but for OpenSky the two say opposite things and imply opposite
+// fixes: 401 = the CREDENTIALS were rejected (rotate OPENSKY_CLIENT_SECRET), 403/451 =
+// the EXIT IP was rejected (flip OPENSKY_ROUTE). Conflating them is exactly why
+// "is the direct route blocked?" could not be answered from telemetry.
+//
+// Deliberately NOT classified as a route rejection: socket errors (ECONNRESET, EPROTO,
+// timeouts). Those are ordinary network noise on either route — EPROTO in particular was
+// the #5074 double-TLS bug, not a block — and labelling them would send an operator to
+// flip the route over a transient blip. Only an explicit refusal from the origin counts.
+function classifyOpenSkyOutcome({ status, error } = {}) {
+  if (status === 403 || status === 451) return 'routeRejection';
+  return classifyUpstreamOutcome({ status, error });
+}
+
 function sampleRelayQueueSize(queueSize) {
   const bucket = getRelayMetricsBucket();
   if (queueSize > bucket.queueMax) bucket.queueMax = queueSize;
@@ -7717,6 +8720,7 @@ function getRelayRollingMetrics() {
     rollup.openskyThrottle += bucket.openskyThrottle;
     rollup.openskyTimeout += bucket.openskyTimeout;
     rollup.openskyAuthRejection += bucket.openskyAuthRejection;
+    rollup.openskyRouteRejection += bucket.openskyRouteRejection;
     rollup.openskyFallback += bucket.openskyFallback;
     rollup.openskyTerminalFailure += bucket.openskyTerminalFailure;
     rollup.drops += bucket.drops;
@@ -7857,6 +8861,16 @@ function getRelayRollingMetrics() {
     aviation: {
       coverage: aviationCoverage,
       minimumServedCoverage: AVIATION_MIN_SERVED_COVERAGE,
+      // Which OpenSky route requests actually take, and whether the origin is refusing
+      // this exit IP. routeRejection (403/451) means "flip OPENSKY_ROUTE";
+      // providerBlocked (429) means the ACCOUNT is out of credits and no route change
+      // can help. `openskyRoute` is the EFFECTIVE route; `openskyRouteRequested` is what
+      // OPENSKY_ROUTE asked for, so the two differing is itself the misconfiguration
+      // signal (proxy requested, no credential, silently serving direct).
+      openskyRoute: OPENSKY_ROUTE,
+      openskyRouteRequested: OPENSKY_ROUTE_REQUESTED,
+      openskyRouteRejection: rollup.openskyRouteRejection,
+      openskyProviderBlocked,
     },
     // Which upstream fed each theater-posture publication cycle, plus empty
     // cycles that were rejected before publication. Kept separate
@@ -7982,6 +8996,14 @@ const MAX_VESSEL_META = 50000;
 
 const vessels = new Map();
 const vesselHistory = new Map();
+// mmsi → timestamp of the vessel's most recent position fix. Retention must
+// exceed GAP_THRESHOLD: the dark-ship return check compares the CURRENT fix
+// against this value, and the vesselHistory equivalent loses the prior fix
+// to its 30-minute DENSITY_WINDOW prune and 10-entry cap long before a >1h
+// silence ends. Bounded by the same retention prune + recency eviction
+// cleanupAggregates applies to vesselHistory.
+const vesselLastFixSeen = new Map();
+const LAST_FIX_RETENTION_MS = 6 * 60 * 60 * 1000; // 6h — 6× GAP_THRESHOLD
 const densityGrid = new Map();
 const candidateReports = new Map();
 // Parallel store for tanker (AIS ship type 80-89) position reports — populated
@@ -8045,6 +9067,17 @@ const TRANSIT_WINDOW_MS = 24 * 60 * 60 * 1000;
 const MIN_DWELL_MS = 5 * 60 * 1000;
 const CHOKEPOINT_TRANSIT_KEY = 'supply_chain:chokepoint_transits:v1';
 const CHOKEPOINT_TRANSIT_TTL = 3600; // 1h — 6x interval; survives ~5 consecutive missed pings
+
+// Dark-ship (AIS gap) count envelope — the trusted producer behind the
+// temporal anomalies `ais_gaps` count source (#7574). Written on its own
+// slow loop, not on the per-snapshot build: detectDisruptions runs every
+// SNAPSHOT_INTERVAL_MS, which would be a Redis write per relay heartbeat.
+const AIS_GAPS_REDIS_KEY = 'maritime:ais-gaps:v1';
+// 60min — must STRICTLY exceed the 30min health maxStaleMin (api/health.js
+// aisGaps entry) so a dead relay reads warn STALE_SEED before the envelope
+// expires to crit EMPTY; 6x the seed interval.
+const AIS_GAPS_TTL = 3600;
+const AIS_GAPS_SEED_INTERVAL_MS = 10 * 60 * 1000;
 const CHOKEPOINT_TRANSIT_INTERVAL_MS = 10 * 60 * 1000;
 
 const NAVAL_PREFIX_RE = /^(USS|USNS|HMS|HMAS|HMCS|INS|JS|ROKS|TCG|FS|BNS|RFS|PLAN|PLA|CGC|PNS|KRI|ITS|SNS|MMSI)/i;
@@ -8300,6 +9333,18 @@ function processPositionReportForSnapshot(data) {
   });
 
   const history = vesselHistory.get(mmsi) || [];
+  // Dark-ship return detection (#7574): a fix arriving more than
+  // GAP_THRESHOLD after the previous one marks the vessel as returned from
+  // extended AIS silence. The prior fix is read from vesselLastFixSeen, NOT
+  // from vesselHistory — cleanupAggregates prunes vesselHistory to the
+  // 30-min DENSITY_WINDOW and caps it at 10 entries, so by the time a >1h
+  // silence ends the old fix is long gone from that structure and a
+  // history-diffing form of this check can never fire.
+  const lastFixAt = vesselLastFixSeen.get(mmsi);
+  if (lastFixAt && now - lastFixAt > GAP_THRESHOLD) {
+    darkShipReturns.set(mmsi, now);
+  }
+  vesselLastFixSeen.set(mmsi, now);
   history.push(now);
   if (history.length > 10) history.shift();
   vesselHistory.set(mmsi, history);
@@ -8386,6 +9431,14 @@ function cleanupAggregates() {
       vesselHistory.set(mmsi, filtered);
     }
   }
+  // Retention prune + recency cap for the dark-ship last-fix map: entries
+  // older than the retention window can never be part of a live >1h silence
+  // comparison again, and the cap bounds memory against vessel churn.
+  const lastFixCutoff = now - LAST_FIX_RETENTION_MS;
+  for (const [mmsi, ts] of vesselLastFixSeen) {
+    if (ts < lastFixCutoff) vesselLastFixSeen.delete(mmsi);
+  }
+  evictMapByTimestamp(vesselLastFixSeen, MAX_VESSEL_HISTORY, (ts) => ts);
   // Hard cap: keep the most recent vessel histories.
   evictMapByTimestamp(vesselHistory, MAX_VESSEL_HISTORY, (history) => history[history.length - 1] || 0);
 
@@ -8474,6 +9527,29 @@ function cleanupAggregates() {
   }
 }
 
+// Vessels seen again after extended AIS silence: mmsi → the return-seen
+// timestamp. Entries are bounded by the 10-minute freshness window in
+// countDarkShips (pruned on read) and the 10-entry vesselHistory cap, so the
+// map cannot grow unbounded even in a flood of simultaneous returns.
+const darkShipReturns = new Map();
+
+/**
+ * Vessels that returned after extended AIS silence and were seen again
+ * within the last 10 minutes — the signal the retired client-side ais_gaps
+ * baseline counted per browser session (#7574). Sightings are recorded at
+ * ingestion (processPositionReportForSnapshot) because cleanupAggregates
+ * prunes vesselHistory to the 30-minute DENSITY_WINDOW, which can never
+ * span the 1-hour GAP_THRESHOLD.
+ */
+function countDarkShips(now = Date.now()) {
+  let darkShipCount = 0;
+  for (const [mmsi, seenAt] of darkShipReturns) {
+    if (now - seenAt >= 10 * 60 * 1000) darkShipReturns.delete(mmsi);
+    else darkShipCount++;
+  }
+  return darkShipCount;
+}
+
 function detectDisruptions() {
   const disruptions = [];
   const now = Date.now();
@@ -8507,17 +9583,7 @@ function detectDisruptions() {
     }
   }
 
-  let darkShipCount = 0;
-  for (const history of vesselHistory.values()) {
-    if (history.length >= 2) {
-      const lastSeen = history[history.length - 1];
-      const secondLast = history[history.length - 2];
-      if (lastSeen - secondLast > GAP_THRESHOLD && now - lastSeen < 10 * 60 * 1000) {
-        darkShipCount++;
-      }
-    }
-  }
-
+  const darkShipCount = countDarkShips(now);
   if (darkShipCount >= 1) {
     disruptions.push({
       id: 'global-gap-spike',
@@ -8728,11 +9794,19 @@ async function seedChokepointTransits() {
     const crossings = chokepointCrossings.get(cp.name) || [];
     const recent = crossings.filter(c => now - c.ts < TRANSIT_WINDOW_MS);
     chokepointCrossings.set(cp.name, recent);
+    // `available` is the same signal seedTransitSummaries encodes by leaving
+    // todayTotal null. Both writers read this one in-memory map and both ship
+    // in a single get-chokepoint-status bundle, so without it one response
+    // carried summaries.suez.todayTotal === null next to
+    // transits["Suez Canal"].total === 0 and an agent's answer depended on
+    // which half it read. The counts stay numeric here because the documented
+    // shape of this key is {tanker, cargo, other, total}.
     transits[cp.name] = {
       tanker: recent.filter(c => c.type === 'tanker').length,
       cargo: recent.filter(c => c.type === 'cargo').length,
       other: recent.filter(c => c.type === 'other').length,
       total: recent.length,
+      available: recent.length > 0,
     };
   }
   const payload = { transits, fetchedAt: now };
@@ -8740,6 +9814,39 @@ async function seedChokepointTransits() {
   await upstashSet('seed-meta:supply_chain:chokepoint_transits', { fetchedAt: now, recordCount: Object.keys(transits).length }, 604800);
   console.log(`[Transit] Seeded ${Object.keys(transits).length} chokepoint transit counts`);
 }
+
+/**
+ * seedAisGaps publishes the dark-ship count envelope + seed-meta.
+ *
+ * `sampledAt` is the content clock the temporal-anomalies rebuild reads
+ * (gapsContentClock); computing `now` once and threading it through both
+ * writes keeps `_seed.fetchedAt` and seed-meta in agreement (#6775).
+ *
+ * The publish is gated on AIS position freshness: while the aisstream feed
+ * is down or stale the relay cannot observe returns, so publishing a count
+ * (most robusly a zero) would stamp OK on a blind sensor. Skipping BOTH
+ * writes instead lets the 30min health budget age the missing stamp into
+ * STALE_SEED — the honest signal.
+ */
+async function seedAisGaps() {
+  const now = Date.now();
+  if (!getAisPositionFreshness(now).currentPositionReady) {
+    console.log(`[AisGaps] Skipping publish: AIS positions not fresh (ageMs=${getAisPositionFreshness(now).positionAgeMs})`);
+    return;
+  }
+  const darkShips = countDarkShips(now);
+  const envelopeOk = await envelopeWrite(AIS_GAPS_REDIS_KEY, { darkShips, sampledAt: now }, AIS_GAPS_TTL, { fetchedAt: now, recordCount: darkShips, sourceVersion: 'ais-gaps', zeroOk: true });
+  const metaOk = await upstashSet('seed-meta:maritime:ais-gaps', { fetchedAt: now, recordCount: darkShips }, 604800);
+  if (!envelopeOk || !metaOk) {
+    console.warn(`[AisGaps] Seed write FAILED (envelope=${envelopeOk} meta=${metaOk})`);
+    return;
+  }
+  console.log(`[AisGaps] Seeded dark-ship count: ${darkShips}`);
+}
+
+setTimeout(() => {
+  startBootSeedLoop('AisGaps', 'seed-meta:maritime:ais-gaps', AIS_GAPS_SEED_INTERVAL_MS, seedAisGaps, err => console.error('[AisGaps] Initial seed error:', err.message), err => console.error('[AisGaps] Seed error:', err.message));
+}, 30_000);
 
 setTimeout(() => {
   startBootSeedLoop('Transit', 'seed-meta:supply_chain:chokepoint_transits', CHOKEPOINT_TRANSIT_INTERVAL_MS, seedChokepointTransits, err => console.error('[Transit] Initial seed error:', err.message), err => console.error('[Transit] Seed error:', err.message));
@@ -8800,10 +9907,17 @@ async function seedTransitSummaries() {
   // coverage shortfall surfaces via the `pwCovered/N` log + recordCount only.
   const CANONICAL_IDS = Object.keys(CHOKEPOINT_THREAT_LEVELS);
   let pwCovered = 0;
+  // WHICH ids are missing, not just how many. A bare `11/13` cannot be acted on
+  // after the fact: portwatch dropped exactly two chokepoints for ~4.5h on
+  // 2026-08-25 and by the time anyone read the alarm the upstream had recovered,
+  // so the shortfall was unattributable — the count was identical every cycle
+  // and named nothing.
+  const pwMissing = [];
 
   for (const cpId of CANONICAL_IDS) {
     const cpData = pw[cpId];
     if (cpData) pwCovered++;
+    else pwMissing.push(cpId);
     const threatLevel = CHOKEPOINT_THREAT_LEVELS[cpId] || 'normal';
     const history = cpData?.history ?? [];
     const anomaly = detectTrafficAnomaly(history, threatLevel);
@@ -8830,21 +9944,22 @@ async function seedTransitSummaries() {
 
     // Compact summary: no history field. Consumed by get-chokepoint-status on
     // every request, so keep it small.
-    // dataAvailable distinguishes genuine zero-traffic (cpData present, 0
-    // crossings) from zero-state fill (upstream missing this cycle). False
-    // here makes the RPC response explicit and lets the client render a
-    // "data unavailable" indicator instead of silently-empty stat rows.
+    // dataAvailable is PortWatch history presence, not AIS today-counts.
+    // todayTotal comes from the in-memory 24h AIS window; an empty window is
+    // unsupplied, not a published zero-traffic measurement (#7457). Leave the
+    // count absent so PortWatch WoW cannot sit next to a fake 0.
     summaries[cpId] = {
-      todayTotal: relayTransit?.total ?? 0,
-      todayTanker: relayTransit?.tanker ?? 0,
-      todayCargo: relayTransit?.cargo ?? 0,
-      todayOther: relayTransit?.other ?? 0,
+      todayTotal: relayTransit?.total ?? null,
+      todayTanker: relayTransit?.tanker ?? null,
+      todayCargo: relayTransit?.cargo ?? null,
+      todayOther: relayTransit?.other ?? null,
       wowChangePct: cpData?.wowChangePct ?? 0,
       riskLevel: cr?.riskLevel ?? '',
       incidentCount7d: cr?.incidentCount7d ?? 0,
       disruptionPct: cr?.disruptionPct ?? 0,
-      riskSummary: cr?.riskSummary ?? '',
-      riskReportAction: cr?.riskReportAction ?? '',
+      // Persisted corridor data can predate prose suppression.
+      riskSummary: '',
+      riskReportAction: '',
       anomaly,
       dataAvailable: Boolean(cpData),
     };
@@ -8864,7 +9979,7 @@ async function seedTransitSummaries() {
   }
 
   if (pwCovered < CANONICAL_IDS.length) {
-    console.warn(`[TransitSummary] portwatch coverage shortfall: ${pwCovered}/${CANONICAL_IDS.length} — missing chokepoints will publish zero-state until next upstream success`);
+    console.warn(`[TransitSummary] portwatch coverage shortfall: ${pwCovered}/${CANONICAL_IDS.length} (missing: ${pwMissing.join(', ')}) — missing chokepoints will publish zero-state until next upstream success`);
   }
 
   const ok = await envelopeWrite(TRANSIT_SUMMARY_REDIS_KEY, { summaries, fetchedAt: now }, TRANSIT_SUMMARY_TTL, { recordCount: pwCovered, sourceVersion: 'transit-summaries' });
@@ -9073,7 +10188,17 @@ async function handleUcdpEventsRequest(req, res) {
 const openskyResponseCache = new Map(); // key: sorted query params → { data, gzip, timestamp }
 const openskyNegativeCache = new Map(); // key: cacheKey → { status, timestamp, body, gzip } — prevents retry storms on 429/5xx
 const openskyInFlight = new Map(); // key: cacheKey → Promise (dedup concurrent requests)
-const OPENSKY_CACHE_TTL_MS = Number(process.env.OPENSKY_CACHE_TTL_MS) || 60 * 1000; // 60s default — env-configurable
+// 180s default — env-configurable. This TTL is the only thing standing between the
+// dashboard's poll rate and a PAID upstream fetch: OpenSky is 82.5% of the residential
+// proxy bill (24.86 GB / $136.75 of a ~$165 quarter, per Decodo's per-target report),
+// and it serves /states/all UNCOMPRESSED — identity, gzip, deflate and br all return
+// the same ~1.49 MB, so no Accept-Encoding change can shrink a miss. Fetching less
+// often is the entire lever, hence 60s → 180s. NOTE: production overrides this with
+// OPENSKY_CACHE_TTL_MS on the ais-relay service, so raising the default alone changes
+// nothing in prod — the env var has to move with it. The client-facing Cache-Control
+// stays at 30s so browsers keep revalidating against this in-memory cache, which is
+// free, instead of pinning a 180s-stale copy of their own.
+const OPENSKY_CACHE_TTL_MS = Number(process.env.OPENSKY_CACHE_TTL_MS) || 180 * 1000;
 const OPENSKY_NEGATIVE_CACHE_TTL_MS = Number(process.env.OPENSKY_NEGATIVE_CACHE_TTL_MS) || 30 * 1000; // 30s — env-configurable
 const OPENSKY_CACHE_MAX_ENTRIES = Math.max(10, Number(process.env.OPENSKY_CACHE_MAX_ENTRIES || 128));
 const OPENSKY_NEGATIVE_CACHE_MAX_ENTRIES = Math.max(10, Number(process.env.OPENSKY_NEGATIVE_CACHE_MAX_ENTRIES || 256));
@@ -9197,13 +10322,153 @@ const OPENSKY_AUTH_COOLDOWN_MS = 60000; // 1 min cooldown after auth failure
 // Global OpenSky rate limiter — serializes upstream requests and enforces 429 cooldown
 let openskyGlobal429Until = 0; // timestamp: block ALL upstream requests until this time
 const OPENSKY_429_COOLDOWN_MS = Number(process.env.OPENSKY_429_COOLDOWN_MS) || 90 * 1000; // 90s cooldown after any 429
-const OPENSKY_MAX_429_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+const OPENSKY_MAX_429_COOLDOWN_MS = OPENSKY_MAX_COOLDOWN_MS;
 const OPENSKY_REQUEST_SPACING_MS = Number(process.env.OPENSKY_REQUEST_SPACING_MS) || 2000; // 2s minimum between consecutive upstream requests
 let openskyLastUpstreamTime = 0;
 let openskyUpstreamQueue = Promise.resolve(); // serial chain — only 1 upstream request at a time
 let openskyRateLimitRemaining = null;
 let openskyLastSuccessAt = 0;
 let openskyLast429At = 0;
+
+function mergeLocalOpenSkyCooldown(untilMs) {
+  if (!Number.isFinite(untilMs) || untilMs <= Date.now()) return;
+  openskyGlobal429Until = Math.max(openskyGlobal429Until, untilMs);
+}
+
+// Aviation bbox callers abort this relay hop after 6s
+// (track-aircraft BBOX_RELAY_TIMEOUT_MS). Bound the shared Redis GET so a
+// slow read still fails open with enough time for OpenSky. Deduplicate only
+// while the read is in flight: a completed zero must not hide a cooldown that
+// the seeder writes before the queued upstream boundary (#6253).
+const OPENSKY_SHARED_COOLDOWN_READ_TIMEOUT_MS = 1_000;
+let sharedOpenSkyCooldownReadPromise = null;
+
+async function readLegacySharedOpenSkyCooldownMs() {
+  const record = await upstashGet(OPENSKY_LEGACY_COOLDOWN_KEY, (reason) => {
+    console.warn('[Relay] OpenSky legacy cooldown read failed, proceeding without it: ' + reason);
+  }, OPENSKY_SHARED_COOLDOWN_READ_TIMEOUT_MS);
+  const inspected = inspectCooldownRecord(record, {
+    account: OPENSKY_ACCOUNT_FINGERPRINT,
+  });
+  if (inspected.ignoreReason === 'account-mismatch') {
+    console.warn('[Relay] OpenSky legacy cooldown ignored — recorded for a different account');
+  } else if (inspected.ignoreReason === 'implausible-deadline') {
+    console.warn('[Relay] OpenSky legacy cooldown ignored — implausible deadline ' + inspected.until);
+  }
+  if (inspected.remainingMs <= 0) return 0;
+
+  // Copy, never delete: a rolling deploy can still have v1 writers. The
+  // account-scoped max-deadline EVAL protects a concurrent v2 writer.
+  try {
+    const command = maxDeadlineSetCommand(
+      OPENSKY_COOLDOWN_KEY,
+      record,
+      ttlSecondsForCooldown(inspected.remainingMs),
+    );
+    const written = await upstashEval(
+      OPENSKY_MAX_DEADLINE_SET_LUA,
+      [OPENSKY_COOLDOWN_KEY],
+      command.slice(4),
+    );
+    if (written == null && UPSTASH_ENABLED) {
+      console.warn('[Relay] OpenSky legacy cooldown migration returned non-OK');
+    }
+  } catch (err) {
+    console.warn('[Relay] OpenSky legacy cooldown migration failed, proceeding with the observed cooldown: ' + (err.message || err));
+  }
+  return inspected.remainingMs;
+}
+
+// Shared Redis record written by this relay and by seed-military-flights.
+// Fails OPEN on every error path: a Redis problem must never disable the
+// data tier, and the in-process cooldown still works when Redis is down (#6253).
+async function remainingSharedOpenSkyCooldownMs() {
+  if (sharedOpenSkyCooldownReadPromise) return sharedOpenSkyCooldownReadPromise;
+
+  const pending = readSharedOpenSkyCooldownMs();
+  sharedOpenSkyCooldownReadPromise = pending;
+  try {
+    return await pending;
+  } finally {
+    if (sharedOpenSkyCooldownReadPromise === pending) {
+      sharedOpenSkyCooldownReadPromise = null;
+    }
+  }
+}
+
+async function readSharedOpenSkyCooldownMs() {
+  try {
+    let v2ReadFailed = false;
+    const record = await upstashGet(OPENSKY_COOLDOWN_KEY, (reason) => {
+      v2ReadFailed = true;
+      console.warn(`[Relay] OpenSky shared cooldown read failed, proceeding without it: ${reason}`);
+    }, OPENSKY_SHARED_COOLDOWN_READ_TIMEOUT_MS);
+    const inspected = inspectCooldownRecord(record, {
+      account: OPENSKY_ACCOUNT_FINGERPRINT,
+    });
+    if (inspected.ignoreReason === 'account-mismatch') {
+      console.warn('[Relay] OpenSky shared cooldown ignored — recorded for a different account');
+    } else if (inspected.ignoreReason === 'implausible-deadline') {
+      console.warn(`[Relay] OpenSky shared cooldown ignored — implausible deadline ${inspected.until}`);
+    }
+    if (inspected.remainingMs > 0) {
+      mergeLocalOpenSkyCooldown(Date.now() + inspected.remainingMs);
+      return inspected.remainingMs;
+    }
+    // A v2 transport or parse failure must remain fail-open. Only a clean
+    // empty, expired, or mismatched v2 read may consult the legacy key.
+    if (v2ReadFailed) return 0;
+    if (!legacyCooldownCompatibilityEnabled()) return 0;
+    const legacyRemainingMs = await readLegacySharedOpenSkyCooldownMs();
+    if (legacyRemainingMs > 0) {
+      mergeLocalOpenSkyCooldown(Date.now() + legacyRemainingMs);
+    }
+    return legacyRemainingMs;
+  } catch (err) {
+    console.warn(`[Relay] OpenSky shared cooldown read failed, proceeding without it: ${err.message || err}`);
+    return 0;
+  }
+}
+
+async function persistSharedOpenSkyCooldown(retryAfterSeconds, completedAt = Date.now()) {
+  const localCooldownMs = clampCooldownMs(retryAfterSeconds, OPENSKY_429_COOLDOWN_MS);
+  mergeLocalOpenSkyCooldown(completedAt + localCooldownMs);
+  // The in-process limiter can stay short (90s). The shared record must
+  // outlive the seeder's */5 tick, so header-less 429s use the 10-minute
+  // persist fallback instead of the relay's local default (#6253).
+  const persistCooldownMs = clampCooldownMs(retryAfterSeconds, OPENSKY_SHARED_FALLBACK_COOLDOWN_MS);
+  const record = buildCooldownRecord({
+    now: completedAt,
+    cooldownMs: persistCooldownMs,
+    retryAfterSeconds,
+    account: OPENSKY_ACCOUNT_FINGERPRINT,
+    recordedBy: 'ais-relay',
+  });
+  try {
+    // During the bounded rollout bridge, one EVAL updates the account-scoped
+    // key and v1 atomically so an old process cannot miss a new lockout.
+    // After the cutoff, only v2 remains on the hot path.
+    const keys = legacyCooldownCompatibilityEnabled({ now: completedAt })
+      ? [OPENSKY_COOLDOWN_KEY, OPENSKY_LEGACY_COOLDOWN_KEY]
+      : [OPENSKY_COOLDOWN_KEY];
+    const command = maxDeadlineSetCommand(
+      keys,
+      record,
+      ttlSecondsForCooldown(persistCooldownMs),
+    );
+    const written = await upstashEval(
+      OPENSKY_MAX_DEADLINE_SET_LUA,
+      keys,
+      command.slice(3 + keys.length),
+    );
+    if (written == null && UPSTASH_ENABLED) {
+      console.warn('[Relay] OpenSky shared cooldown persist returned non-OK');
+    }
+  } catch (err) {
+    console.warn(`[Relay] OpenSky shared cooldown persist failed: ${err.message || err}`);
+  }
+  return localCooldownMs;
+}
 
 async function getOpenSkyToken() {
   const clientId = process.env.OPENSKY_CLIENT_ID;
@@ -9455,6 +10720,11 @@ function openskyQueuedFetch(url, token) {
     if (Date.now() < openskyGlobal429Until) {
       return { status: 429, data: JSON.stringify({ states: [], time: Date.now() }), rateLimited: true };
     }
+    // Cross-process arming: a seeder 429 parked the shared Redis key while this
+    // process still had a zero in-process deadline (#6253). Fail-open on Redis.
+    if (await remainingSharedOpenSkyCooldownMs() > 0) {
+      return { status: 429, data: JSON.stringify({ states: [], time: Date.now() }), rateLimited: true };
+    }
     openskyLastUpstreamTime = Date.now();
     incrementRelayMetric('openskyUpstreamFetches');
     const result = await _openskyRawFetch(url, token);
@@ -9466,14 +10736,7 @@ function openskyQueuedFetch(url, token) {
       openskyLastSuccessAt = completedAt;
     }
     if (result.status === 429) {
-      const providerCooldownMs = result.retryAfterSeconds == null
-        ? OPENSKY_429_COOLDOWN_MS
-        : result.retryAfterSeconds * 1000;
-      const cooldownMs = Math.min(
-        OPENSKY_MAX_429_COOLDOWN_MS,
-        Math.max(OPENSKY_429_COOLDOWN_MS, providerCooldownMs),
-      );
-      openskyGlobal429Until = Math.max(openskyGlobal429Until, completedAt + cooldownMs);
+      const cooldownMs = await persistSharedOpenSkyCooldown(result.retryAfterSeconds, completedAt);
       openskyLast429At = completedAt;
       console.warn(`[Relay] OpenSky 429 — global cooldown ${Math.ceil(cooldownMs / 1000)}s (all bbox queries blocked)`);
     }
@@ -9519,7 +10782,7 @@ async function handleOpenSkyRequest(req, res, PORT) {
     const negCached = openskyNegativeCache.get(cacheKey);
     if (negCached && Date.now() - negCached.timestamp < OPENSKY_NEGATIVE_CACHE_TTL_MS) {
       incrementRelayMetric('openskyNegativeHit');
-      recordRelayOutcome('opensky', classifyUpstreamOutcome({ status: negCached.status }));
+      recordRelayOutcome('opensky', classifyOpenSkyOutcome({ status: negCached.status }));
       touchCacheEntry(openskyNegativeCache, cacheKey, negCached); // LRU
       return sendPreGzipped(req, res, 200, {
         'Content-Type': 'application/json',
@@ -9532,6 +10795,11 @@ async function handleOpenSkyRequest(req, res, PORT) {
     // 2b. Global 429 cooldown — blocks ALL bbox queries when OpenSky is rate-limiting.
     //     Without this, 5 unique bbox keys all fire simultaneously when neg cache expires,
     //     ALL get 429'd, and the cycle repeats forever with zero data flowing.
+    //     Also honor a seeder-written Redis deadline so this process does not
+    //     spend a doomed auth+data round-trip to rediscover the same lockout.
+    if (Date.now() >= openskyGlobal429Until) {
+      await remainingSharedOpenSkyCooldownMs();
+    }
     if (Date.now() < openskyGlobal429Until) {
       incrementRelayMetric('openskyNegativeHit');
       recordRelayOutcome('opensky', 'throttle');
@@ -9567,7 +10835,7 @@ async function handleOpenSkyRequest(req, res, PORT) {
       const dedupNeg = openskyNegativeCache.get(cacheKey);
       if (dedupNeg && Date.now() - dedupNeg.timestamp < OPENSKY_NEGATIVE_CACHE_TTL_MS) {
         incrementRelayMetric('openskyDedupNeg');
-        recordRelayOutcome('opensky', classifyUpstreamOutcome({ status: dedupNeg.status }));
+        recordRelayOutcome('opensky', classifyOpenSkyOutcome({ status: dedupNeg.status }));
         touchCacheEntry(openskyNegativeCache, cacheKey, dedupNeg); // LRU
         return sendPreGzipped(req, res, 200, {
           'Content-Type': 'application/json',
@@ -9621,8 +10889,8 @@ async function handleOpenSkyRequest(req, res, PORT) {
     const result = await openskyQueuedFetch(openskyUrl, token);
     const upstreamStatus = result.status || 502;
     const upstreamOutcome = result.error
-      ? classifyUpstreamOutcome({ status: upstreamStatus, error: result.error })
-      : classifyUpstreamOutcome({ status: upstreamStatus });
+      ? classifyOpenSkyOutcome({ status: upstreamStatus, error: result.error })
+      : classifyOpenSkyOutcome({ status: upstreamStatus });
     recordRelayOutcome('opensky', upstreamOutcome);
 
     if (upstreamStatus === 401) {
@@ -9667,7 +10935,7 @@ async function handleOpenSkyRequest(req, res, PORT) {
       ...responseHeaders,
     }, responseData);
   } catch (err) {
-    recordRelayOutcome('opensky', classifyUpstreamOutcome({ error: err }));
+    recordRelayOutcome('opensky', classifyOpenSkyOutcome({ error: err }));
     if (settleFlight) settleFlight();
     if (!cacheKey) {
       try {
@@ -9891,6 +11159,24 @@ const polymarketCache = new Map(); // key: query string → { data, timestamp }
 const polymarketInflight = new Map(); // key → Promise (dedup concurrent requests)
 const POLYMARKET_CACHE_TTL_MS = 10 * 60 * 1000; // 10 min — reduce upstream pressure
 const POLYMARKET_NEG_TTL_MS = 5 * 60 * 1000; // 5 min negative cache on 429/error
+const POLYMARKET_MAX_BODY_BYTES = 2 * 1024 * 1024;
+const POLYMARKET_MAX_CACHE_ENTRIES = 64;
+
+function cachePolymarketResult(key, entry) {
+  polymarketCache.delete(key);
+  while (polymarketCache.size >= POLYMARKET_MAX_CACHE_ENTRIES) {
+    polymarketCache.delete(polymarketCache.keys().next().value);
+  }
+  polymarketCache.set(key, entry);
+}
+
+function backoffPolymarketResult(key) {
+  const cached = polymarketCache.get(key);
+  const now = Date.now();
+  cachePolymarketResult(key, cached?.data
+    ? { ...cached, retryAt: now + POLYMARKET_NEG_TTL_MS }
+    : { data: null, timestamp: now - POLYMARKET_CACHE_TTL_MS + POLYMARKET_NEG_TTL_MS });
+}
 
 // Circuit breaker — stops upstream requests after repeated failures to prevent OOM
 const polymarketCircuitBreaker = { failures: 0, openUntil: 0 };
@@ -9934,7 +11220,7 @@ function acquirePolymarketSlot() {
 function fetchPolymarketUpstream(cacheKey, endpoint, params, tag) {
   return acquirePolymarketSlot().catch(() => 'REJECTED').then((slotResult) => {
     if (slotResult === 'REJECTED') {
-      polymarketCache.set(cacheKey, { data: '[]', timestamp: Date.now() - POLYMARKET_CACHE_TTL_MS + POLYMARKET_NEG_TTL_MS });
+      backoffPolymarketResult(cacheKey);
       return null;
     }
     const gammaUrl = `https://gamma-api.polymarket.com/${endpoint}?${params}`;
@@ -9950,11 +11236,11 @@ function fetchPolymarketUpstream(cacheKey, endpoint, params, tag) {
           polymarketCircuitBreaker.failures = 0;
         } else {
           tripPolymarketCircuitBreaker();
-          polymarketCache.set(cacheKey, { data: '[]', timestamp: Date.now() - POLYMARKET_CACHE_TTL_MS + POLYMARKET_NEG_TTL_MS });
+          backoffPolymarketResult(cacheKey);
         }
       }
       const request = https.get(gammaUrl, {
-        headers: { 'Accept': 'application/json' },
+        headers: { 'Accept': 'application/json', 'User-Agent': CHROME_UA },
         timeout: 10000,
       }, (response) => {
         if (response.statusCode !== 200) {
@@ -9965,10 +11251,30 @@ function fetchPolymarketUpstream(cacheKey, endpoint, params, tag) {
           return;
         }
         let data = '';
-        response.on('data', chunk => data += chunk);
+        let bytes = 0;
+        response.on('data', chunk => {
+          if (finalized) return;
+          bytes += Buffer.byteLength(chunk);
+          if (bytes > POLYMARKET_MAX_BODY_BYTES) {
+            finalize(false);
+            response.destroy();
+            request.destroy();
+            resolve(null);
+            return;
+          }
+          data += chunk;
+        });
         response.on('end', () => {
+          if (finalized) return;
+          try {
+            if (!Array.isArray(JSON.parse(data))) throw new Error('Expected market list');
+          } catch {
+            finalize(false);
+            resolve(null);
+            return;
+          }
           finalize(true);
-          polymarketCache.set(cacheKey, { data, timestamp: Date.now() });
+          cachePolymarketResult(cacheKey, { data, timestamp: Date.now() });
           resolve(data);
         });
         response.on('error', () => { finalize(false); resolve(null); });
@@ -10000,16 +11306,17 @@ function handlePolymarketRequest(req, res) {
   // query-string ordering, tag vs tag_slug alias, or varying limit values.
   // Cache key excludes limit — always fetch upstream with limit=50, slice on serve.
   // This prevents cache fragmentation from different callers (limit=20 vs limit=30).
-  const endpoint = url.searchParams.get('endpoint') || 'markets';
+  const endpoint = url.searchParams.get('endpoint') === 'events' ? 'events' : 'markets';
   const requestedLimit = Math.max(1, Math.min(100, parseInt(url.searchParams.get('limit') || '50', 10) || 50));
   const upstreamLimit = 50; // canonical upstream limit for cache sharing
   const params = new URLSearchParams();
-  params.set('closed', url.searchParams.get('closed') || 'false');
-  params.set('order', url.searchParams.get('order') || 'volume');
-  params.set('ascending', url.searchParams.get('ascending') || 'false');
+  params.set('closed', url.searchParams.get('closed') === 'true' ? 'true' : 'false');
+  const order = url.searchParams.get('order');
+  params.set('order', ['volume', 'liquidity', 'startDate', 'endDate', 'spread'].includes(order) ? order : 'volume');
+  params.set('ascending', url.searchParams.get('ascending') === 'true' ? 'true' : 'false');
   params.set('limit', String(upstreamLimit));
-  const tag = url.searchParams.get('tag') || url.searchParams.get('tag_slug');
-  if (tag && endpoint === 'events') params.set('tag_slug', tag.replace(/[^a-z0-9-]/gi, '').slice(0, 100));
+  const tag = (url.searchParams.get('tag') || url.searchParams.get('tag_slug') || '').replace(/[^a-z0-9-]/gi, '').slice(0, 100);
+  if (tag && endpoint === 'events') params.set('tag_slug', tag);
 
   const cacheKey = endpoint + ':' + params.toString();
 
@@ -10024,6 +11331,7 @@ function handlePolymarketRequest(req, res) {
 
   const cached = polymarketCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < POLYMARKET_CACHE_TTL_MS) {
+    if (cached.data === null) return safeEnd(res, 502, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }, JSON.stringify({ error: 'Polymarket upstream unavailable' }));
     return sendCompressed(req, res, 200, {
       'Content-Type': 'application/json',
       'Cache-Control': 'public, max-age=600',
@@ -10033,18 +11341,19 @@ function handlePolymarketRequest(req, res) {
     }, sliceToLimit(cached.data));
   }
 
-  // Circuit breaker open — serve stale cache or empty, skip upstream
-  if (Date.now() < polymarketCircuitBreaker.openUntil) {
-    if (cached) {
+  const circuitOpen = Date.now() < polymarketCircuitBreaker.openUntil;
+  if (circuitOpen || Date.now() < (cached?.retryAt || 0)) {
+    if (cached?.data) {
       return sendCompressed(req, res, 200, {
         'Content-Type': 'application/json',
         'Cache-Control': 'no-store',
+        'CDN-Cache-Control': 'no-store',
         'X-Cache': 'STALE',
-        'X-Circuit': 'OPEN',
+        ...(circuitOpen ? { 'X-Circuit': 'OPEN' } : {}),
         'X-Polymarket-Source': 'railway-stale',
-      }, cached.data);
+      }, sliceToLimit(cached.data));
     }
-    return safeEnd(res, 200, { 'Content-Type': 'application/json', 'X-Circuit': 'OPEN' }, JSON.stringify([]));
+    return safeEnd(res, 503, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Circuit': 'OPEN' }, JSON.stringify({ error: 'Polymarket upstream unavailable' }));
   }
 
   let inflight = polymarketInflight.get(cacheKey);
@@ -10064,7 +11373,7 @@ function handlePolymarketRequest(req, res) {
         'X-Cache': 'MISS',
         'X-Polymarket-Source': 'railway',
       }, sliceToLimit(data));
-    } else if (cached) {
+    } else if (cached?.data) {
       sendCompressed(req, res, 200, {
         'Content-Type': 'application/json',
         'Cache-Control': 'no-store',
@@ -10073,7 +11382,7 @@ function handlePolymarketRequest(req, res) {
         'X-Polymarket-Source': 'railway-stale',
       }, sliceToLimit(cached.data));
     } else {
-      safeEnd(res, 200, { 'Content-Type': 'application/json' }, JSON.stringify([]));
+      safeEnd(res, 502, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }, JSON.stringify({ error: 'Polymarket upstream unavailable' }));
     }
   });
 }
@@ -10114,7 +11423,7 @@ setInterval(() => {
     if (now - entry.timestamp > WORLDBANK_CACHE_TTL_MS * 2) worldbankCache.delete(key);
   }
   for (const [key, entry] of polymarketCache) {
-    if (now - entry.timestamp > POLYMARKET_CACHE_TTL_MS * 2) polymarketCache.delete(key);
+    if (now - entry.timestamp > POLYMARKET_CACHE_TTL_MS * 2 && now >= (entry.retryAt || 0)) polymarketCache.delete(key);
   }
   for (const [key, entry] of yahooChartCache) {
     if (now - entry.ts > YAHOO_CHART_CACHE_TTL_MS * 2) yahooChartCache.delete(key);
@@ -10440,11 +11749,20 @@ async function ytFetch(url) {
 
 const ytLiveCache = new Map();
 const YT_CACHE_TTL = 5 * 60 * 1000;
+const YT_CHANNEL_ID_RE = /^UC[A-Za-z0-9_-]{22}$/;
+const YT_HANDLE_RE = /^[\p{L}\p{N}](?:[\p{L}\p{N}\p{M}._·-]{0,28}[\p{L}\p{N}\p{M}])?$/u;
 
 function handleYouTubeLiveRequest(req, res) {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const channel = url.searchParams.get('channel');
   const videoIdParam = url.searchParams.get('videoId');
+  const handle = channel?.replace(/^@/, '').normalize('NFC') || '';
+  if ((channel && (channel.length > 128 || channel !== channel.trim()
+    || (!YT_CHANNEL_ID_RE.test(channel) && !YT_HANDLE_RE.test(handle))))
+    || (videoIdParam && (videoIdParam.length !== 11 || !/^[A-Za-z0-9_-]{11}$/.test(videoIdParam)))) {
+    return sendCompressed(req, res, 400, { 'Content-Type': 'application/json' },
+      JSON.stringify({ error: 'Invalid YouTube handle, channel ID or video ID' }));
+  }
 
   if (videoIdParam && /^[A-Za-z0-9_-]{11}$/.test(videoIdParam)) {
     const cacheKey = `vid:${videoIdParam}`;
@@ -10477,7 +11795,7 @@ function handleYouTubeLiveRequest(req, res) {
       JSON.stringify({ error: 'Missing channel parameter' }));
   }
 
-  const channelHandle = channel.startsWith('@') ? channel : `@${channel}`;
+  const channelHandle = YT_CHANNEL_ID_RE.test(channel) ? channel : `@${handle.toLowerCase()}`;
   const cacheKey = `ch:${channelHandle}`;
   const cached = ytLiveCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < YT_CACHE_TTL) {
@@ -10487,7 +11805,8 @@ function handleYouTubeLiveRequest(req, res) {
     }, cached.json);
   }
 
-  const liveUrl = `https://www.youtube.com/${channelHandle}/live`;
+  const channelPath = YT_CHANNEL_ID_RE.test(channel) ? `channel/${channel}` : `@${encodeURIComponent(handle)}`;
+  const liveUrl = `https://www.youtube.com/${channelPath}/live`;
   ytFetch(liveUrl)
     .then(r => {
       if (!r.ok) {
@@ -10682,7 +12001,10 @@ const server = http.createServer(async (req, res) => {
   // prevention (rate limiting), not data protection. Cloudflare WAF provides edge-level protection.
   const isPublicRoute = pathname === '/health' || pathname === '/' || isRssRoute || pathname.startsWith('/widget-agent');
   if (!isPublicRoute) {
-    if (!isAuthorizedRequest(req)) {
+    const authorized = pathname === '/status'
+      ? Boolean(RELAY_SHARED_SECRET) && isAuthorizedRequest(req)
+      : isAuthorizedRequest(req);
+    if (!authorized) {
       const routeGroup = getRouteGroup(pathname);
       if (routeGroup === 'snapshot') incrementRelayMetric('aisSnapshotUnauthorizedClient');
       else if (routeGroup === 'opensky') recordRelayOutcome('opensky', 'authRejection');
@@ -10814,14 +12136,19 @@ const server = http.createServer(async (req, res) => {
         lastPollAt: telegramState.lastPollAt ? new Date(telegramState.lastPollAt).toISOString() : null,
         hasError: !!telegramState.lastError,
         lastError: telegramState.lastError || null,
-        pollInFlight: telegramPollInFlight,
-        pollInFlightSince: telegramPollInFlight && telegramPollStartedAt ? new Date(telegramPollStartedAt).toISOString() : null,
+        pollInFlight: telegramPollRun !== null,
+        pollInFlightSince: telegramPollRun ? new Date(telegramPollRun.startedAt).toISOString() : null,
       },
       xFeed: {
         enabled: X_ENABLED,
         accounts: xState.accounts?.length || 0,
         items: xState.items?.length || 0,
+        // lastPollAt is an ACCEPTED-PUBLICATION clock: it advances only when a
+        // List page is validated, settled and published. lastAttemptAt is the
+        // attempt clock this field used to be, kept here so public consumers can
+        // still tell "not polling" from "polling but not accepting".
         lastPollAt: xState.lastPollAt ? new Date(xState.lastPollAt).toISOString() : null,
+        lastAttemptAt: xState.lastAttemptAt ? new Date(xState.lastAttemptAt).toISOString() : null,
         hasError: !!xState.lastError,
         lastError: xState.lastError || null,
         // Distinguishes "Redis unreadable, refusing to publish" from an ordinary
@@ -10833,6 +12160,7 @@ const server = http.createServer(async (req, res) => {
         pollInFlight: xPollGuard.isInFlight(),
         pollInFlightSince: xPollGuard.startedAt() ? new Date(xPollGuard.startedAt()).toISOString() : null,
         rateLimitedUntil: xState.rateLimitedUntil ? new Date(xState.rateLimitedUntil).toISOString() : null,
+        backoffCause: xState.backoffCause || null,
       },
       oref: {
         enabled: SIREN_ALERTS_ENABLED,
@@ -10868,6 +12196,46 @@ const server = http.createServer(async (req, res) => {
         // allowVercelPreviewOrigins removed per #3802. See note above.
         enabled: !AUTH_EFFECTIVELY_DISABLED,
         sharedSecretEnabled: !!RELAY_SHARED_SECRET,
+      },
+    }));
+  } else if (pathname === '/status') {
+    const postBudget = await xPostBudget.status({ requestedPosts: 5, coverageUnitPosts: 5 });
+    return sendCompressed(req, res, postBudget.available ? 200 : 503, {
+      'Content-Type': 'application/json',
+      'Cache-Control': 'no-store',
+    }, JSON.stringify({
+      status: xPostBudgetServiceStatus(postBudget),
+      xFeed: {
+        enabled: X_ENABLED,
+        bearerConfigured: Boolean(X_BEARER_TOKEN),
+        listConfigured: X_CURATED_LIST_CONFIGURED,
+        accounts: xState.accounts?.length || 0,
+        items: xState.items?.length || 0,
+        lastPollAt: xState.lastPollAt ? new Date(xState.lastPollAt).toISOString() : null,
+        lastAttemptAt: xState.lastAttemptAt ? new Date(xState.lastAttemptAt).toISOString() : null,
+        lastProviderSuccessAt: xState.lastProviderSuccessAt
+          ? new Date(xState.lastProviderSuccessAt).toISOString()
+          : null,
+        lastAcceptedPublicationAt: xState.lastAcceptedPublicationAt
+          ? new Date(xState.lastAcceptedPublicationAt).toISOString()
+          : null,
+        lastAttemptSlot: xState.lastAttemptSlot,
+        lastProviderSuccessSlot: xState.lastProviderSuccessSlot,
+        lastPublishedSlot: xState.lastPublishedSlot,
+        lastMembershipCheckAt: xState.lastMembershipCheckAt
+          ? new Date(xState.lastMembershipCheckAt).toISOString()
+          : null,
+        lastError: xState.lastError || null,
+        coverage: xState.lastCoverage,
+        lastHealthyAt: xState.lastHealthyAt ? new Date(xState.lastHealthyAt).toISOString() : null,
+        pollInFlight: xPollGuard.isInFlight(),
+        rateLimitedUntil: xState.rateLimitedUntil ? new Date(xState.rateLimitedUntil).toISOString() : null,
+        backoffCause: xState.backoffCause || null,
+        lastDeletionAuditAt: xState.lastDeletionAuditAt
+          ? new Date(xState.lastDeletionAuditAt).toISOString()
+          : null,
+        lastCycleUsage: xState.lastCycleUsage,
+        postBudget,
       },
     }));
   } else if (pathname === '/metrics') {
@@ -10958,7 +12326,7 @@ const server = http.createServer(async (req, res) => {
     const clientId = process.env.OPENSKY_CLIENT_ID;
     const clientSecret = process.env.OPENSKY_CLIENT_SECRET;
 
-    diag.steps.push({ step: 'env_check', hasClientId: !!clientId, hasClientSecret: !!clientSecret, proxyEnabled: OPENSKY_PROXY_ENABLED });
+    diag.steps.push({ step: 'env_check', hasClientId: !!clientId, hasClientSecret: !!clientSecret, route: OPENSKY_ROUTE, routeRequested: OPENSKY_ROUTE_REQUESTED, proxyEnabled: OPENSKY_PROXY_ENABLED });
     diag.steps.push({
       step: 'auth_state',
       cachedToken: !!openskyToken,
@@ -11015,8 +12383,48 @@ const server = http.createServer(async (req, res) => {
 
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     res.end(JSON.stringify(diag, null, 2));
-  } else if (pathname === '/telegram' || pathname.startsWith('/telegram/')) {
-    // Telegram Early Signals feed (public channels)
+  } else if (pathname === '/telegram/resolve') {
+    try {
+      const url = new URL(req.url, `http://localhost:${PORT}`);
+      const username = url.searchParams.get('username') || '';
+      const { preview } = await withTimeout(
+        resolveTelegramChannel(username),
+        TELEGRAM_LOOKUP_DEADLINE_MS,
+        `resolveTelegramChannel(${username})`,
+      );
+      sendCompressed(req, res, 200, {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-store',
+        'CDN-Cache-Control': 'no-store',
+      }, JSON.stringify(preview));
+    } catch (e) {
+      const status = getTelegramErrorStatus(e);
+      res.writeHead(status, getTelegramErrorHeaders(e));
+      res.end(JSON.stringify({ error: getTelegramPublicErrorMessage(status) }));
+    }
+  } else if (pathname === '/telegram/channel') {
+    try {
+      const url = new URL(req.url, `http://localhost:${PORT}`);
+      const username = url.searchParams.get('username') || '';
+      const limit = Math.max(1, Math.min(50, Number(url.searchParams.get('limit') || 20)));
+      const payload = await withTimeout(
+        fetchTelegramChannelFeed(username, limit),
+        TELEGRAM_LOOKUP_DEADLINE_MS,
+        `fetchTelegramChannelFeed(${username})`,
+      );
+      sendCompressed(req, res, 200, {
+        'Content-Type': 'application/json',
+        // Post bodies are R4. The relay's bounded in-memory cache absorbs
+        // repeated lookups; shared HTTP caches must not bypass relay auth.
+        'Cache-Control': 'no-store',
+        'CDN-Cache-Control': 'no-store',
+      }, JSON.stringify(payload));
+    } catch (e) {
+      const status = getTelegramErrorStatus(e);
+      res.writeHead(status, getTelegramErrorHeaders(e));
+      res.end(JSON.stringify({ error: getTelegramPublicErrorMessage(status) }));
+    }
+  } else if (pathname === '/telegram' || pathname === '/telegram/feed') {
     try {
       const url = new URL(req.url, `http://localhost:${PORT}`);
       const limit = Math.max(1, Math.min(200, Number(url.searchParams.get('limit') || 50)));
@@ -11734,23 +13142,33 @@ function parseGfDates(text, isRoundTrip) {
     const stripped = text.replace(/^\)\]\}'/, '');
     const outer = JSON.parse(stripped);
     const inner = outer?.[0]?.[2];
-    if (!inner) return [];
+    if (!inner) return null;
 
     const data = JSON.parse(inner);
     const items = data[data.length - 1];
-    if (!Array.isArray(items)) return [];
+    if (!Array.isArray(items)) return null;
 
+    const isCalendarDate = value => {
+      if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+      const time = Date.parse(`${value}T00:00:00Z`);
+      return Number.isFinite(time) && new Date(time).toISOString().slice(0, 10) === value;
+    };
     const roundTrip = isRoundTrip === 'true' || isRoundTrip === true;
-    return items.map(item => {
+    const dates = [];
+    for (const item of items) {
       try {
         if (!Array.isArray(item) || item.length < 3) return null;
         if (!Array.isArray(item[2]) || !Array.isArray(item[2][0]) || item[2][0].length < 2) return null;
-        const price = parseFloat(item[2][0][1]);
-        if (!price || Number.isNaN(price)) return null;
-        return { date: item[0] ?? '', returnDate: roundTrip ? (item[1] ?? '') : '', price };
+        const date = item[0];
+        const returnDate = item[1];
+        if (!isCalendarDate(date) || (roundTrip && !isCalendarDate(returnDate))) return null;
+        const price = Number(item[2][0][1]);
+        if (!Number.isFinite(price) || price <= 0) return null;
+        dates.push({ date, returnDate: roundTrip ? returnDate : '', price });
       } catch { return null; }
-    }).filter(Boolean);
-  } catch { return []; }
+    }
+    return dates;
+  } catch { return null; }
 }
 
 async function handleGoogleFlightsSearch(req, res) {
@@ -11877,6 +13295,7 @@ async function handleGoogleFlightsDates(req, res) {
     const MAX_DATE_CHUNKS = 6;
     const allDates = [];
     let hasPartialFailure = false;
+    let hasCooldown = false;
 
     if (totalDays <= MAX_CHUNK) {
       incrementRelayMetric('googleFlightsRequests');
@@ -11907,63 +13326,68 @@ async function handleGoogleFlightsDates(req, res) {
         throw new Error(`Google Flights returned ${gfResp.status}`);
       }
       const text = await gfResp.text();
-      allDates.push(...parseGfDates(text, isRoundTrip));
+      const dates = parseGfDates(text, isRoundTrip);
+      if (dates === null) {
+        recordRelayOutcome('googleFlights', 'terminalFailure');
+        throw new Error('Google Flights returned an invalid calendar response');
+      }
+      allDates.push(...dates);
       recordRelayOutcome('googleFlights', 'success');
       incrementRelayMetric('googleFlightsServed');
     } else {
-      const current = new Date(start);
-      let chunksAttempted = 0;
-      while (current <= end && chunksAttempted < MAX_DATE_CHUNKS) {
-        chunksAttempted++;
+      const chunks = [];
+      for (let day = start.getTime(); day <= end.getTime() && chunks.length < MAX_DATE_CHUNKS; day += MAX_CHUNK * 86_400_000) {
+        chunks.push({
+          ...params,
+          startDate: new Date(day).toISOString().slice(0, 10),
+          endDate: new Date(Math.min(day + (MAX_CHUNK - 1) * 86_400_000, end.getTime())).toISOString().slice(0, 10),
+        });
+      }
+      if (totalDays > MAX_CHUNK * MAX_DATE_CHUNKS) hasPartialFailure = true;
+
+      // At most six concurrent 20s fetches fit within the RPC's 30s wait.
+      const results = await Promise.all(chunks.map(async (chunk) => {
         incrementRelayMetric('googleFlightsRequests');
         if (Date.now() < gfGlobal429Until) {
           incrementRelayMetric('googleFlights429');
           recordRelayOutcome('googleFlights', 'throttle');
+          hasCooldown = true;
           hasPartialFailure = true;
-          current.setDate(current.getDate() + MAX_CHUNK);
-          continue;
+          return [];
         }
-        const chunkEnd = new Date(current);
-        chunkEnd.setDate(chunkEnd.getDate() + MAX_CHUNK - 1);
-        if (chunkEnd > end) chunkEnd.setTime(end.getTime());
-
-        const chunkFilters = buildDateFilters({
-          ...params,
-          startDate: current.toISOString().slice(0, 10),
-          endDate: chunkEnd.toISOString().slice(0, 10),
-        });
-        const body = `f.req=${encodeGfFilters(chunkFilters)}`;
-        let gfResp;
         try {
-          gfResp = await fetch(GF_CALENDAR_URL, { method: 'POST', headers: GF_HEADERS, body, signal: AbortSignal.timeout(20_000) });
+          const body = `f.req=${encodeGfFilters(buildDateFilters(chunk))}`;
+          const gfResp = await fetch(GF_CALENDAR_URL, { method: 'POST', headers: GF_HEADERS, body, signal: AbortSignal.timeout(20_000) });
+          if (gfResp.status === 429) {
+            gfGlobal429Until = Date.now() + GF_429_COOLDOWN_MS;
+            console.warn(`[Google Flights] chunk 429 — global cooldown ${GF_429_COOLDOWN_MS / 1000}s`);
+            incrementRelayMetric('googleFlights429');
+            recordRelayOutcome('googleFlights', 'throttle');
+            hasCooldown = true;
+          } else if (gfResp.status === 401 || gfResp.status === 403) {
+            recordRelayOutcome('googleFlights', 'authRejection');
+          } else if (gfResp.ok) {
+            const text = await gfResp.text();
+            const dates = parseGfDates(text, isRoundTrip);
+            if (dates === null) {
+              recordRelayOutcome('googleFlights', 'terminalFailure');
+              console.warn(`[Google Flights] dates chunk ${chunk.startDate} returned an invalid calendar response`);
+            } else {
+              recordRelayOutcome('googleFlights', 'success');
+              incrementRelayMetric('googleFlightsServed');
+              return dates;
+            }
+          } else {
+            recordRelayOutcome('googleFlights', 'terminalFailure');
+            console.warn(`[Google Flights] dates chunk ${chunk.startDate} failed: ${gfResp.status}`);
+          }
         } catch (err) {
           recordRelayOutcome('googleFlights', classifyUpstreamOutcome({ error: err }));
-          hasPartialFailure = true;
-          current.setDate(current.getDate() + MAX_CHUNK);
-          continue;
         }
-        if (gfResp.status === 429) {
-          gfGlobal429Until = Date.now() + GF_429_COOLDOWN_MS;
-          console.warn(`[Google Flights] chunk 429 — global cooldown ${GF_429_COOLDOWN_MS / 1000}s`);
-          incrementRelayMetric('googleFlights429');
-          recordRelayOutcome('googleFlights', 'throttle');
-          hasPartialFailure = true;
-        } else if (gfResp.status === 401 || gfResp.status === 403) {
-          recordRelayOutcome('googleFlights', 'authRejection');
-          hasPartialFailure = true;
-        } else if (gfResp.ok) {
-          const text = await gfResp.text();
-          allDates.push(...parseGfDates(text, isRoundTrip));
-          recordRelayOutcome('googleFlights', 'success');
-          incrementRelayMetric('googleFlightsServed');
-        } else {
-          recordRelayOutcome('googleFlights', 'terminalFailure');
-          hasPartialFailure = true;
-          console.warn(`[Google Flights] dates chunk ${current.toISOString().slice(0, 10)} failed: ${gfResp.status}`);
-        }
-        current.setDate(current.getDate() + MAX_CHUNK);
-      }
-      if (current <= end) hasPartialFailure = true;
+        hasPartialFailure = true;
+        return [];
+      }));
+      for (const dates of results) allDates.push(...dates);
     }
 
     const sortByPrice = url.searchParams.get('sort_by_price') === 'true';
@@ -11972,7 +13396,7 @@ async function handleGoogleFlightsDates(req, res) {
     if (hasPartialFailure && allDates.length > 0) recordRelayOutcome('googleFlights', 'fallback');
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ dates: allDates, partial: hasPartialFailure }));
+    res.end(JSON.stringify({ dates: allDates, partial: hasPartialFailure, cooldown: hasCooldown }));
   } catch (err) {
     const isTimeout = err?.name === 'TimeoutError' || err?.message?.includes('timed out');
     if (isTimeout) {
@@ -12051,11 +13475,11 @@ function isWidgetEndpointAllowed(endpoint) {
 
 const WIDGET_FETCH_TOOL = {
   name: 'fetch_worldmonitor_data',
-  description: 'Fetch live data from WorldMonitor APIs. Only pre-approved endpoint paths are allowed.',
+  description: 'Fetch structured WorldMonitor data from the catalog in the system prompt. Prefer a matching bootstrap key, then a matching RPC; use search_web only for a data gap. Send a GET to /api/bootstrap with params.keys (comma-separated catalog keys), or /api/<service>/v1/<method> with the cataloged RPC params. Supply a path, not a full URL; params are string query parameters appended to the URL. Some cataloged routes require credentials this tool does not send; their authorization error body is returned as text, not data. Successful bootstrap JSON has { data: { <key>: <array or object> }, missing: [<key>] }; RPC JSON has method-specific fields and can include historical series, such as seeded FRED observations. The model receives sanitized response text, normally JSON, truncated to 20,000 characters; it may be incomplete JSON or an API error body. Local policy rejection returns "Endpoint not allowed."; leading <!DOCTYPE or <html pages return an HTML error message with no data; fetch failures return "Fetch failed: <message>". Treat errors or missing data as unavailable, never as zero.',
   input_schema: {
     type: 'object',
     properties: {
-      endpoint: { type: 'string', description: 'Approved API endpoint path (e.g. /api/market/v1/list-crypto-quotes)' },
+      endpoint: { type: 'string', description: 'Cataloged API path, not a full URL (e.g. /api/bootstrap or /api/economic/v1/get-fred-series); put query parameters in params' },
       params: { type: 'object', description: 'Query parameters as key-value string pairs', additionalProperties: { type: 'string' } },
     },
     required: ['endpoint'],
@@ -12246,7 +13670,7 @@ For modify requests: make targeted changes to improve the widget as requested.`;
 
 const WIDGET_SEARCH_TOOL = {
   name: 'search_web',
-  description: 'Search the web for current news, live data, or any topic not covered by WorldMonitor RPCs. Returns up to 8 results with title, URL, snippet, and publish date. Use this for topics like breaking news, weather, specific events, prices not in RPC catalog, etc.',
+  description: 'Search the web for data to display in a widget, only when no suitable WorldMonitor bootstrap key or RPC supplies the requested data, specificity, or freshness. Prefer matching structured WorldMonitor data, including weatherAlerts, news list-feed-digest, and aviation news. A local weather forecast, a breaking event not yet in the feeds, or a price not in the catalog are valid widget requests: use search_web for these gaps. Requests up to 8 results and returns a sanitized JSON array with title, url, snippet, publishedDate. These are web snippets, not structured dashboard values; freshness varies by provider and publishedDate may be a date, relative age, or empty. No usable results or search failures return error text.',
   input_schema: {
     type: 'object',
     properties: {
@@ -12425,6 +13849,8 @@ function handleWidgetAgentHealthRequest(req, res) {
   return safeEnd(res, 200, { 'Content-Type': 'application/json' }, JSON.stringify(status));
 }
 
+const WIDGET_MAX_TOOL_CALLS = 3;
+
 async function handleWidgetAgentRequest(req, res) {
   const status = requireWidgetAgentAccess(req, res);
   if (!status) return;
@@ -12516,6 +13942,7 @@ async function handleWidgetAgentRequest(req, res) {
   // Error (log-failed)" — defeating the entire diagnostic value of this
   // log line. `completed` doesn't need hoisting (not read in catch).
   let toolCallCount = 0;
+  let toolExecutionCount = 0;
 
   try {
     const { default: Anthropic } = await import('@anthropic-ai/sdk');
@@ -12536,13 +13963,16 @@ async function handleWidgetAgentRequest(req, res) {
     messages.push({ role: 'user', content: String(prompt).slice(0, 2000) });
 
     let completed = false;
+    const recoveryCandidates = [];
+    let incompleteMessage = `Widget generation incomplete: tool loop exhausted (${maxTurns} turns)`;
+    let finalizing = false;
+    let truncatedResponses = 0;
     for (let turn = 0; turn < maxTurns; turn++) {
       if (cancelled) break;
 
-      // Option D: on penultimate turn, inject a final-turn directive so the model
-      // emits HTML with whatever data it has instead of making another tool call.
-      const isLastChance = turn === maxTurns - 2;
-      const turnMessages = isLastChance
+      // Finalization is irreversible, including after an incomplete response.
+      finalizing ||= toolCallCount >= WIDGET_MAX_TOOL_CALLS || turn >= maxTurns - 2;
+      const turnMessages = finalizing
         ? [...messages, { role: 'user', content: 'FINAL TURN: You have used all available tool calls. You MUST emit the completed widget HTML now using the data you already have. No more tool calls — output <!-- widget-html --> immediately.' }]
         : messages;
 
@@ -12550,50 +13980,81 @@ async function handleWidgetAgentRequest(req, res) {
         model,
         max_tokens: maxTokens,
         system: systemPrompt,
-        tools: isLastChance ? [] : [WIDGET_FETCH_TOOL, WIDGET_SEARCH_TOOL],
+        // Keep schemas for tool blocks in history while prohibiting new calls.
+        tools: [WIDGET_FETCH_TOOL, WIDGET_SEARCH_TOOL],
+        tool_choice: { type: finalizing ? 'none' : 'auto' },
         messages: turnMessages,
       });
+      if (cancelled) break;
 
-      if (response.stop_reason === 'end_turn') {
+      const hasToolRequests = response.content.some(b => b.type === 'tool_use');
+      if (response.stop_reason === 'end_turn' && !hasToolRequests) {
         const textBlock = response.content.find(b => b.type === 'text');
         const text = textBlock?.text ?? '';
-        const htmlMatch = text.match(/<!--\s*widget-html\s*-->([\s\S]*?)<!--\s*\/widget-html\s*-->/);
-        const html = (htmlMatch?.[1] ?? text).slice(0, maxHtml);
-        const titleMatch = text.match(/<!--\s*title:\s*([^\n]+?)\s*-->/);
-        const title = titleMatch?.[1]?.trim() ?? 'Custom Widget';
+        const { html, title, isComplete } = parseWidgetAgentResponse(text, maxHtml);
+        if (!isComplete) {
+          incompleteMessage = 'Widget generation incomplete: expected nonempty HTML inside complete widget-html markers.';
+          break;
+        }
         sendWidgetSSE(res, 'html_complete', { html });
         sendWidgetSSE(res, 'done', { title });
         completed = true;
         break;
       }
 
-      if (response.stop_reason === 'tool_use') {
+      if (hasToolRequests) {
         const toolResults = [];
         for (const block of response.content) {
           if (block.type !== 'tool_use') continue;
+          if (cancelled) break;
+
+          // Count attempts, including invalid/failed/unknown requests. Rejection
+          // never refunds the shared budget, and every block gets a result.
+          toolCallCount++;
+          const rejectTool = content => toolResults.push({ type: 'tool_result', tool_use_id: block.id, is_error: true, content });
+          if (toolCallCount > WIDGET_MAX_TOOL_CALLS) {
+            rejectTool('Tool call budget exhausted. Generate the widget using existing data.');
+            continue;
+          }
+          if (finalizing || response.stop_reason !== 'tool_use') {
+            rejectTool('Tools disabled during finalization or an incomplete response. Generate the complete widget using existing data.');
+            continue;
+          }
+          if (!block.input || typeof block.input !== 'object' || Array.isArray(block.input)) {
+            rejectTool('Invalid tool input.');
+            continue;
+          }
 
           if (block.name === 'search_web') {
             const { query = '' } = block.input;
+            if (typeof query !== 'string') {
+              rejectTool('Invalid search query.');
+              continue;
+            }
             sendWidgetSSE(res, 'tool_call', { endpoint: `search:${String(query).slice(0, 80)}` });
             try {
+              toolExecutionCount++;
               const searchResult = await performWidgetWebSearch(String(query));
               if (searchResult) {
                 toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: sanitizeToolContent(JSON.stringify(searchResult.results)) });
               } else {
-                toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: 'No search results available. No search provider configured.' });
+                rejectTool('No search results available. No search provider configured.');
               }
             } catch (err) {
-              toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: `Search failed: ${err.message}` });
+              rejectTool(`Search failed: ${err.message}`);
             }
             continue;
           }
 
-          if (block.name !== 'fetch_worldmonitor_data') continue;
+          if (block.name !== 'fetch_worldmonitor_data') {
+            rejectTool('Unknown tool.');
+            continue;
+          }
           const { endpoint, params = {} } = block.input;
           sendWidgetSSE(res, 'tool_call', { endpoint });
 
-          if (!isWidgetEndpointAllowed(endpoint)) {
-            toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: 'Endpoint not allowed.' });
+          if (typeof endpoint !== 'string' || !isWidgetEndpointAllowed(endpoint)) {
+            rejectTool('Endpoint not allowed.');
             continue;
           }
 
@@ -12602,6 +14063,7 @@ async function handleWidgetAgentRequest(req, res) {
             for (const [k, v] of Object.entries(params)) {
               url.searchParams.set(k, String(v));
             }
+            toolExecutionCount++;
             const dataRes = await fetch(url.toString(), {
               headers: { 'User-Agent': 'WorldMonitor-WidgetAgent/1.0' },
               signal: AbortSignal.timeout(15_000),
@@ -12609,39 +14071,59 @@ async function handleWidgetAgentRequest(req, res) {
             const data = await dataRes.text();
             const trimmed = data.trimStart();
             if (trimmed.startsWith('<!DOCTYPE') || trimmed.startsWith('<html')) {
-              toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: 'Error: endpoint returned HTML instead of JSON. No data available.' });
+              rejectTool('Error: endpoint returned HTML instead of JSON. No data available.');
             } else {
               toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: sanitizeToolContent(data) });
             }
           } catch (err) {
-            toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: `Fetch failed: ${err.message}` });
+            rejectTool(`Fetch failed: ${err.message}`);
           }
         }
         messages.push({ role: 'assistant', content: response.content });
         messages.push({ role: 'user', content: toolResults });
-        toolCallCount++;
+        if (response.stop_reason === 'tool_use') recoveryCandidates.push(response.content);
+      } else {
+        messages.push({ role: 'assistant', content: response.content });
+      }
+      if (cancelled) break;
+
+      // The installed SDK also exposes pause_turn, refusal and stop_sequence.
+      // Keep partial content in history, but never promote it to success.
+      switch (response.stop_reason) {
+        case 'tool_use':
+          if (!hasToolRequests) throw new Error('Widget generation incomplete: tool stop without tool requests');
+          break;
+        case 'max_tokens':
+          finalizing = true;
+          if (++truncatedResponses > 1) throw new Error('Widget generation incomplete: response truncated twice at the token limit');
+          messages.push({ role: 'user', content: 'The previous response was truncated. Generate the entire completed widget again, more concisely, using existing data. Do not continue the partial HTML.' });
+          break;
+        case 'pause_turn':
+          finalizing = true;
+          break;
+        case 'refusal':
+          throw new Error('Widget generation refused by the AI backend');
+        case 'stop_sequence':
+          throw new Error('Widget generation incomplete: unexpected stop sequence');
+        default:
+          throw new Error('Widget generation incomplete: unexpected stop reason');
       }
     }
     if (!completed && !cancelled) {
-      // Partial recovery: scan all assistant messages for any widget-html markers
-      // emitted mid-loop (e.g. model tried to output but was truncated).
+      // Recover the newest complete tool-turn output from this request only.
       let recovered = false;
-      for (const msg of messages) {
-        if (msg.role !== 'assistant') continue;
-        const text = Array.isArray(msg.content)
-          ? msg.content.filter(b => b.type === 'text').map(b => b.text).join('')
-          : String(msg.content ?? '');
-        const htmlMatch = text.match(/<!--\s*widget-html\s*-->([\s\S]*?)<!--\s*\/widget-html\s*-->/);
-        if (htmlMatch?.[1]?.trim()) {
-          const titleMatch = text.match(/<!--\s*title:\s*([^\n]+?)\s*-->/);
-          sendWidgetSSE(res, 'html_complete', { html: htmlMatch[1].slice(0, maxHtml) });
-          sendWidgetSSE(res, 'done', { title: titleMatch?.[1]?.trim() ?? 'Custom Widget' });
+      for (let i = recoveryCandidates.length - 1; i >= 0; i--) {
+        const text = recoveryCandidates[i].filter(b => b.type === 'text').map(b => b.text).join('');
+        const parsed = parseWidgetAgentResponse(text, maxHtml);
+        if (parsed.isComplete) {
+          sendWidgetSSE(res, 'html_complete', { html: parsed.html });
+          sendWidgetSSE(res, 'done', { title: parsed.title });
           recovered = true;
           break;
         }
       }
       if (!recovered) {
-        sendWidgetSSE(res, 'error', { message: `Widget generation incomplete: tool loop exhausted (${maxTurns} turns)` });
+        sendWidgetSSE(res, 'error', { message: incompleteMessage });
       }
     }
   } catch (err) {
@@ -12653,24 +14135,22 @@ async function handleWidgetAgentRequest(req, res) {
     if (!cancelled) {
       sendWidgetSSE(res, 'error', { message: classifyWidgetAgentError(err, model) });
     }
-    // Verbose structured log so Railway operators can diagnose without
-    // server-side reproduction. Includes status + type + request shape;
-    // omits headers/body to avoid leaking the prompt or auth headers.
+    // Log metadata only: SDK error messages and stacks can contain request
+    // or response bodies, including prompts and credentials.
     try {
       console.error('[widget-agent] Error:', JSON.stringify({
-        message: err && err.message ? String(err.message).slice(0, 500) : String(err).slice(0, 500),
         status: err && typeof err.status === 'number' ? err.status : null,
         type: (err && err.error && err.error.type) || (err && err.type) || null,
         name: err && err.name ? String(err.name) : null,
         isPro,
         model,
         toolCallCount,
+        toolExecutionCount,
         promptLen: typeof prompt === 'string' ? prompt.length : 0,
         historyLen: Array.isArray(conversationHistory) ? conversationHistory.length : 0,
       }));
-      if (err && err.stack) console.error('[widget-agent] Stack:', err.stack);
     } catch (logErr) {
-      console.error('[widget-agent] Error (log-failed):', err && err.message);
+      console.error('[widget-agent] Error (log-failed)');
     }
   } finally {
     clearTimeout(timeout);
@@ -13201,7 +14681,7 @@ const wss = new WebSocketServer({ server });
 server.listen(PORT, () => {
   const listeningPort = server.address()?.port || PORT;
   relayBoundPort = listeningPort;
-  console.log(`[Relay] WebSocket relay on port ${listeningPort} (OpenSky: ${OPENSKY_PROXY_ENABLED ? 'via proxy' : 'direct'})`);
+  console.log(`[Relay] WebSocket relay on port ${listeningPort} (OpenSky route: ${OPENSKY_ROUTE}${OPENSKY_ROUTE_REQUESTED !== OPENSKY_ROUTE ? ` — "${OPENSKY_ROUTE_REQUESTED}" requested but unconfigured` : ''})`);
   if (RELAY_TEST_MODE) {
     if (process.env.RELAY_TEST_THEATER_VESSEL === '1') {
       candidateReports.set('test-military-vessel', {
@@ -13212,6 +14692,15 @@ server.listen(PORT, () => {
         shipType: 35,
         timestamp: Date.now(),
       });
+    }
+    // Opt-in seam: background loops stay off by default in test mode, but the
+    // curated Telegram poll had no coverage at all as a result — including its
+    // pacing, which is the property that keeps a shared MTProto account below
+    // Telegram's flood threshold. Gated behind RELAY_TEST_MODE *and* an
+    // explicit flag, so it cannot start outside the test harness.
+    if (process.env.RELAY_TEST_TELEGRAM_POLL === 'true') {
+      console.log('[Relay] Test mode: starting the Telegram poll loop on request');
+      startTelegramPollLoop();
     }
     console.log('[Relay] Test mode enabled — background seed loops are disabled');
     return;

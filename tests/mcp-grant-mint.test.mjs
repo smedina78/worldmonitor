@@ -16,7 +16,7 @@
 import { strict as assert } from 'node:assert';
 import { describe, it, beforeEach, afterEach } from 'node:test';
 
-import { signGrant, verifyGrant, GrantConfigError } from '../api/_mcp-grant-hmac.ts';
+import { signGrant, verifyGrant, readGrantSecret, GrantConfigError } from '../api/_mcp-grant-hmac.ts';
 import { mintGrantHandler } from '../api/internal/mcp-grant-mint.ts';
 import { grantContextHandler } from '../api/internal/mcp-grant-context.ts';
 
@@ -226,6 +226,23 @@ describe('_mcp-grant-hmac', () => {
       () => signGrant({ userId: 'u', nonce: 'n', exp: FIXED_NOW + 1000 }), // no explicit secret → reads env
       (err) => err instanceof GrantConfigError,
     );
+  });
+
+  it('readGrantSecret missing-secret warn is value-free and does not enumerate MCP_* keys (#7278)', () => {
+    const decoyKey = 'MCP_DECOY_UNUSED_FOR_7278';
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (...args) => warnings.push(args.map(String).join(' '));
+    try {
+      assert.throws(
+        () => readGrantSecret({ [decoyKey]: 'decoy-value-must-not-appear' }),
+        (err) => err instanceof GrantConfigError,
+      );
+    } finally {
+      console.warn = originalWarn;
+    }
+    assert.deepEqual(warnings, ['[mcp-grant-hmac] MCP_PRO_GRANT_HMAC_SECRET is not set']);
+    assert.equal(warnings.join('\n').includes(decoyKey), false);
   });
 });
 
@@ -543,6 +560,14 @@ describe('grantContextHandler', () => {
     assert.equal(res.headers.get('Cache-Control'), 'no-store');
     const body = await res.json();
     assert.deepEqual(body, { client_name: 'Claude Desktop', redirect_host: 'claude.ai' });
+  });
+
+  it('a custom-scheme redirect surfaces its scheme, not a bare pseudo-host (cursor:// deeplink)', async () => {
+    const { deps, redis } = makeContextDeps();
+    redis.set('oauth:nonce:nonce_xyz', { ...BASE_NONCE_DATA, redirect_uri: 'cursor://anysphere.cursor-mcp/oauth/callback' });
+    const res = await grantContextHandler(makeGetReq('nonce_xyz'), deps);
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).redirect_host, 'cursor://anysphere.cursor-mcp');
   });
 
   it('returns 401 UNAUTHENTICATED when Clerk session is null', async () => {

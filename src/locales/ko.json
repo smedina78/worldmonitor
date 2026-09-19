@@ -119,7 +119,8 @@
       "activeSirens": "사이렌 작동 중",
       "sirens24h": "사이렌 / 24시간",
       "aviationDisruptions": "항공 장애",
-      "gpsJammingZones": "GPS 교란 구역"
+      "gpsJammingZones": "GPS 교란 구역",
+      "temporalUnavailable": "시간 관측 데이터 없음"
     },
     "fallback": {
       "instabilityIndex": "**불안정 지수: {{score}}/100** ({{level}}, {{trend}})",
@@ -190,7 +191,7 @@
       "decisionSignalsUnavailable": "중국 의사결정 신호 스냅샷을 현재 사용할 수 없습니다."
     },
     "foodStocks": "Food stocks",
-    "foodStocksHelp": "USDA PSD commodity stocks-to-use by marketing year, with the world ratio alongside for context. FAOSTAT fills production only where PSD has no country coverage.",
+    "foodStocksHelp": "USDA PSD commodity stocks-to-use by marketing year, with the world ratio alongside for context. FAOSTAT Food Balances supplies production and domestic supply when PSD has no complete country balance.",
     "loadingFoodStocks": "Loading food stocks…",
     "foodStocksUnavailable": "Food stocks unavailable.",
     "foodStocksProLocked": "Upgrade to PRO for commodity stocks-to-use",
@@ -230,6 +231,71 @@
       "manufacturingShare": "Manufacturing employment",
       "source": "Sources: {{sources}}.",
       "retained": "{{stage}} data retained from the last successful refresh."
+    },
+    "fiveFactorScorecard": {
+      "title": "5요인 회복력 스코어카드",
+      "help": "식품, 에너지, 인구, 기술, 방위 분야의 v1 고정 증거 점수입니다. 행을 확장하여 입력값, 출처 정보, 데이터 누락 이유를 확인하세요.",
+      "loading": "5요인 스코어카드 로딩 중…",
+      "unavailable": "5요인 스코어카드를 사용할 수 없습니다.",
+      "proLocked": "5요인 회복력 스코어카드를 사용하려면 PRO로 업그레이드하세요",
+      "insufficient": "데이터 부족",
+      "notAvailable": "사용 불가",
+      "noEvidence": "이 항목에 대한 증거가 없습니다.",
+      "score": "{{score}}/5",
+      "coverage": "{{coverage}}% 커버리지",
+      "methodologyVersion": "방법론 v{{version}}",
+      "methodologyLink": "방법론 보기",
+      "pillars": {
+        "food": "식품",
+        "energy": "에너지",
+        "demographics": "인구 통계",
+        "technology": "기술",
+        "defense": "국방"
+      },
+      "reasons": {
+        "source-unavailable": "출처 없음",
+        "country-unavailable": "국가 정보 없음",
+        "invalid-value": "유효하지 않은 출처 값",
+        "stale": "증거가 오래됨",
+        "coverage-below-floor": "점수 산정 기준 미달",
+        "required-group-missing": "필수 증거 그룹 누락",
+        "missing-population": "인구 데이터 없음",
+        "redistribution-blocked": "출처 재배포 불가",
+        "pillar-unavailable": "지표 항목 사용 불가"
+      },
+      "inputs": {
+        "population": "Population",
+        "food_productionBalance": "생산 균형",
+        "food_stocksToUse": "사용 가능 재고",
+        "food_waterSecurity": "물 안보",
+        "food_importDiversity": "수입 다양성",
+        "energy_productionBalance": "생산 균형",
+        "energy_lowCarbonShare": "저탄소 에너지 비중",
+        "energy_gridEfficiency": "전력망 효율",
+        "demographics_totalDependency": "총 부양비",
+        "demographics_oldAgeDependency": "고령 부양비",
+        "demographics_workingAgeProjection": "생산가능인구 전망",
+        "demographics_tertiaryEnrollment": "고등교육 진학률",
+        "demographics_researchersPerMillion": "100만 명당 연구자 수",
+        "demographics_stemGraduateShare": "STEM 졸업생 비중",
+        "demographics_trainedIndustrialShare": "훈련된 산업 인력 비중",
+        "demographics_manufacturingEmploymentShare": "제조업 고용 비중",
+        "technology_internetUse": "인터넷 사용",
+        "technology_mobileSubscriptions": "모바일 가입자",
+        "technology_fixedBroadband": "유선 광대역",
+        "technology_rdSpend": "연구개발 지출",
+        "technology_researchersPerMillion": "100만 명당 연구자 수",
+        "technology_stemGraduateShare": "STEM 졸업생 비율",
+        "technology_electricityAccess": "전기 접근성",
+        "defense_expenditureUsd": "군사 지출",
+        "defense_expenditurePctGdp": "군사 부담",
+        "defense_personnel": "무장군대 인원",
+        "defense_industrialBalance": "방위 산업 균형",
+        "defense_supplierDiversity": "무기 공급처 다양성"
+      }
+    },
+    "defenseIndustrialBase": {
+      "proLocked": "PRO로 업그레이드하여 무기 공급업체 의존성 및 군사 역량 확인"
     }
   },
   "header": {
@@ -528,6 +594,7 @@
       "recent": "최근 검색",
       "empty": "데이터를 검색하거나 명령어를 실행하세요",
       "noResults": "결과 없음",
+      "resultAnnouncement_other": "'{{query}}' 검색 결과 {{count}}개",
       "commands": "명령어",
       "results": "결과",
       "seeAllCommands": "모든 명령 보기",
@@ -786,7 +853,6 @@
   "components": {
     "webcams": {
       "paused": "웹캠 일시정지됨",
-      "pausedIdle": "웹캠 일시정지됨 — 마우스를 움직여 재개",
       "regions": {
         "all": "전체",
         "mideast": "중동",
@@ -913,7 +979,8 @@
       "refineryStage": "Refine",
       "stageUnavailable": "No published figures for this stage",
       "withheldNote": "W withheld",
-      "productionCaption": "Country shares of actual production. The map deposits layer shows where resources sit; this table shows who mines or refines them."
+      "productionCaption": "Country shares of actual production. The map deposits layer shows where resources sit; this table shows who mines or refines them.",
+      "productionProLocked": "PRO로 업그레이드하여 채광 및 제련소 국가별 점유율을 단계별 집중도(HHI)로 확인"
     },
     "tradePolicy": {
       "tariffs": "관세",
@@ -1107,9 +1174,6 @@
       "datacenter": "데이터 센터",
       "base": "군사 기지",
       "nuclear": "핵 시설"
-    },
-    "community": {
-      "joinDiscussion": "Help Shape What's Next"
     },
     "threatLabels": {
       "critical": "심각",
@@ -1419,7 +1483,10 @@
       "provenanceTitle": "커버리지 출처: 이 브리프가 선택된 수집 스토리 및 고유 소스의 개수",
       "compiledFrom": "{{stories}}개의 스토리와 {{sources}}개의 소스에서 컴파일됨",
       "briefFreshness": "{{minutes}}분 전 생성됨 · 최신 소스 {{hours}}시간 전",
-      "briefStoryDetails": "Story details ({{count}})"
+      "briefStoryDetails": "기사 세부 정보 ({{count}})",
+      "streamIdleStopLabel": "유휴 상태일 때 라이브 영상 중지",
+      "streamIdleStopDesc": "활동이 없는 상태가 이 시간 동안 지속되면 Live News와 Live Webcams을 중지하고 패널에 알림을 표시합니다.",
+      "streamIdleStopNever": "사용 안 함"
     },
     "settings": {
       "exportSettings": "설정 내보내기",
@@ -1748,6 +1815,16 @@
       "loading": "Telegram 릴레이에 연결 중...",
       "empty": "사용 가능한 메시지 없음",
       "disabled": "Telegram 릴레이가 비활성 상태입니다",
+      "watchlistPlaceholder": "@username으로 공개 채널 추가",
+      "resolving": "채널 검색 중...",
+      "invalidUsername": "공개 Telegram @username을 사용하세요",
+      "resolveFailed": "채널을 찾을 수 없습니다",
+      "watchlistLimit": "맞춤 채널은 최대 {{count}}개까지 팔로우할 수 있습니다",
+      "previewMembers": "멤버 {{count}}명",
+      "addChannel": "채널 추가",
+      "added": "추가됨",
+      "remove": "삭제",
+      "custom": "맞춤",
       "filterAll": "전체",
       "filterBreaking": "속보",
       "filterConflict": "분쟁",
@@ -1959,6 +2036,22 @@
       "metals": {
         "gold": "Gold",
         "silver": "Silver"
+      },
+      "divergence": {
+        "compositeValue": "물리적 스트레스 지수: {{value}} / 100",
+        "fiveDayTrend": "5거래일 프리미엄 추세",
+        "regimes": {
+          "normal": "정상",
+          "elevated": "상승",
+          "stressed": "스트레스",
+          "extreme": "극심"
+        },
+        "states": {
+          "insufficientHistory": "워밍업 중: {{count}} / {{required}} 거래 데이터 포인트",
+          "staleInput": "물리적 벤치마크 만료됨",
+          "missingInput": "발산 신호 불가능"
+        },
+        "twentyDayTrend": "20거래일 프리미엄 추세"
       }
     },
     "crypto": {
@@ -2110,6 +2203,26 @@
         "failedToLoad": "로드 실패"
       },
       "cissStale": "ECB가 더 최신 값을 발표하지 않았습니다 — 이 수치가 최신이 아닐 수 있습니다."
+    },
+    "supplyVulnerability": {
+      "title": "원자재 취약성",
+      "help": "공급자 집중도, 해상 운송 및 이용 가능한 전략 비축량을 바탕으로 한 국가별 원자재 노출도입니다.",
+      "loading": "원자재 취약성을 불러오는 중…",
+      "unavailable": "원자재 취약성 데이터를 사용할 수 없습니다",
+      "noCoverage": "이 국가에 대한 근거가 부족합니다",
+      "unknown": "알 수 없음",
+      "concentration": "집중도",
+      "transit": "운송",
+      "buffer": "비축량",
+      "sources": "출처",
+      "methodology": "방법론",
+      "hormuzTitle": "원자재 의존도",
+      "dependentCountries": "의존 국가",
+      "dependentCommodities": "의존 원자재",
+      "stateOk": "현재",
+      "stateStale": "오래된 입력",
+      "stateInsufficient": "데이터 부족",
+      "proLocked": "PRO로 업그레이드하여 원자재 취약성 점수 확인"
     },
     "hormuzTracker": {
       "infoTooltip": "<strong>호르무즈 무역 추적기</strong> 세계에서 가장 중요한 석유 병목지점인 호르무즈 해협을 통과하는 AIS 선박 실시간 추적. 유조선 수, 중단 이벤트, 주간 흐름 변화를 모니터링. 전 세계 석유 공급의 약 20%가 매일 이곳을 통과.",
@@ -2500,7 +2613,14 @@
       "empty": "검출된 활성 수렴이 없습니다.",
       "signals_other": "{{count}}개 신호",
       "analyzing": "분석 중입니다...",
-      "viewOnMap": "지도에서 보기"
+      "viewOnMap": "지도에서 보기",
+      "waiting": "다음 데이터 업데이트를 기다리는 중입니다. 이 패널은 자동으로 업데이트됩니다.",
+      "offline": "연결을 기다리는 중입니다. 다시 온라인 상태가 되면 이 패널이 자동으로 업데이트됩니다.",
+      "updated": "업데이트됨 {{time}}",
+      "saved": "마지막으로 확인된 업데이트 {{time}} · 업데이트 확인 중",
+      "savedOffline": "마지막으로 확인된 업데이트 {{time}} · 오프라인",
+      "localSignals": "대시보드에 로드된 신호를 기반으로 함",
+      "emptySaved": "마지막으로 확인된 업데이트에는 수렴이 없었습니다."
     },
     "thermalEscalation": {
       "title": "열 급증",
@@ -2645,6 +2765,47 @@
       "rubBase": "러시아 중앙은행 — 단위당 루블",
       "rubPerUnit": "단위당 루블",
       "sourceCbr": "출처: 러시아 중앙은행"
+    },
+    "passkeyOffer": {
+      "title": "패스키를 저장하시겠어요?",
+      "body": "다음에는 지문, 얼굴, 또는 기기 PIN으로 로그인하세요 — 기억할 비밀번호가 없습니다.",
+      "accept": "패스키 저장",
+      "dismiss": "나중에",
+      "close": "닫기",
+      "announce": "다음에 더 빠르게 로그인하려면 패스키를 저장하세요.",
+      "busy": "기기 대기 중…",
+      "succeeded": "패스키가 저장되었습니다. 다음에 로그인할 때 사용할 수 있습니다.",
+      "retryable": "완료되지 않았습니다. 다시 시도할 수 있습니다.",
+      "failed": "이 기기에서 패스키를 저장할 수 없었습니다."
+    },
+    "decisionBrief": {
+      "commodityTitle": "원자재 의사결정 브리프",
+      "commodity": "원자재 / 제품",
+      "blockedChokepoint": "봉쇄를 가정한 해상 요충지",
+      "commodityCapture": "원자재 비교 기록",
+      "title": "의사결정 브리프",
+      "fuel": "연료",
+      "chokepoint": "병목 지점",
+      "baseline": "기준 시나리오 차질",
+      "comparison": "비교 시나리오 차질",
+      "capture": "둘 다 가져오기 / 새로고침",
+      "downloadHtml": "브리프 HTML 다운로드",
+      "downloadJson": "브리프 JSON 다운로드",
+      "back": "← 국가 브리프로 돌아가기",
+      "select": "에너지 공급 차질을 선택한 다음 두 시나리오를 가져오세요.",
+      "changed": "선택이 변경되었습니다. 내보내기 전에 두 시나리오를 가져오세요.",
+      "loading": "두 시나리오를 가져오는 중…",
+      "captured": "가져왔습니다. 다운로드 전에 관측 날짜와 제약을 확인하세요.",
+      "failed": "시나리오를 가져오지 못했습니다. 접근 권한을 확인하고 다시 시도하세요. 내보낼 결과가 없습니다.",
+      "locked": "의사결정 브리프는 Pro에서 이용할 수 있습니다."
+    },
+    "liveMedia": {
+      "idleStatus": "활동 부재로 일시 중지됨",
+      "idleBody": "마우스, 키보드 또는 터치 활동이 {{duration}} 동안 없어서 라이브 영상이 중지되었습니다.",
+      "idleResume": "재개",
+      "idleKeepPlaying": "유휴 상태일 때 계속 재생",
+      "idleSettingsHint": "언제든지 설정 › 미디어에서 변경할 수 있습니다.",
+      "idleKeepPlayingToast": "유휴 상태일 때 라이브 영상이 계속 재생됩니다. 설정 › 미디어에서 변경하세요."
     }
   },
   "popups": {
@@ -2688,9 +2849,9 @@
     },
     "gpsJamming": {
       "title": "GPS/GNSS 간섭",
-      "navPerformance": "Nav Performance",
-      "samples": "ADS-B Samples",
-      "aircraft": "Aircraft",
+      "navPerformance": "영향을 받은 항공기",
+      "samples": "영향을 받은 항공기 수",
+      "aircraft": "관측된 항공기 총수",
       "h3Hex": "H3 Hex"
     },
     "flight": {
@@ -3426,7 +3587,8 @@
   "auth": {
     "signIn": "로그인",
     "createAccount": "계정 만들기",
-    "settings": "설정"
+    "settings": "설정",
+    "passkeyOffer": {}
   },
   "mcp": {
     "connectPanel": "MCP 연결",

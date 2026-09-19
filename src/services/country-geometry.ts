@@ -275,8 +275,8 @@ async function ensureLoaded(): Promise<void> {
         return;
       }
 
-      loadedGeoJson = data;
       rebuildCountryIndex(data);
+      loadedGeoJson = data;
       markLcpDebug('wm:data:country-geometry-fetch-ready', { features: data.features.length });
 
       // Apply optional higher-resolution boundary overrides (sourced from Natural Earth)
@@ -294,12 +294,17 @@ async function ensureLoaded(): Promise<void> {
         // Overrides optional; ignore fetch/parse errors
       }
     } catch (err) {
+      rebuildCountryIndex({ type: 'FeatureCollection', features: [] });
       markLcpDebug('wm:data:country-geometry-fetch-error');
       console.warn('[country-geometry] Failed to load countries.geojson:', err);
     }
   })();
 
-  await loadPromise;
+  try {
+    await loadPromise;
+  } finally {
+    loadPromise = null;
+  }
 }
 
 export async function preloadCountryGeometry(): Promise<void> {
@@ -383,6 +388,12 @@ export function getAllCountryCodes(): string[] {
 export function getCountryBbox(code: string): [number, number, number, number] | null {
   const entry = countryIndex.get(code.toUpperCase());
   return entry?.bbox ?? null;
+}
+
+/** Polygon rings for focus math. The stored bbox stays a naive AABB for hit-tests. */
+export function getCountryPolygons(code: string): [number, number][][][] | null {
+  const entry = countryIndex.get(code.toUpperCase());
+  return entry?.polygons ?? null;
 }
 
 export function getCountryCentroid(

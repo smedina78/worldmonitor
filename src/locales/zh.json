@@ -119,7 +119,8 @@
       "activeSirens": "警报启动中",
       "sirens24h": "警报 / 24小时",
       "aviationDisruptions": "航空中断",
-      "gpsJammingZones": "GPS干扰区域"
+      "gpsJammingZones": "GPS干扰区域",
+      "temporalUnavailable": "时间序列观测数据不可用"
     },
     "fallback": {
       "instabilityIndex": "**不稳定指数：{{score}}/100**（{{level}}，{{trend}}）",
@@ -190,7 +191,7 @@
       "decisionSignalsUnavailable": "中国决策信号快照当前不可用。"
     },
     "foodStocks": "Food stocks",
-    "foodStocksHelp": "USDA PSD commodity stocks-to-use by marketing year, with the world ratio alongside for context. FAOSTAT fills production only where PSD has no country coverage.",
+    "foodStocksHelp": "USDA PSD commodity stocks-to-use by marketing year, with the world ratio alongside for context. FAOSTAT Food Balances supplies production and domestic supply when PSD has no complete country balance.",
     "loadingFoodStocks": "Loading food stocks…",
     "foodStocksUnavailable": "Food stocks unavailable.",
     "foodStocksProLocked": "Upgrade to PRO for commodity stocks-to-use",
@@ -230,6 +231,71 @@
       "manufacturingShare": "Manufacturing employment",
       "source": "Sources: {{sources}}.",
       "retained": "{{stage}} data retained from the last successful refresh."
+    },
+    "fiveFactorScorecard": {
+      "title": "五维韧性记分卡",
+      "help": "食品、能源、人口、技术和国防领域的 v1 冻结证据得分。展开行以查看输入项、数据来源及缺失数据原因。",
+      "loading": "正在加载五维记分卡…",
+      "unavailable": "五维记分卡不可用。",
+      "proLocked": "升级至 PRO 以获取五维韧性记分卡",
+      "insufficient": "数据不足",
+      "notAvailable": "不可用",
+      "noEvidence": "该支柱暂无可用证据。",
+      "score": "{{score}}/5",
+      "coverage": "{{coverage}}% 覆盖率",
+      "methodologyVersion": "方法论 v{{version}}",
+      "methodologyLink": "查看方法论",
+      "pillars": {
+        "food": "粮食",
+        "energy": "能源",
+        "demographics": "人口",
+        "technology": "技术",
+        "defense": "国防"
+      },
+      "reasons": {
+        "source-unavailable": "数据源不可用",
+        "country-unavailable": "国家数据不可用",
+        "invalid-value": "源数据值无效",
+        "stale": "证据已过期",
+        "coverage-below-floor": "覆盖率低于评分下限",
+        "required-group-missing": "缺少必需的证据组",
+        "missing-population": "人口数据不可用",
+        "redistribution-blocked": "源数据不允许再分发",
+        "pillar-unavailable": "支柱数据不可用"
+      },
+      "inputs": {
+        "population": "Population",
+        "food_productionBalance": "生产平衡",
+        "food_stocksToUse": "可用库存",
+        "food_waterSecurity": "水安全",
+        "food_importDiversity": "进口多样性",
+        "energy_productionBalance": "生产平衡",
+        "energy_lowCarbonShare": "低碳能源占比",
+        "energy_gridEfficiency": "电网效率",
+        "demographics_totalDependency": "总抚养比",
+        "demographics_oldAgeDependency": "老年抚养比",
+        "demographics_workingAgeProjection": "劳动年龄人口预测",
+        "demographics_tertiaryEnrollment": "高等教育入学率",
+        "demographics_researchersPerMillion": "每百万人口研究人员数",
+        "demographics_stemGraduateShare": "STEM毕业生占比",
+        "demographics_trainedIndustrialShare": "受过培训产业劳动力占比",
+        "demographics_manufacturingEmploymentShare": "制造业就业占比",
+        "technology_internetUse": "互联网使用",
+        "technology_mobileSubscriptions": "移动用户数",
+        "technology_fixedBroadband": "固定宽带",
+        "technology_rdSpend": "研发支出",
+        "technology_researchersPerMillion": "每百万人口研究人员数",
+        "technology_stemGraduateShare": "STEM毕业生占比",
+        "technology_electricityAccess": "电力普及率",
+        "defense_expenditureUsd": "军事支出",
+        "defense_expenditurePctGdp": "军费负担",
+        "defense_personnel": "武装部队人员",
+        "defense_industrialBalance": "国防工业平衡",
+        "defense_supplierDiversity": "武器供应商多样性"
+      }
+    },
+    "defenseIndustrialBase": {
+      "proLocked": "升级至PRO以查看武器供应商依赖关系和军事能力"
     }
   },
   "header": {
@@ -528,6 +594,7 @@
       "recent": "最近搜索",
       "empty": "搜索数据或执行命令",
       "noResults": "无结果",
+      "resultAnnouncement_other": "“{{query}}”有 {{count}} 个结果",
       "commands": "命令",
       "results": "结果",
       "seeAllCommands": "查看所有命令",
@@ -786,7 +853,6 @@
   "components": {
     "webcams": {
       "paused": "摄像头已暂停",
-      "pausedIdle": "摄像头已暂停 — 移动鼠标以恢复",
       "regions": {
         "all": "全部",
         "mideast": "中东",
@@ -913,7 +979,8 @@
       "refineryStage": "Refine",
       "stageUnavailable": "No published figures for this stage",
       "withheldNote": "W withheld",
-      "productionCaption": "Country shares of actual production. The map deposits layer shows where resources sit; this table shows who mines or refines them."
+      "productionCaption": "Country shares of actual production. The map deposits layer shows where resources sit; this table shows who mines or refines them.",
+      "productionProLocked": "升级至PRO以查看矿山和炼油厂按阶段分布的国家份额和浓度(HHI)"
     },
     "tradePolicy": {
       "tariffs": "关税",
@@ -1107,9 +1174,6 @@
       "datacenter": "数据中心",
       "base": "基地",
       "nuclear": "核设施"
-    },
-    "community": {
-      "joinDiscussion": "Help Shape What's Next"
     },
     "threatLabels": {
       "critical": "危急",
@@ -1419,7 +1483,10 @@
       "compiledFrom": "编译自 {{stories}} 条故事和 {{sources}} 个来源",
       "provenanceTitle": "覆盖来源：此摘要选自多少条摄取的故事和不同的来源",
       "briefFreshness": "生成于 {{minutes}}m 前 · 最新来源 {{hours}}h 前",
-      "briefStoryDetails": "Story details ({{count}})"
+      "briefStoryDetails": "报道详情 ({{count}})",
+      "streamIdleStopLabel": "空闲时停止实时视频",
+      "streamIdleStopNever": "从不",
+      "streamIdleStopDesc": "在此时间内无活动后停止实时新闻和实时网络摄像头，并在面板中显示通知。"
     },
     "settings": {
       "exportSettings": "导出设置",
@@ -1748,6 +1815,16 @@
       "loading": "正在连接Telegram中继...",
       "empty": "暂无消息",
       "disabled": "Telegram中继未激活",
+      "watchlistPlaceholder": "通过 @username 添加公开频道",
+      "resolving": "正在查找频道...",
+      "invalidUsername": "请使用公开的 Telegram @username",
+      "resolveFailed": "找不到频道",
+      "watchlistLimit": "最多可关注 {{count}} 个自定义频道",
+      "previewMembers": "{{count}} 位成员",
+      "addChannel": "添加频道",
+      "added": "已添加",
+      "remove": "移除",
+      "custom": "自定义",
       "filterAll": "全部",
       "filterBreaking": "突发",
       "filterConflict": "冲突",
@@ -1959,6 +2036,22 @@
       "metals": {
         "gold": "Gold",
         "silver": "Silver"
+      },
+      "divergence": {
+        "compositeValue": "物理压力指数：{{value}} / 100",
+        "fiveDayTrend": "五个交易日溢价趋势",
+        "regimes": {
+          "normal": "正常",
+          "elevated": "升高",
+          "stressed": "受压",
+          "extreme": "极端"
+        },
+        "states": {
+          "insufficientHistory": "预热中：{{count}} / {{required}} 个交易点",
+          "staleInput": "物理基准数据已过期",
+          "missingInput": "分歧信号不可用"
+        },
+        "twentyDayTrend": "二十个交易日溢价趋势"
       }
     },
     "crypto": {
@@ -2110,6 +2203,26 @@
         "failedToLoad": "加载失败"
       },
       "cissStale": "欧洲中央银行尚未发布新数值 — 此读数可能已过期。"
+    },
+    "supplyVulnerability": {
+      "title": "大宗商品脆弱性",
+      "help": "基于供应商集中度、海运通道和可用战略缓冲评估各国分商品风险敞口。",
+      "loading": "正在加载大宗商品脆弱性…",
+      "unavailable": "大宗商品脆弱性数据不可用",
+      "noCoverage": "该国家的证据不足",
+      "unknown": "未知",
+      "concentration": "集中度",
+      "transit": "运输通道",
+      "buffer": "战略缓冲",
+      "sources": "来源",
+      "methodology": "方法论",
+      "hormuzTitle": "大宗商品依赖",
+      "dependentCountries": "依赖国家",
+      "dependentCommodities": "依赖商品",
+      "stateOk": "当前",
+      "stateStale": "输入已过期",
+      "stateInsufficient": "数据不足",
+      "proLocked": "升级至PRO以查看商品脆弱性评分"
     },
     "hormuzTracker": {
       "infoTooltip": "<strong>霍尔木兹贸易追踪器</strong> 通过全球最关键的石油咽喉要道霍尔木兹海峡的AIS船舶实时追踪。监控油轮数量、中断事件和每周流量变化。全球约20%的石油供应每天经此通过。",
@@ -2500,7 +2613,14 @@
       "empty": "未检测到活跃收敛",
       "signals_other": "{{count}} 个信号",
       "analyzing": "分析中...",
-      "viewOnMap": "在地图上查看"
+      "viewOnMap": "在地图上查看",
+      "waiting": "正在等待下一次数据更新。此面板会自动更新。",
+      "offline": "正在等待连接。恢复联网后，此面板会自动更新。",
+      "updated": "更新于 {{time}}",
+      "saved": "最近一次已知更新 {{time}} · 正在检查更新",
+      "savedOffline": "最近一次已知更新 {{time}} · 离线",
+      "localSignals": "基于仪表板中已加载的信号",
+      "emptySaved": "最近一次已知更新中未发现汇聚。"
     },
     "thermalEscalation": {
       "title": "热异常升级",
@@ -2645,6 +2765,47 @@
       "rubBase": "俄罗斯央行 — 每 1 单位卢布",
       "rubPerUnit": "每单位卢布",
       "sourceCbr": "来源：俄罗斯央行"
+    },
+    "passkeyOffer": {
+      "title": "保存通行密钥？",
+      "body": "下次登录时使用指纹、面容或设备PIN即可——无需记住密码。",
+      "accept": "保存通行密钥",
+      "dismiss": "暂不保存",
+      "close": "关闭",
+      "announce": "保存通行密钥以便下次更快登录。",
+      "busy": "正在等待设备响应…",
+      "succeeded": "通行密钥已保存。下次登录时可以使用。",
+      "retryable": "操作未完成。您可以重试。",
+      "failed": "无法在此设备上保存通行密钥。"
+    },
+    "decisionBrief": {
+      "commodityTitle": "大宗商品决策简报",
+      "commodity": "大宗商品 / 产品",
+      "blockedChokepoint": "假定被封锁的咽喉要道",
+      "commodityCapture": "记录大宗商品比较",
+      "title": "决策简报",
+      "fuel": "燃料",
+      "chokepoint": "咽喉要道",
+      "baseline": "基准中断程度",
+      "comparison": "对比中断程度",
+      "capture": "获取 / 刷新两者",
+      "downloadHtml": "下载 HTML 简报",
+      "downloadJson": "下载 JSON 简报",
+      "back": "← 返回国家简报",
+      "select": "选择能源供应中断情况，然后获取两个情景。",
+      "changed": "选择已更改。导出前请获取两个情景。",
+      "loading": "正在获取两个情景…",
+      "captured": "已获取。下载前请核查观测日期和限制条件。",
+      "failed": "无法获取情景。请检查访问权限并重试。没有可导出的结果。",
+      "locked": "决策简报面向 Pro 用户提供。"
+    },
+    "liveMedia": {
+      "idleStatus": "因不活动已暂停",
+      "idleBody": "在没有鼠标、键盘或触摸活动 {{duration}} 后，实时视频已停止。",
+      "idleResume": "继续",
+      "idleKeepPlaying": "空闲时继续播放",
+      "idleSettingsHint": "可随时在设置 › 媒体中更改。",
+      "idleKeepPlayingToast": "实时视频在空闲时将继续播放。在设置 › 媒体中更改。"
     }
   },
   "popups": {
@@ -2688,9 +2849,9 @@
     },
     "gpsJamming": {
       "title": "GPS/GNSS干扰",
-      "navPerformance": "Nav Performance",
-      "samples": "ADS-B Samples",
-      "aircraft": "Aircraft",
+      "navPerformance": "受影响航空器",
+      "samples": "受影响航空器数量",
+      "aircraft": "观测到的航空器总数",
       "h3Hex": "H3 Hex"
     },
     "flight": {
@@ -3335,7 +3496,7 @@
   },
   "shell": {
     "documentTitle": "World Monitor — 实时全球情报仪表板",
-    "metaDescription": "实时全球情报平台。刊登于 WIRED。全球 190 个国家 200 万+ 用户使用。冲突、市场、军事、OSINT 信息一览无遗。",
+    "metaDescription": "使用 World Monitor 实时仪表盘浏览全球态势，结合交互式地图与数据面板查看新闻、地缘政治、军事、金融、能源和基础设施信息。按所选产品视图探索相关图层、地区与事件，比较数据来源、观测时间和可用信号，跟踪变化并打开详情核查背景，为日常监测与研究提供可追溯的信息入口，同时关注来源覆盖及更新状态。",
     "offlineTitle": "您已离线",
     "offlineMessage": "World Monitor 需要互联网连接来获取实时情报数据。",
     "offlineRetry": "重试"
@@ -3426,7 +3587,8 @@
   "auth": {
     "signIn": "登录",
     "createAccount": "创建账户",
-    "settings": "设置"
+    "settings": "设置",
+    "passkeyOffer": {}
   },
   "mcp": {
     "connectPanel": "连接 MCP",

@@ -2,14 +2,14 @@
 
 **Last verified**: 2026-07-27 (public lifecycle, plan, price, and capability facts now share one generation chain).
 
-Factual snapshot of how authentication, payments, entitlements, and billing management work today. This page intentionally describes only current deployed behavior.
+Factual snapshot of the repository architecture for authentication, payments, entitlements, and billing management. Checkout source references were reviewed on 2026-09-15; deployment must be verified separately.
 
 ## Stack at a glance
 
 | Concern | Provider | Primary entry points |
 |---|---|---|
 | Auth | **Clerk** (`@clerk/clerk-js` headless on main app, `@clerk/clerk-react` on `/pro`) | `src/services/clerk.ts`, `pro-test/src/services/checkout.ts` |
-| Payments | **Dodo Payments** (hosted overlay + full-page return) | `convex/lib/dodo.ts`, `dodopayments-checkout` npm SDK |
+| Payments | **Dodo Payments** (top-level redirect to hosted checkout + guarded full-page return) | `convex/lib/dodo.ts`, `src/services/checkout.ts`, `pro-test/src/services/checkout.ts`; neither browser bundle requires the overlay SDK |
 | Entitlements | **Convex** (`subscriptions` + `entitlements` tables, reactive WebSocket) | `convex/payments/*`, `src/services/entitlements.ts`, `src/services/billing.ts` |
 | Referral attribution | **Dodo → Affonso** (via `metadata.affonso_referral` contract) | `convex/payments/checkout.ts:131`, `convex/payments/subscriptionHelpers.ts:299` |
 | Billing portal | **Dodo customer portal** | `api/customer-portal.ts`, `convex/payments/billing.ts`, `src/services/billing.ts:openBillingPortal` |
@@ -26,7 +26,7 @@ Products are served at runtime from `https://api.worldmonitor.app/api/product-ca
 - **Pro Annual** — `pdt_0NbttMIfjLWC10jHQWYgJ` ($399.99/yr, ~17% discount).
 - **API Starter** — `pdt_0NbttVmG1SERrxhygbbUq` ($99.99/mo, 1k req/day).
 - **API Annual** — `pdt_0Nbu2lawHYE3dv2THgSEV` ($999/yr).
-- **API Business** — `pdt_0Nbttg7NuOJrhbyBGCius` ($299.99/mo, 10k req/day, commercial-use license + 5 bundled Pro seats (same company email domain); monthly-only, published in #4945; Starter→Business upgrades ride the Dodo collection/portal path).
+- **API Business** — `pdt_0Nbttg7NuOJrhbyBGCius` ($299.99/mo, 10k req/day, commercial-use license + 5 bundled Pro seats (any corporate email domain); monthly-only, published in #4945; Starter→Business upgrades ride the Dodo collection/portal path).
 - **Enterprise** — `mailto:enterprise@worldmonitor.app` (contact sales).
 
 ## Auth — Clerk
@@ -52,16 +52,18 @@ Both share `_createCheckoutSession()` which:
 1. Validates `returnUrl` against an allow-listed set of worldmonitor.app origins.
 2. Builds metadata: `wm_user_id` (HMAC-signed via `convex/lib/identitySigning.ts`), `wm_login_email` + `wm_login_email_sig` (the Clerk login email authenticated for this checkout, signed as a **separate** field so the `wm_user_id_sig` payload stays `userId` alone and pre-existing sessions keep verifying), + optional `affonso_referral`.
 3. Calls `checkout()` from `convex/lib/dodo.ts`.
-4. Returns `{ checkout_url }` for overlay open or full-page redirect.
+4. Returns `{ checkout_url }` for hosted checkout navigation.
 
 ### Duplicate guard
 
 Before creating a session, `getCheckoutBlockingSubscription` checks for active/on_hold/cancelled subs. If one exists, throws/returns `ACTIVE_SUBSCRIPTION_EXISTS` with the blocking plan info — clients route the user to billing portal instead of creating a second sub.
 
-### Overlay vs full-page flow
+### Checkout flow
 
-- **Overlay** (main app): `src/services/checkout.ts:openCheckout()` uses `DodoPayments.Checkout.open()` with `manualRedirect: true`. On success, a sessionStorage flag (`wm-post-checkout`) is set and the page reloads. Post-reload, `consumePostCheckoutFlag()` + entitlement transition detector show the success banner and unlock panels.
-- **Full-page return** (fallback / `/pro` path): Dodo redirects to `worldmonitor.app/?subscription_id=...&status=active`. `src/services/checkout-return.ts:handleCheckoutReturn()` reads params, cleans the URL, returns success boolean.
+Both surfaces take the same path since #4449: a top-level redirect to Dodo's hosted checkout. The overlay iframe could not host Dodo's nested 3DS/fraud stack.
+
+- **Live path**: `startCheckout()` (`src/services/checkout.ts`, `pro-test/src/services/checkout.ts`) creates the session at the edge endpoint, then navigates full-page. Dodo returns the buyer to the dashboard on the guarded `?wm_checkout=return` contract; `src/services/checkout-return.ts:handleCheckoutReturn()` reads the params, reconciles success only against authoritative Dodo evidence (`subscription_id`/`payment_id` plus a success status), and cleans the URL.
+- **Overlay removed**: neither surface initializes the Dodo overlay SDK. The dashboard's unused overlay event handler, callback wiring, watchdog and SDK dependency have been removed. Hosted checkout uses `safeHostedCheckoutUrl()` before navigation; live entitlement subscriptions and the guarded return handler own activation.
 
 ### Webhook → subscription lifecycle
 
@@ -111,7 +113,7 @@ src/services/
 ├── auth-state.ts             # Central auth session
 ├── billing.ts                # Subscription watch + openBillingPortal
 ├── entitlements.ts           # Reactive entitlement state
-├── checkout.ts               # Dodo overlay orchestration
+├── checkout.ts               # Hosted checkout orchestration
 ├── checkout-return.ts        # Post-checkout URL param handling
 └── referral.ts               # Share-link fetch + Web Share API
 

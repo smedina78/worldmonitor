@@ -407,16 +407,27 @@ export function isSunsetLayer(key: keyof MapLayers): boolean {
   return !IRAN_ATTACKS_ENABLED && key === 'iranAttacks';
 }
 
+export function getOrderedLayerKeys(variant: MapVariant): Array<keyof MapLayers> {
+  return (VARIANT_LAYER_ORDER[variant] ?? VARIANT_LAYER_ORDER.full)
+    .filter(k => !isSunsetLayer(k));
+}
+
+export function getCompleteLayerCatalogKeys(variant: MapVariant): Array<keyof MapLayers> {
+  const primary = getOrderedLayerKeys(variant);
+  const seen = new Set(primary);
+  const rest = (Object.keys(LAYER_REGISTRY) as Array<keyof MapLayers>)
+    .filter(k => !seen.has(k) && !isSunsetLayer(k));
+  return [...primary, ...rest];
+}
+
 export function getLayersForVariant(variant: MapVariant, kind: RendererKind): LayerDefinition[] {
-  const keys = VARIANT_LAYER_ORDER[variant] ?? VARIANT_LAYER_ORDER.full;
-  return keys
-    .filter(k => !isSunsetLayer(k))
+  return getOrderedLayerKeys(variant)
     .map(k => LAYER_REGISTRY[k])
     .filter(d => d.renderers.includes(kind));
 }
 
 export function getAllowedLayerKeys(variant: MapVariant): Set<keyof MapLayers> {
-  return new Set((VARIANT_LAYER_ORDER[variant] ?? VARIANT_LAYER_ORDER.full).filter(k => !isSunsetLayer(k)));
+  return new Set(getOrderedLayerKeys(variant));
 }
 
 export function sanitizeLayersForVariant(layers: MapLayers, variant: MapVariant): MapLayers {
@@ -426,6 +437,15 @@ export function sanitizeLayersForVariant(layers: MapLayers, variant: MapVariant)
     if (!allowed.has(key)) sanitized[key] = false;
   }
   return sanitized;
+}
+
+export function sanitizeResilienceScoreForRenderer(
+  layers: MapLayers,
+  isDeckGLActive: boolean,
+): MapLayers {
+  return layers.resilienceScore && !isDeckGLActive
+    ? { ...layers, resilienceScore: false }
+    : layers;
 }
 
 /**

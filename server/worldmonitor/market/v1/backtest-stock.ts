@@ -310,7 +310,7 @@ export const backtestStock: MarketServiceHandler['backtestStock'] = async (
     const response: BacktestStockResponse = {
       available: true,
       symbol,
-      name: req.name || symbol,
+      name: symbol,
       display: symbol,
       currency: history.currency || 'USD',
       evalWindowDays,
@@ -358,7 +358,8 @@ export const backtestStock: MarketServiceHandler['backtestStock'] = async (
     if (quotaHold.reservation && (definitiveInvalidSymbol || result.source !== 'fresh' || !result.leader)) {
       await quotaHold.reservation.rollback();
     }
-    if (result.data) return result.data;
+    // Shared records use the symbol; caller display names belong only in this response.
+    if (result.data) return { ...result.data, name: req.name || symbol };
   } catch (err) {
     if (quotaHold.reservation) {
       await quotaHold.reservation.rollback();

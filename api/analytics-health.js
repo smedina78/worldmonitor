@@ -3,7 +3,8 @@
  *
  * A browser cannot tell whether a receiptless collector response came from a
  * privacy layer or from a collector outage. It reports only bounded counter
- * deltas here; Redis supplies the cross-user denominator and Sentry receives a
+ * deltas here, including the compatibility-timeout numerator; Redis supplies
+ * the cross-user denominator and Sentry receives a
  * single warning when one request cohort's failure rate separates from that
  * cohort's own observed baseline. No event payload, user id, URL, or browser
  * fingerprint is accepted.
@@ -94,6 +95,12 @@ const RATE_LIMIT_PER_MINUTE = 60;
 const ALLOWED_COHORTS = new Set(['event', 'critical-event', 'identify']);
 const ALLOWED_FAILURE_KINDS = new Set(['network', 'timeout', 'missing-receipt', 'none']);
 
+// App-owned collector-health counters (#7674): this route is the only writer,
+// so reads and writes ride the deployment-prefixed helper default ON TOP of
+// this coarse env segment. Production keeps the bare historical shape
+// (deployment prefix is '' there); on preview the counters are scoped to this
+// exact deployment — intentional, since per-deploy collector cohorts should
+// not blend with other branches' baselines.
 function keyPrefix() {
   const environment = process.env.VERCEL_ENV || 'production';
   return `analytics:collector-health:v1:${environment}`;
@@ -131,13 +138,15 @@ function finiteCounter(value, minimum = 1) {
 export function parseCollectorHealthReport(payload) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
   const { cohort, writes, failures, failureKind } = payload;
+  const manualTimeoutWrites = payload.manualTimeoutWrites ?? 0;
   if (!ALLOWED_COHORTS.has(cohort) || !ALLOWED_FAILURE_KINDS.has(failureKind)) return null;
   if (!finiteCounter(writes) || !finiteCounter(failures, 0) || failures > writes) return null;
+  if (!finiteCounter(manualTimeoutWrites, 0) || manualTimeoutWrites > writes) return null;
   if (failureKind === 'none' && failures !== 0) return null;
   if (payload.bucket !== undefined && (!Number.isSafeInteger(payload.bucket) || payload.bucket < 0)) return null;
   return payload.bucket === undefined
-    ? { cohort, writes, failures, failureKind }
-    : { cohort, writes, failures, failureKind, bucket: payload.bucket };
+    ? { cohort, writes, manualTimeoutWrites, failures, failureKind }
+    : { cohort, writes, manualTimeoutWrites, failures, failureKind, bucket: payload.bucket };
 }
 
 /**
@@ -333,6 +342,7 @@ export async function recordCollectorHealthAggregate(
 ) {
   const { redisPipeline: pipeline, captureSilentError: capture } = dependencies;
   const writesKey = redisKey(bucket, report.cohort, 'writes');
+  const manualTimeoutWritesKey = redisKey(bucket, report.cohort, 'manual-timeout-writes');
   const failuresKey = redisKey(bucket, report.cohort, 'failures');
   const today = dayIndexForBucket(bucket);
   const hour = hourIndexForBucket(bucket);
@@ -343,10 +353,13 @@ export async function recordCollectorHealthAggregate(
   // previous day's baseline, and the breach streak.
   const results = await pipeline([
     ['INCRBY', writesKey, String(report.writes)],
+    ['INCRBY', manualTimeoutWritesKey, String(report.manualTimeoutWrites ?? 0)],
     ['INCRBY', failuresKey, String(report.failures)],
     ['EXPIRE', writesKey, String(HEALTH_KEY_TTL_SECONDS)],
+    ['EXPIRE', manualTimeoutWritesKey, String(HEALTH_KEY_TTL_SECONDS)],
     ['EXPIRE', failuresKey, String(HEALTH_KEY_TTL_SECONDS)],
     ['GET', writesKey],
+    ['GET', manualTimeoutWritesKey],
     ['GET', failuresKey],
     ['GET', redisKey(previousBucket, report.cohort, 'writes')],
     ['GET', redisKey(previousBucket, report.cohort, 'failures')],
@@ -355,16 +368,18 @@ export async function recordCollectorHealthAggregate(
     ['GET', baselineKey(today - 1, hour, report.cohort, 'windows')],
     ['GET', streakKey],
   ], 2_500);
-  if (!Array.isArray(results) || results.length < 12) return false;
+  if (!Array.isArray(results) || results.length < 15) return false;
 
   if (results.some(hasEntryError)) return false;
-  const writes = counterResult(results[4]);
-  const failures = counterResult(results[5]);
-  if (writes === null || failures === null) return false;
+  const writes = counterResult(results[6]);
+  const manualTimeoutWrites = counterResult(results[7]);
+  const failures = counterResult(results[8]);
+  if (writes === null || manualTimeoutWrites === null || failures === null) return false;
+  if (manualTimeoutWrites > writes) return false;
 
-  const baseline = readBaseline(results[8], results[9], results[10]);
-  const previousWrites = counterResult(results[6]);
-  const previousFailures = counterResult(results[7]);
+  const baseline = readBaseline(results[11], results[12], results[13]);
+  const previousWrites = counterResult(results[9]);
+  const previousFailures = counterResult(results[10]);
   if (previousWrites !== null && previousFailures !== null) {
     const finalized = await finalizeBaselineWindow(
       pipeline,
@@ -379,8 +394,8 @@ export async function recordCollectorHealthAggregate(
 
   if (!shouldEmitAggregateAlert(writes, failures, baseline)) return true;
 
-  if (hasEntryError(results[11])) return false;
-  const streak = advanceBreachStreak(stringResult(results[11]), bucket);
+  if (hasEntryError(results[14])) return false;
+  const streak = advanceBreachStreak(stringResult(results[14]), bucket);
 
   // The Lua transition re-reads and updates the streak atomically, rejects
   // stragglers from older buckets, and claims the once-per-window latch.
@@ -422,6 +437,8 @@ export async function recordCollectorHealthAggregate(
     extra: {
       failureCount: failures,
       writeCount: writes,
+      manualTimeoutWriteCount: manualTimeoutWrites,
+      manualTimeoutRate: manualTimeoutWrites / writes,
       failureRate: failures / writes,
       failureRateLowerBound: observed.lower,
       baselineFailureRate: baseline ? baseline.failures / baseline.writes : null,

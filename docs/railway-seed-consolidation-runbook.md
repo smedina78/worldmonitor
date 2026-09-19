@@ -34,15 +34,17 @@ The normal deployment architecture is intentionally small:
 |---|---|---|
 | Merge safety | GitHub protected `main` | Require a PR, current-base checks with `strict=true`, administrator enforcement, zero required human approvals, and no bypass actors. |
 | Service selection | Railway's native watch paths, backed by `scripts/railway-services.json`, its closure audit, and the exact identity roster in `scripts/railway-native-autodeploy-fleet.json` | A source migration may change `source.checkSuites` only. It must not change watch paths, fleet identity, or another service field. |
+| Desired configuration sync | Main-only `Railway Registry Sync` workflow | Apply registry-managed watch paths, Dockerfile paths, and cron schedules from the exact merged checkout. Verify through the separate Viewer identity. |
 | Deployment creation | Railway's native GitHub integration on explicit branch `main` | No GitHub Actions workflow dispatches, retries, leases, or repairs a normal deployment. |
 | Drift detection | One six-hourly, read-only Railway workflow after the monitor migration | Missing, detached, replaced, unexpected, unknown, failed, skipped, overdue, or contradictory state is red. The monitor has no mutation token, dispatch permission, retry, reviewer, or acceptance baseline. |
 | Recovery | Operator diagnosis followed by an explicit Railway action or batch rollback | Recovery is never automatic and never turns missing evidence green. Seed/ingestion freshness remains a separate acceptance surface. |
 
 The permanent monitor uses a credential issued to a dedicated Railway
-`VIEWER` identity. The legacy token names described later in this rollback
-section are not proof of read-only capability and are deleted with the old
-control plane; never reuse a deploy-capable project token for the target
-monitor.
+`VIEWER` identity. `Railway Registry Sync` uses the separate
+`RAILWAY_RECONCILE_DEPLOY_TOKEN_V2` project token only for its bounded config
+patch. Other legacy token names described later are not proof of read-only
+capability and are deleted with the old control plane. Never reuse a
+deploy-capable project token for the target monitor.
 
 During the bounded rollback window, **Railway Deploy Trigger (Manual Rollback
 Only)** and **Railway Deploy Trigger Watchdog (Manual Rollback Only)** retain
@@ -229,12 +231,14 @@ live settings with:
 node scripts/audit-railway-watch-paths.mjs
 ```
 
-To reconcile only drifted seeders and verify the read-back:
+For breakglass repair, reconcile only drifted seeders and verify the read-back:
 
 ```bash
 node scripts/audit-railway-watch-paths.mjs --apply
 ```
 
+Run the breakglass command only from a clean checkout whose `HEAD` equals current
+`origin/main`. A stale checkout can remove dependencies that a newer merge added.
 The apply mode changes only drifted `build.watchPatterns`,
 `build.dockerfilePath` and `deploy.cronSchedule` fields, uses one environment
 config commit, and waits for
@@ -244,28 +248,59 @@ publisher, while still auditing their watch paths and required environment.
 Run the audit after adding or replacing a standalone seeder, changing a bundle
 dependency, or changing a production cron.
 
+**Editing `watchPatterns` is not complete until the live read-back matches.**
+Widening a service's closure in the registry does not touch Railway. Until the
+main-only reconciler applies it, Railway keeps filtering pushes against the old
+list and can answer a matching commit with `No changes to watched files`.
+#6928 widened `ais-relay` without syncing, and Railway refused `6821a584e`
+(#7196) for it a day before anyone noticed (#7256).
+
+The `Railway Registry Sync` workflow
+(`.github/workflows/railway-registry-sync.yml`) owns this transition. It runs
+after a push to `main` changes the registry, fleet identity, audit, a shared
+Railway helper, the runner, or the workflow. The apply step uses the dedicated
+mutation token only after the checkout SHA is confirmed as the current `main`
+revision. This rejects a stale re-run before it can restore an older registry.
+The apply changes only registry-managed fields. The final step starts a fresh
+read budget, uses the separate Viewer identity, and fails unless live Railway
+matches the repository. That read also reports `source.branch` and
+`source.checkSuites` drift, which the apply step never writes: a run that stays
+red on those fields needs the service source repaired in the Railway dashboard,
+not a re-run. Each attempt is bounded, operational failures retry twice after
+the first failure, and a drift verdict or a refused patch fails immediately.
+The production concurrency group never cancels an in-flight apply.
+
+The workflow runs the configuration audit only. The deployment-history check is
+legitimately red for the first minutes after a merge, so including it here would
+alarm on ordinary build lag. Drift that no registry edit caused, such as a hand
+edit in the Railway dashboard, stays the six-hourly monitor's job.
+
 The audit only proves the trigger config matches the registry. Proving a merge
 actually reached production is the separate
 [deploy-drift check](#deploy-drift-check) below.
 
 The six-hourly `Railway Native Deploy Health` workflow performs this audit in
 deployment-only mode and runs the deployment-history check from the same
-Viewer projection. `Seed Freshness Monitor` owns ingestion acceptance only.
+Viewer projection. `Railway Registry Sync` reuses the same environment and
+Viewer token only for its final independent read. `Seed Freshness Monitor` owns
+ingestion acceptance only.
 Create the dedicated GitHub Actions environment
 `ingestion-acceptance-production`, restrict its deployment branch policy to
 `main`, and configure:
 
+- environment secret `RAILWAY_RECONCILE_DEPLOY_TOKEN_V2`: the production project
+  token used only by the registry-sync apply step and the dormant rollback path;
 - environment secret `RAILWAY_PRODUCTION_VIEWER_API_TOKEN`: an account token for
   a dedicated Railway identity whose project role is Viewer;
 - environment variable `RAILWAY_PROJECT_ID`: the `world-monitor` project ID.
 
-Do not define the Viewer token as a repository or organization secret:
+Do not define either token as a repository or organization secret.
 `workflow_dispatch` can target another ref, while the environment's server-side
-branch policy keeps the production credential unavailable there. The workflow
-references the environment with deployment tracking disabled and maps the token
-to `RAILWAY_API_TOKEN` only on the combined read step. It never links a checkout,
-requests variables, or passes `--apply`. Missing or inaccessible context fails
-the monitor rather than silently skipping the live audit. See
+branch policy keeps both production credentials unavailable there. The workflow
+references the environment with deployment tracking disabled. It maps the
+mutation token to `RAILWAY_TOKEN` only on the apply step and maps the Viewer
+token to `RAILWAY_API_TOKEN` only on the final read. Missing or inaccessible
+context fails the workflow rather than silently skipping the live audit. See
 [Deploy-drift check](#deploy-drift-check) for the exact workflow contract.
 
 ### Legacy reconciliation control plane (rollback window only)
@@ -594,9 +629,14 @@ a service has no stable active-deployment baseline.
 The job runs only for the literal `refs/heads/main`. It freezes the event SHA
 against the checkout SHA, uses full Git history with a blobless filter, and
 fails if the exact comparison commit cannot be fetched. It passes that
-immutable commit with `--head`; a local manual
-invocation without `--head` first refreshes the explicit `origin/main`
-tracking ref and then resolves it, never the current feature-branch `HEAD`.
+immutable commit with `--head`. Every invocation refreshes the explicit
+`origin/main` tracking ref again after the Railway fleet read, so lineage is
+judged against current ancestry without moving the comparison head; a merge
+landing mid-read is therefore recognized rather than reported as drift. That
+refresh is skipped when the run deadline has already passed, and a failure to
+refresh degrades to the pre-refresh ref, which can only over-report. A local
+manual invocation without `--head` additionally resolves that refreshed ref as
+the head, never the current feature-branch `HEAD`.
 
 The workflow maps `RAILWAY_PRODUCTION_VIEWER_API_TOKEN` to
 `RAILWAY_API_TOKEN` only on the combined read step. The
@@ -768,11 +808,36 @@ compact-health problem have both advanced. See Railway's official
 [deployment actions reference](https://docs.railway.com/deployments/deployment-actions).
 
 `railway run` is also not production-network evidence: Railway documents it as
-executing locally after injecting service variables. For an immediate long-cron
-backfill, use a controlled temporary Railway cron execution, verify its terminal
-run plus seed metadata and compact health, then restore the captured command and
-schedule and rerun the operational-config audit. The full rollback-safe sequence
-is documented in
+executing locally after injecting service variables. For an authorized
+Cross-Strait history backfill, use the checked-in sandbox runner. It passes only
+server-side references from `seed-bundle-derived-signals`, rejects an incomplete
+canonical/source/history environment before the seeder can start, fetches the
+service's deployed commit, requires a lossless same-run history-ingest
+postflight, and destroys the sandbox after success or failure:
+
+```bash
+npm run railway:cross-strait-history:force -- \
+  --project <project-id> --environment <production-id-or-name> \
+  --confirm-production
+```
+
+The recovery contract is the full retained archive (365 MND reporting days plus
+reviewed Japan rows), not the newest 150 history rows. Scheduled ticks still
+cap each append at 150. The one-off batches through that same boundary so
+embedding cost stays bounded per batch, then requires a lossless same-run
+receipt: validation drops (blank title, missing `occurredAt`, over-limit
+fields) still fail postflight. Confirm `seed-bundle-derived-signals` has
+deployed this batching revision before running; an older seeder will slice the
+archive and the command will exit 75.
+
+The Railway sandbox also has a 15-minute server idle timeout as a cleanup
+backstop if the local process loses its response before it can read the sandbox
+ID. Verify the terminal run, the same-run ingest-health receipt, Convex
+intel-history for `domain=military` `resource=cross-strait-activity`, and
+compact health after the authorized execution. Other immediate long-cron
+backfills still require a controlled temporary Railway cron execution, captured
+command and schedule restoration, and a repeated operational-config audit. The
+full rollback-safe sequence is documented in
 [A merged seeder fix is not live until its cron fires](solutions/integration-issues/merged-is-not-ran-long-cron-seeders.md).
 
 ---
@@ -1022,10 +1087,10 @@ detects old source material.
 
 ### Bundle 3 heavy: seed-bundle-static-ref-heavy (live, #6806)
 
-Arms-Suppliers (460s worst case) and Military-Bases (410s) cannot share a 570s
+Arms-Suppliers (380s reservation) and Military-Bases (410s) cannot share a 570s
 tick — Railway kills a cron container at 10 minutes, so that ceiling is not
 negotiable. They CAN share a bundle: the runner defers whichever loses the tick
-to the next daily fire, and at 10-day and 30-day cadences a one-day deferral
+to the next daily fire, and at 14-day and 30-day cadences a one-day deferral
 costs nothing. One service carries all three heavy members instead of three
 1-section services, because Railway caps a project at 100 and the fleet is at 82.
 
@@ -1035,22 +1100,35 @@ costs nothing. One service carries all three heavy members instead of three
 | **Start command** | `node scripts/seed-bundle-static-ref-heavy.mjs` |
 | **Cron schedule** | `0 4 * * *` (daily 04:00 UTC, staggered off leftover's 03:00) |
 | **Lifecycle** | active — service `6285c37b-1327-46f1-bfd0-7454612764fb`, provisioned 2026-08-19, first tick published `bundle:heartbeat:static-ref-heavy` at 2026-08-20T04:01:04Z |
-| **Members** | Mineral-Production (180s / 60d), Arms-Suppliers (370s / 14d), Military-Bases (400s / 30d) |
+| **Members** | Supply-Vulnerability (160s / daily), Mineral-Production (180s / 60d), Arms-Suppliers (370s / 14d), and Military-Bases (400s / 30d), ordered by the durable turn policy below |
 | **Wall-time budget** | `maxBundleMs: 570_000` |
 | **Required variable** | `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`, `CLOUDFLARE_R2_ACCOUNT_ID` and one of `CLOUDFLARE_R2_TOKEN` / `CLOUDFLARE_API_TOKEN`. `USPTO_API_KEY` stays on leftover. The R2 pair is NOT optional here: `scripts/data/military-bases-final.json` is gitignored and the service has no volume, so without it Military-Bases falls back to the published version and exits non-zero once that is past its 30-day interval (#6845). |
 | **Heartbeat** | `bundle:heartbeat:static-ref-heavy` |
 
-**The lead slot rotates by day and that is load-bearing.** A member that never
-publishes never stops being due, so a fixed order hands it the first slot every
-single tick. That is not hypothetical: Arms-Suppliers has never written
+Supply-Vulnerability is a Redis-only projection with a 170s reservation,
+including kill grace. It does not always run first: Supply-Vulnerability leads
+even durable turns, while the rotated heavy list leads odd turns. This split is
+load-bearing because Supply-Vulnerability and Military-Bases reserve 580s
+together, more than the 570s bundle budget. The admission contract guarantees
+that each cadence class gets a slot within any two consecutive claimed turns.
+
+The scheduler claims the current value of `bundle:turn:static-ref-heavy` under
+a 15-minute lease. It acknowledges and advances that turn after every fully
+completed tick, including a non-zero tick, so a failing lead cannot monopolize
+the next invocation. A process killed or aborted before its terminal summary
+does not acknowledge; after lease expiry, the same unexecuted turn is safe to
+retry. This avoids the missed-day and repeated-parity failures of calendar
+rotation.
+
+Within the heavy list, `turn % 3` rotates Mineral-Production, Arms-Suppliers,
+and Military-Bases. A member that never publishes never stops being due, so a
+fixed order would hand it the first heavy slot every single tick. That is not
+hypothetical: Arms-Suppliers has never written
 `seed-meta:military:arms-suppliers-complete`, and on 2026-08-18 it took 371s of
 leftover's budget, leaving 177s against Mineral-Production's 190s reservation —
-deferring it by 13 seconds on the tick its acknowledgement expired. The bundle
-rotates `dayIndex % 3` (days since epoch, not `getUTCDay()`, which stutters
-across the week boundary and would give one member two consecutive lead days),
-so each member leads every third tick and a permanently failing member can
-consume at most one lead slot in three. `seed-bundle-macro.mjs` uses the same
-device for the same reason.
+deferring it by 13 seconds on the tick its acknowledgement expired. Durable
+turn rotation means each heavy member leads every third claimed turn and a
+permanently failing member can consume at most one heavy lead slot in three.
 
 Start commands in this table keep the `scripts/` prefix so they match the other
 bundle rows and the registry-coverage grep. Railway's actual start command is
@@ -1079,8 +1157,9 @@ any red check anywhere strands this service's builds.
 | **Watch paths** | `scripts/**`, `shared/**` |
 | **Replaces** | 2 services |
 | **Net savings** | 1 slot |
-| **Members** | Resilience Scores (6h), Resilience Static (annual window Oct 1-3, skips most runs), Food Stocks (monthly USDA PSD + FAOSTAT fill; needs `USDA_FAS_PSD_API_KEY`) |
-| **Wall budget** | 570 seconds, below Railway's 10-minute container kill. Section timeouts are 240s / 420s / 480s, so each fits the budget once the runner's 10s kill grace is added. Resilience Scores stays first in the array: it is the member that keeps `resilience:ranking:v27` and `resilience:intervals:v10:*` alive between cron fires, so it must be offered the budget before the heavier annual and monthly members. |
+| **Members** | Resilience Scores (2h admission interval), Resilience Static (90d, skips most runs), Food Stocks (monthly USDA PSD + FAOSTAT fill; needs `USDA_FAS_PSD_API_KEY`), Five-Factor Scorecard (daily Redis-only scoring) |
+| **Wall budget** | 570 seconds, below Railway's 10-minute container kill. Section timeouts are 240s / 280s / 480s / 180s, so every member fits alone once the runner's 10s kill grace is added. Resilience Scores stays first because it keeps the ranking and interval caches alive. Five-Factor Scorecard stays last: if a long-cadence section consumes its reservation, the runner defers scorecard before start; it fits on the next normal tick when Static and Food skip. The 180s scorecard reservation contains the 25s source-read deadline, Redis retry ceiling, atomic publication, and process-cleanup headroom. |
+| **Scorecard measurement** | Read-only production-source `--dry-run` on 2026-08-29: 196 countries, 3,716,740 serialized bytes, 1.82s wall time, and 220,577,792-byte maximum RSS. Validation passed and Redis was not modified. This is placement and payload-size evidence, not deployment or production-acceptance evidence. |
 | **Do not** | raise any section timeout above `maxBundleMs - 10_000`. A section whose timeout plus kill grace exceeds the budget is deferred on **every** tick while the bundle still exits 0 — #6556 ran this service dead for six hours behind a green badge. `tests/bundle-budget-admission.test.mjs` fails the PR, and `runBundle` refuses to start, but the arithmetic is worth knowing before you edit. |
 
 ### Bundle 5: seed-bundle-derived-signals
@@ -1237,12 +1316,12 @@ Recovery is accepted only when:
 |---|---|
 | **Service name** | `seed-bundle-macro` |
 | **Start command** | `node scripts/seed-bundle-macro.mjs` |
-| **Cron schedule** | `0 8 * * *` (daily 08:00 UTC) |
+| **Cron schedule** | `0 8,9 * * *` (daily 08:00 and 09:00 UTC) |
 | **Watch paths** | `scripts/**`, `shared/**` |
 | **Replaces** | 6 services |
 | **Net savings** | 5 slots |
 | **Members** | BIS Data (12h), CBR Rates (daily), BoC Valet (daily), StatCan WDS (daily), China Macro (36h), China Release Calendar (36h), China Policy Events (6h), BIS Extended (12h), BLS Series (daily), Eurostat (daily), Eurostat House Prices (7d), Eurostat Government Debt (2d), Eurostat Industrial Production (daily), IMF Macro (30d), National Debt (30d), FAO FFPI (daily), World Bank External Debt (30d), BIS LBS (7d), FATF Listing (30d), Education Attainment (7d) |
-| **Wall budget** | 570 seconds. The runner defers a section when its timeout plus 10-second kill grace cannot fit before Railway's 10-minute limit. Education stays last on six UTC days so a persistent failure in the new flag-dark producer cannot starve established production members; it gets first priority each Sunday UTC so sustained production load cannot defer its first envelope forever. |
+| **Wall budget** | 570 seconds. The runner defers a section when its timeout plus 10-second kill grace cannot fit before Railway's 10-minute limit. Physical Premiums runs first with 80 seconds of admission headroom. Education gets first priority at 08:00 each Sunday UTC, with Physical second. The 09:00 retry always puts Physical first, so a deferred run has another full admission window even when Education fails. Completed members skip through their interval gates. |
 
 ### Bundle 9: seed-bundle-health
 
@@ -1409,8 +1488,8 @@ entries.
 > include valid imports outside `scripts/`. Active rows must instead follow the
 > deploy mode and exact `watchPatterns` recorded in `scripts/railway-services.json`.
 > These rows are intentionally **not** part of the 100-service inventory count
-> above and are registered in `scripts/railway-services.json` with deploy mode
-> `nixpacks-root-repo`.
+> above. The planned rows are registered with deploy mode
+> `nixpacks-root-repo`; active rows use their verified live mode.
 >
 > **Cadence below is inferred from each seed's cache TTL** as a documentation
 > aid; confirm the live cron schedule and Service ID against the Railway
@@ -1438,12 +1517,16 @@ fetch('https://backboard.railway.com/graphql/v2',{method:'POST',
 | seed-market-quotes | `node scripts/seed-market-quotes.mjs` | **planned — not provisioned** | Equity index / stock bootstrap quotes (Yahoo + Finnhub + Alpha Vantage) |
 | seed-commodity-quotes | `node scripts/seed-commodity-quotes.mjs` | ~30 min (30m TTL) | Commodity + extended-gold bootstrap quotes |
 | seed-crypto-sectors | `node scripts/seed-crypto-sectors.mjs` | **planned — not provisioned** | CoinGecko crypto sector performance |
-| seed-market-breadth | `node scripts/seed-market-breadth.mjs` | daily (30d history window) | S&P 500 breadth (% above 20/50/200-day, Barchart) |
+| seed-market-breadth | `node scripts/seed-market-breadth.mjs` | daily (30d history window) | S&P 500 breadth (% above 20/50/200-day, computed from the TradingView constituent scan) |
 | seed-weather-alerts | `node scripts/seed-weather-alerts.mjs` | **planned — not provisioned** | NWS active weather alerts |
 | seed-fx-yoy | `node scripts/seed-fx-yoy.mjs` | daily (25h TTL) | Wide-coverage FX YoY + 24m drawdown (resilience FX-stress inputs) |
 | seed-comtrade-bilateral-hs4 | `node scripts/seed-comtrade-bilateral-hs4.mjs` | **`0 6 1 * *` (monthly, verified 2026-07-27)** | UN Comtrade bilateral HS4 trade flows — only scheduled consumer of the keyed 500/mo Comtrade quota |
 | seed-hs2-chokepoint-exposure | `node scripts/seed-hs2-chokepoint-exposure.mjs` | periodic (TTL-extended) | HS2 chokepoint trade-exposure (derived) |
 | seed-service-statuses | `node scripts/seed-service-statuses.mjs` | **planned — not provisioned** | Service-status warm-ping; primary seeder is the AIS relay loop |
+| seed-imd-cyclone-marine | `node seed-imd-cyclone-marine.mjs` | **`*/15 * * * *` (verified 2026-09-05)** | Official IMD cyclone, port, coastal, and marine products; scripts-root Nixpacks service `5f943d96-5f89-4817-941b-fdc36b71722e` |
+
+Configure the IMD account credentials and the IP-bound production key before
+you activate this service. See [Configure the IMD Railway seeder](natural-disasters.mdx#configure-the-imd-railway-seeder).
 
 The bilateral HS4 cron uses `COMTRADE_API_KEYS` and a 480-request hard budget
 under the provider's 500-call monthly quota. The authenticated route requests

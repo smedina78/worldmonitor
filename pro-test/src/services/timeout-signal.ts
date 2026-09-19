@@ -16,13 +16,12 @@
  * silently instead (an entitlement poll that could never succeed).
  *
  * MIRROR PAIR: `src/services/timeout-signal.ts` and
- * `pro-test/src/services/timeout-signal.ts` MUST stay byte-identical, because
- * `entitlement-watchdog.ts` — itself a byte-identical mirror across the two
- * roots — imports it as `./timeout-signal`. That specifier only resolves in
- * both bundles if the helper sits at the same relative path under each root.
- * `tests/entitlement-watchdog-parity.test.mts` enforces both halves; drift
- * there is quiet, because the import still resolves while one bundle loses
- * its fallback.
+ * `pro-test/src/services/timeout-signal.ts` MUST stay byte-identical. Each
+ * root's `checkout-transport.ts` imports it as `./timeout-signal`, and that
+ * specifier only resolves in both bundles if the helper sits at the same
+ * relative path under each root. `tests/marketing-mirror-parity.test.mts`
+ * enforces it; drift is quiet, because the import still resolves while one
+ * bundle loses its fallback.
  */
 export function createTimeoutSignal(ms: number): AbortSignal {
   if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
@@ -38,15 +37,67 @@ export function createTimeoutSignal(ms: number): AbortSignal {
       // to tell a request that timed out from one the caller cancelled — so the
       // fallback reproduces the native reason rather than silently reclassifying
       // every old-engine timeout as a cancellation.
-      controller.abort(
-        typeof DOMException === 'function'
-          ? new DOMException('signal timed out', 'TimeoutError')
-          : undefined,
-      );
+      let reason: DOMException | undefined;
+      if (typeof DOMException === 'function') {
+        reason = new DOMException('signal timed out', 'TimeoutError');
+        // Match the native reason's stack too, which is the header only.
+        // Chromium leaves a JS-built DOMException stackless, and Sentry's
+        // fetch instrumentation backfills a stackless rejection with the fetch
+        // call site; engines that do record a stack give it this timer's
+        // frames. Either way a browser extension's fetch hook that leaked this
+        // reason would report as a first-party rejection and escape the
+        // dashboard's zero-frame `signal timed out` suppression, as the
+        // insights loader's own reason did (WORLDMONITOR-125/12Z/11N). The
+        // cost is the native one: a caller that must surface a timeout has to
+        // catch it or report it with a `kind` tag.
+        try {
+          Object.defineProperty(reason, 'stack', {
+            value: 'TimeoutError: signal timed out',
+            configurable: true,
+            writable: true,
+          });
+        } catch {
+          /* engine pins `stack`; an unstamped reason must still abort below */
+        }
+      }
+      controller.abort(reason);
     } catch {
       /* already aborted or exotic AbortController */
     }
   }, ms);
+  return controller.signal;
+}
+
+/** Compose cancellation without assuming the Baseline 2024 AbortSignal.any API. */
+export function combineAbortSignals(signals: AbortSignal[]): AbortSignal {
+  if (signals.length === 0) return new AbortController().signal;
+  if (signals.length === 1) return signals[0]!;
+  if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.any === 'function') {
+    return AbortSignal.any(signals);
+  }
+  const controller = new AbortController();
+  const listeners = new Map<AbortSignal, () => void>();
+  const cleanup = (): void => {
+    for (const [signal, listener] of listeners) signal.removeEventListener('abort', listener);
+    listeners.clear();
+  };
+  const forward = (signal: AbortSignal): void => {
+    cleanup();
+    try {
+      controller.abort(signal.reason);
+    } catch {
+      controller.abort();
+    }
+  };
+  for (const signal of signals) {
+    if (signal.aborted) {
+      forward(signal);
+      break;
+    }
+    const listener = (): void => forward(signal);
+    listeners.set(signal, listener);
+    signal.addEventListener('abort', listener, { once: true });
+  }
   return controller.signal;
 }
 

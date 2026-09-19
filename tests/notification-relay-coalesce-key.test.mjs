@@ -6,9 +6,9 @@
  * relay scripts are runtime side-effect modules with no exports — the same
  * pattern used by tests/notification-relay-effective-sensitivity.test.mjs.
  *
- * The actual VTEC parser (deriveWeatherCoalesceKey in ais-relay.cjs) is
- * exercised here too via a minimal re-implementation extracted from the
- * source. If the source diverges, this test will fail and force an update.
+ * The VTEC parser (deriveWeatherCoalesceKey) and the notification family/slot
+ * selection live in scripts/_weather-alert-select.mjs and are imported and
+ * exercised directly here — no re-implementation.
  *
  * See docs/archive/plans/forbid-realtime-all-events.md "Out of scope: Slot B".
  *
@@ -32,6 +32,11 @@ const seedAviationSrc = readFileSync(resolve(__dirname, '..', 'scripts', 'seed-a
 const regionalAlertEmitterSrc = readFileSync(resolve(__dirname, '..', 'scripts', 'regional-snapshot', 'alert-emitter.mjs'), 'utf-8');
 const notificationDedupSrc = readFileSync(resolve(__dirname, '..', 'scripts', 'shared', 'notification-dedup.cjs'), 'utf-8');
 const notificationDedup = require('../scripts/shared/notification-dedup.cjs');
+const {
+  deriveWeatherCoalesceKey,
+  weatherAlertFamilyKey,
+  selectWeatherNotificationAlerts,
+} = await import('../scripts/_weather-alert-select.mjs');
 
 describe('notification-relay checkDedup — Slot B coalesce key', () => {
   it('checkDedup signature accepts an optional coalesceKey parameter', () => {
@@ -80,13 +85,13 @@ describe('notification-relay checkDedup — SETNX transport outcomes', () => {
       UPSTASH_REDIS_REST_TOKEN: process.env.UPSTASH_REDIS_REST_TOKEN,
       CONVEX_URL: process.env.CONVEX_URL,
       CONVEX_SITE_URL: process.env.CONVEX_SITE_URL,
-      RELAY_SHARED_SECRET: process.env.RELAY_SHARED_SECRET,
+      CONVEX_NOTIFICATION_RELAY_SECRET: process.env.CONVEX_NOTIFICATION_RELAY_SECRET,
     };
     process.env.UPSTASH_REDIS_REST_URL = 'https://upstash.example.test';
     process.env.UPSTASH_REDIS_REST_TOKEN = 'token';
     process.env.CONVEX_URL = 'https://example.convex.cloud';
     process.env.CONVEX_SITE_URL = 'https://example.convex.site';
-    process.env.RELAY_SHARED_SECRET = 'secret';
+    process.env.CONVEX_NOTIFICATION_RELAY_SECRET = 'secret';
     delete require.cache[require.resolve(relayPath)];
 
     const originalLoad = Module._load;
@@ -296,10 +301,8 @@ describe('market alert producer — asset-family coalesce key', () => {
       /return `market:\$\{assetClass\}:\$\{stableIdentifier\}:\$\{direction\}:\$\{severity\}`/,
       'market coalesce key must separate asset class, instrument, direction, and severity band',
     );
-    // Lock the normalization line itself so a source change (dropping the
-    // 'unknown' fallback or the trim/lowercase) is caught — the behavioral test
-    // below re-derives this logic inline, so without this assertion the two
-    // could drift together silently. PR #4985 review finding #4.
+    // Lock the normalization line itself so dropping the fallback or
+    // trim/lowercase normalization is caught. PR #4985 review finding #4.
     assert.match(
       aisRelaySrc,
       /const stableIdentifier = String\(identifier \|\| 'unknown'\)\.trim\(\)\.toLowerCase\(\)/,
@@ -317,19 +320,6 @@ describe('market alert producer — asset-family coalesce key', () => {
         `market_alert block must pass coalesceKey:\n${block}`,
       );
     }
-  });
-
-  it('rounded percent changes within the same critical commodity surge collapse to one family', () => {
-    const coalesce = (assetClass, identifier, direction, severity) =>
-      `market:${assetClass}:${String(identifier || 'unknown').trim().toLowerCase()}:${direction}:${severity}`;
-    const coffee11 = coalesce('commodity', 'KC=F', 'surge', 'critical');
-    const coffee13 = coalesce('commodity', 'KC=F', 'surge', 'critical');
-    assert.equal(coffee11, coffee13, 'Coffee +11% and +13% critical surge must share one dedup family');
-    assert.notEqual(
-      coffee11,
-      coalesce('commodity', 'KC=F', 'surge', 'high'),
-      'a high-to-critical threshold crossing may notify as a severity upgrade',
-    );
   });
 });
 
@@ -384,15 +374,10 @@ describe('seed-aviation publishNotificationEvent — Slot B publisher dedup', ()
   });
 });
 
-describe('ais-relay deriveWeatherCoalesceKey — VTEC parser', () => {
-  // Mini re-implementation that mirrors the source. If the parser shape changes,
-  // both this test fixture and the source need updating in lockstep.
-  function deriveWeatherCoalesceKey(vtec) {
-    if (typeof vtec !== 'string') return undefined;
-    const m = vtec.match(/\/[OTEX]\.[A-Z]+\.([A-Z]{4})\.([A-Z]{2})\.([A-Z])\.(\d{4})\./);
-    if (!m) return undefined;
-    return `nws:${m[1]}.${m[2]}.${m[3]}.${m[4]}`;
-  }
+describe('deriveWeatherCoalesceKey — VTEC parser', () => {
+  // The REAL parser, imported from scripts/_weather-alert-select.mjs. It used
+  // to be re-implemented here from the ais-relay source, which meant the test
+  // could not fail when the parser changed — only when the copy drifted.
 
   it('parses a typical NEW Severe Thunderstorm Warning VTEC into a stable family key', () => {
     const vtec = '/O.NEW.KSGF.SV.W.0034.250427T1257Z-250427T1330Z/';
@@ -476,13 +461,17 @@ describe('ais-relay weather publisher — coalesceKey threading', () => {
     );
   });
 
-  it('publishNotificationEvent call passes coalesceKey when derivable from VTEC', () => {
-    // Spread-conditional: only includes the field when the parser returned a value,
+  it('publishNotificationEvent call passes the shared weather family key as coalesceKey', () => {
+    // Spread-conditional: only includes the field when the key is non-empty,
     // so undefined isn't sent over the wire.
+    // Narrowing this to deriveWeatherCoalesceKey(a.vtec) left every VTEC-less
+    // SWIC/ECCC alert on publishNotificationEvent's global `weather_alert:
+    // <title>` dedup hash, so two countries sharing a generic WMO title
+    // collided on SET NX (#7243).
     assert.match(
       aisRelaySrc,
-      /coalesceKey\s*=\s*deriveWeatherCoalesceKey\(a\.vtec\)/,
-      'weather publisher must derive coalesceKey via deriveWeatherCoalesceKey(a.vtec)',
+      /coalesceKey\s*=\s*weatherAlertFamilyKey\(a\)/,
+      'weather publisher must key dedup on the same family key the selector partitions by',
     );
     assert.match(
       aisRelaySrc,
@@ -491,20 +480,33 @@ describe('ais-relay weather publisher — coalesceKey threading', () => {
     );
   });
 
-  it('selects 3 DISTINCT families before slicing — distinct families never lost (PR #3467 review P1)', () => {
+  it('selects DISTINCT families before slicing — distinct families never lost (PR #3467 review P1)', () => {
     // Without this: if the first 3 raw alerts are 3 adjacent zones of one VTEC
     // family, publisher dedup collapses them to 1 notification AND a 4th
     // genuinely-distinct family at index 3+ is never considered. Net silent
-    // loss of legit events. Fix: dedupe BY family key FIRST, then take top 3.
-    assert.match(
-      aisRelaySrc,
-      /seenFamilyKeys\s*=\s*new Set\(\)/,
-      'publisher must build a Set of seen family keys before publishing',
-    );
-    assert.match(
-      aisRelaySrc,
-      /distinctFamilyAlerts/,
-      'publisher must accumulate distinct-family alerts (not raw .slice(0, 3))',
+    // loss of legit events. Fix: dedupe BY family key FIRST, then slice.
+    // Exercised against the real selector rather than the relay source text.
+    const zone = (id) => ({
+      id,
+      source: 'nws',
+      countryCode: 'US',
+      severity: 'Extreme',
+      event: 'Severe thunderstorm warning',
+      vtec: '/O.NEW.KSGF.SV.W.0034.250427T1257Z-250427T1330Z/',
+    });
+    const tornado = {
+      id: 'tornado',
+      source: 'nws',
+      countryCode: 'US',
+      severity: 'Extreme',
+      event: 'Tornado warning',
+      vtec: '/O.NEW.KSGF.TO.W.0034.250427T1257Z-250427T1330Z/',
+    };
+    const selected = selectWeatherNotificationAlerts([zone('z1'), zone('z2'), zone('z3'), tornado]);
+    assert.deepEqual(
+      selected.map((a) => a.id),
+      ['z1', 'tornado'],
+      'three adjacent zones must collapse to one slot so the 4th distinct family is still reached',
     );
     // The naive `for (const a of highSeverityAlerts.slice(0, 3))` ordering is the bug; assert it's gone.
     assert.doesNotMatch(
@@ -512,17 +514,37 @@ describe('ais-relay weather publisher — coalesceKey threading', () => {
       /for\s*\(const\s+a\s+of\s+highSeverityAlerts\.slice\(0,\s*3\)\)/,
       'publisher must NOT iterate highSeverityAlerts.slice(0, 3) directly — that loses distinct families',
     );
-    // Family-key fallback uses source + a stable per-alert identity so VTEC-less
-    // NWS/ECCC/SWIC alerts still dedupe against themselves without colliding
-    // across authorities. A hardcoded `nws:fallback:` prefix would swallow SWIC
-    // rows into an NWS family when ids overlap.
-    assert.match(
-      aisRelaySrc,
-      /deriveWeatherCoalesceKey\(a\.vtec\)\s*\n?\s*\?\?\s*`\$\{a\.source \|\| 'weather'\}:\$\{a\.id/,
-      'family-key fallback must include source plus a stable per-alert identity (id || headline || event)',
+  });
+
+  it('family-key fallback is source- and country-scoped so VTEC-less alerts cannot collide', () => {
+    // A hardcoded `nws:fallback:` prefix would swallow SWIC rows into an NWS
+    // family when ids overlap on the shared weather:alerts:v1 path.
+    assert.equal(
+      weatherAlertFamilyKey({ source: 'swic', countryCode: 'CH', headline: 'Heavy rain' }),
+      'swic:CH:Heavy rain',
+    );
+    assert.notEqual(
+      weatherAlertFamilyKey({ source: 'swic', countryCode: 'CH', headline: 'Heavy rain' }),
+      weatherAlertFamilyKey({ source: 'swic', countryCode: 'IN', headline: 'Heavy rain' }),
+      'the same generic WMO title in two countries must be two families',
+    );
+    assert.notEqual(
+      weatherAlertFamilyKey({ source: 'swic', countryCode: 'CA', headline: 'Storm' }),
+      weatherAlertFamilyKey({ source: 'eccc', countryCode: 'CA', headline: 'Storm' }),
+      'two authorities for one country must not share a family',
+    );
+    assert.equal(
+      weatherAlertFamilyKey({ source: 'nws', countryCode: 'US', headline: 'x', vtec: '/O.NEW.KSGF.SV.W.0034.250427T1257Z-250427T1330Z/' }),
+      'nws:KSGF.SV.W.0034',
+      'VTEC wins over the title fallback when present',
+    );
+    assert.equal(
+      weatherAlertFamilyKey({ source: 'swic', countryCode: 'KZ', id: 'only-an-id' }),
+      'swic:KZ:only-an-id',
+      'a titleless alert still gets a usable family rather than an empty key',
     );
     assert.doesNotMatch(
-      aisRelaySrc,
+      weatherSelectSrc,
       /nws:fallback:/,
       'family-key fallback must not hardcode an NWS prefix on the shared weather:alerts:v1 path',
     );

@@ -209,7 +209,16 @@ export default async function handler(req, ctx) {
           relayResponse = await fetchViaRailway(feedUrl, timeout);
         } catch (relayError) {
           console.error('RSS proxy relay retry error:', feedUrl, relayError instanceof Error ? relayError.message : String(relayError));
-          captureSilentError(relayError, { tags: { route: 'api/rss-proxy', step: 'relay-retry', feed: feedUrl }, ctx });
+          // Skip Sentry on timeout, exactly as the outer catch does for the
+          // direct leg. fetchViaRailway aborts on the same feed timeout budget,
+          // and this retry is a best-effort SECOND attempt whose failure the
+          // caller never sees — the original non-ok direct response is returned
+          // either way. Capturing it reported routine upstream latency at error
+          // level (WORLDMONITOR-11G); #7438 made the same call for
+          // api/telegram-feed.js. Real relay failures still report.
+          if (relayError?.name !== 'AbortError') {
+            captureSilentError(relayError, { tags: { route: 'api/rss-proxy', step: 'relay-retry', feed: feedUrl }, ctx });
+          }
         }
         if (relayResponse?.ok) {
           response = relayResponse;
@@ -219,28 +228,20 @@ export default async function handler(req, ctx) {
     }
 
     const data = await response.text();
-    const isSuccess = response.status >= 200 && response.status < 300;
     const relayCacheState = usedRelay ? response.headers.get('x-cache') : null;
     const relayStaleMarker = usedRelay ? response.headers.get('x-relay-stale') : null;
-    // New relays identify stale fallback explicitly. Keep the label fallback
-    // while Railway and Vercel revisions roll out independently.
-    const legacyStaleCacheLabel = relayCacheState === 'STALE' || relayCacheState?.endsWith('-STALE');
-    const isStaleRelay = relayStaleMarker === '1' || legacyStaleCacheLabel;
-    const isCacheableSuccess = isSuccess && !isStaleRelay;
-    // Relay-only feeds are slow-updating institutional sources — cache longer
-    const cdnTtl = isRelayOnly ? 3600 : 900;
-    const swr = isRelayOnly ? 7200 : 1800;
-    const sie = isRelayOnly ? 14400 : 3600;
-    const browserTtl = isRelayOnly ? 600 : 180;
     return new Response(data, {
       status: response.status,
       headers: {
-        'Content-Type': response.headers.get('content-type') || 'application/xml',
-        'Cache-Control': isCacheableSuccess
-          ? `public, max-age=${browserTtl}, s-maxage=${cdnTtl}, stale-while-revalidate=${swr}, stale-if-error=${sie}`
-          : isStaleRelay ? 'no-store' : 'public, max-age=15, s-maxage=60, stale-while-revalidate=120',
-        ...(isCacheableSuccess && { 'CDN-Cache-Control': `public, s-maxage=${cdnTtl}, stale-while-revalidate=${swr}, stale-if-error=${sie}` }),
-        ...(isStaleRelay && { 'CDN-Cache-Control': 'no-store' }),
+        // Consumers parse response.text() as feed XML. Never let an upstream
+        // MIME type or active XML turn this same-origin URL into a document.
+        'Content-Type': 'text/plain; charset=utf-8',
+        'X-Content-Type-Options': 'nosniff',
+        'Content-Security-Policy': "sandbox; default-src 'none'",
+        // validateApiKey() gates every GET. Shared caches do not key on the
+        // credential header, so this must not be public / s-maxage / CDN-cached.
+        // `private` keeps CDNs out; max-age lets the SPA feedCache persist.
+        'Cache-Control': 'private, max-age=180',
         ...(relayCacheState && { 'X-Cache': relayCacheState }),
         ...(relayStaleMarker && { 'X-Relay-Stale': relayStaleMarker }),
         ...corsHeaders,
@@ -260,7 +261,6 @@ export default async function handler(req, ctx) {
     }
     return jsonResponse({
       error: isTimeout ? 'Feed timeout' : 'Failed to fetch feed',
-      details: error.message,
       url: feedUrl
     }, isTimeout ? 504 : 502, corsHeaders);
   }

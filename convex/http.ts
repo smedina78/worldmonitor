@@ -1,9 +1,11 @@
 import { anyApi, httpRouter } from "convex/server";
 import { httpAction, type ActionCtx } from "./_generated/server";
 import { internal } from "./_generated/api";
+import { lookupVerifiedAccountEmail, requireVerifiedAccountEmail } from "./lib/notificationEmail";
 import { TOUCH_DEBOUNCE_MS } from "./apiKeys";
 import {
   CHECKOUT_RATE_LIMITED,
+  isCheckoutTimedOutOutcome,
   isCheckoutRateLimitedOutcome,
 } from "./payments/checkoutRateLimit";
 import { webhookHandler } from "./payments/webhookHandlers";
@@ -53,6 +55,14 @@ function corsHeaders(origin: string | null): Headers {
   return headers;
 }
 
+export async function userPrefsOptionsHttpHandler(
+  _ctx: ActionCtx,
+  request: Request,
+): Promise<Response> {
+  const headers = corsHeaders(request.headers.get("Origin"));
+  return new Response(null, { status: 204, headers });
+}
+
 async function timingSafeEqualStrings(a: string, b: string): Promise<boolean> {
   const enc = new TextEncoder();
   const keyMaterial = await crypto.subtle.generateKey(
@@ -69,6 +79,34 @@ async function timingSafeEqualStrings(a: string, b: string): Promise<boolean> {
   let diff = 0;
   for (let i = 0; i < aArr.length; i++) diff |= aArr[i]! ^ bArr[i]!;
   return diff === 0;
+}
+
+const tenantRelaySecrets = {
+  gateway: "CONVEX_TENANT_RELAY_SECRET",
+  delivery: "CONVEX_NOTIFICATION_RELAY_SECRET",
+  suppression: "CONVEX_EMAIL_SUPPRESSION_SECRET",
+} as const;
+
+async function authorizeTenantRelay(
+  request: Request,
+  roles: readonly (keyof typeof tenantRelaySecrets)[],
+): Promise<Response | null> {
+  const provided = /^Bearer\s+(\S+)$/.exec(request.headers.get("Authorization") ?? "")?.[1];
+  const deny = () => Response.json({ error: "UNAUTHORIZED" }, { status: 401 });
+  if (!provided) return deny();
+  // A copied ingestion key must never acquire tenant authority under a new name.
+  const ingestion = process.env.RELAY_SHARED_SECRET;
+  if (ingestion && await timingSafeEqualStrings(provided, ingestion)) return deny();
+  for (const role of roles) {
+    const secret = process.env[tenantRelaySecrets[role]];
+    if (!secret || !(await timingSafeEqualStrings(provided, secret))) continue;
+    for (const other of Object.keys(tenantRelaySecrets) as (keyof typeof tenantRelaySecrets)[]) {
+      const otherSecret = process.env[tenantRelaySecrets[other]];
+      if (other !== role && otherSecret && await timingSafeEqualStrings(secret, otherSecret)) return deny();
+    }
+    return null;
+  }
+  return deny();
 }
 
 /** Parse a request body only when JSON produced an object (never null or an array). */
@@ -133,6 +171,96 @@ function setRateLimitResponseHeaders(headers: Headers, limit: number, reset: num
   headers.set("X-RateLimit-Remaining", "0");
   headers.set("X-RateLimit-Reset", String(reset));
   headers.set("Retry-After", String(retryAfter));
+}
+
+const REGISTER_INTEREST_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const REGISTER_INTEREST_MAX_EMAIL_LENGTH = 320;
+const REGISTER_INTEREST_MAX_META_LENGTH = 100;
+
+/**
+ * Server-to-server bridge for the anonymous waitlist flow. The public
+ * registerInterest mutation is internal so a Convex client cannot bypass the
+ * edge handler's Turnstile/desktop proof, email validation, and rate limits.
+ */
+export async function registerInterestHttpHandler(
+  ctx: ActionCtx,
+  request: Request,
+): Promise<Response> {
+  const providedSecret = request.headers.get("x-convex-shared-secret") ?? "";
+  const expectedSecret = process.env.CONVEX_SERVER_SHARED_SECRET ?? "";
+  if (!expectedSecret || !(await timingSafeEqualStrings(providedSecret, expectedSecret))) {
+    return new Response(JSON.stringify({ error: "UNAUTHORIZED" }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const body = await parseJsonObjectBody<{
+    email?: unknown;
+    source?: unknown;
+    appVersion?: unknown;
+    referredBy?: unknown;
+  }>(request);
+  if (!body) {
+    return new Response(JSON.stringify({ error: "INVALID_JSON" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const email = typeof body.email === "string" ? body.email : "";
+  if (
+    email.length === 0 ||
+    email.length > REGISTER_INTEREST_MAX_EMAIL_LENGTH ||
+    !REGISTER_INTEREST_EMAIL_RE.test(email)
+  ) {
+    return new Response(JSON.stringify({ error: "INVALID_EMAIL" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const metadata = [
+    ["source", body.source],
+    ["appVersion", body.appVersion],
+    ["referredBy", body.referredBy],
+  ] as const;
+  for (const [field, value] of metadata) {
+    if (
+      value !== undefined &&
+      (typeof value !== "string" || value.length > REGISTER_INTEREST_MAX_META_LENGTH)
+    ) {
+      return new Response(JSON.stringify({ error: `INVALID_${field.toUpperCase()}` }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+  }
+  if (typeof body.referredBy === "string" && body.referredBy.length > 20) {
+    return new Response(JSON.stringify({ error: "INVALID_REFERRED_BY" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  try {
+    const result = await ctx.runMutation(internal.registerInterest.register, {
+      email,
+      source: body.source as string | undefined,
+      appVersion: body.appVersion as string | undefined,
+      referredBy: body.referredBy as string | undefined,
+    });
+    return new Response(JSON.stringify(result), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch (err) {
+    console.error("[register-interest] internal mutation failed:", err);
+    return new Response(JSON.stringify({ error: "REGISTRATION_UNAVAILABLE" }), {
+      status: 503,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
 }
 
 export async function internalEntitlementsHttpHandler(
@@ -259,6 +387,53 @@ export async function internalEntitlementsHttpHandler(
 
 const http = httpRouter();
 
+// Only the edge contact handler may write leads after its public abuse checks.
+http.route({
+  path: "/leads/submit-contact",
+  method: "POST",
+  handler: httpAction(async (ctx, request) => {
+    const expected = process.env.CONVEX_SERVER_SHARED_SECRET ?? "";
+    const provided = request.headers.get("x-convex-shared-secret") ?? "";
+    if (!expected || !(await timingSafeEqualStrings(provided, expected))) {
+      return Response.json({ error: "UNAUTHORIZED" }, { status: 401 });
+    }
+    const body = await parseJsonObjectBody<Record<string, unknown>>(request);
+    if (!body || typeof body.name !== "string" || typeof body.email !== "string"
+      || typeof body.source !== "string"
+      || [body.organization, body.phone, body.message].some(
+        (value) => value !== undefined && typeof value !== "string",
+      )) {
+      return Response.json({ error: "INVALID_CONTACT" }, { status: 400 });
+    }
+    try {
+      const result = await ctx.runMutation(internal.contactMessages.submit, {
+        name: body.name,
+        email: body.email,
+        source: body.source,
+        organization: body.organization as string | undefined,
+        phone: body.phone as string | undefined,
+        message: body.message as string | undefined,
+      });
+      return Response.json(result);
+    } catch (error) {
+      const code = extractConvexErrorCode(error);
+      if (code === "rate_limited") {
+        return Response.json({ error: code }, { status: 429 });
+      }
+      if (code === "FREE_EMAIL_NOT_ALLOWED") {
+        return Response.json({ error: code }, { status: 422 });
+      }
+      return Response.json({ error: "CONTACT_STORAGE_FAILED" }, { status: 503 });
+    }
+  }),
+});
+
+http.route({
+  path: "/api/internal-register-interest",
+  method: "POST",
+  handler: httpAction(registerInterestHttpHandler),
+});
+
 http.route({
   path: "/api/internal-entitlements",
   method: "POST",
@@ -268,10 +443,7 @@ http.route({
 http.route({
   path: "/api/user-prefs",
   method: "OPTIONS",
-  handler: httpAction(async (_ctx, request) => {
-    const headers = corsHeaders(request.headers.get("Origin"));
-    return new Response(null, { status: 204, headers });
-  }),
+  handler: httpAction(userPrefsOptionsHttpHandler),
 });
 
 http.route({
@@ -430,18 +602,22 @@ http.route({
     if (!msg) return new Response("OK", { status: 200 });
 
     if (msg.chat?.type !== "private") return new Response("OK", { status: 200 });
-
-    if (!msg.date || Math.abs(Date.now() / 1000 - msg.date) > 900) {
+    if (typeof msg.chat.id !== "number" || !Number.isSafeInteger(msg.chat.id) || msg.chat.id <= 0) {
       return new Response("OK", { status: 200 });
     }
 
-    const text = msg.text?.trim() ?? "";
+    if (typeof msg.date !== "number" || !Number.isSafeInteger(msg.date) || Math.abs(Date.now() / 1000 - msg.date) > 900) {
+      return new Response("OK", { status: 200 });
+    }
+
+    if (typeof msg.text !== "string") return new Response("OK", { status: 200 });
+    const text = msg.text.trim();
     const chatId = String(msg.chat.id);
 
     const match = text.match(/^\/start\s+([A-Za-z0-9_-]{40,50})$/);
-    if (!match) return new Response("OK", { status: 200 });
+    if (!match?.[1]) return new Response("OK", { status: 200 });
 
-    const claimed = await ctx.runMutation(anyApi.notificationChannels!.claimPairingToken as any, {
+    const claimed = await ctx.runMutation(internal.notificationChannels.claimPairingToken, {
       token: match[1],
       chatId,
     });
@@ -470,15 +646,8 @@ http.route({
   path: "/relay/deactivate",
   method: "POST",
   handler: httpAction(async (ctx, request) => {
-    const secret = process.env.RELAY_SHARED_SECRET ?? "";
-    const provided = (request.headers.get("Authorization") ?? "").replace(/^Bearer\s+/, "");
-
-    if (!secret || !(await timingSafeEqualStrings(provided, secret))) {
-      return new Response(JSON.stringify({ error: "UNAUTHORIZED" }), {
-        status: 401,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
+    const unauthorized = await authorizeTenantRelay(request, ["delivery"]);
+    if (unauthorized) return unauthorized;
 
     const body = await parseJsonObjectBody<{ userId?: string; channelType?: string }>(request);
     if (!body) {
@@ -514,15 +683,8 @@ http.route({
   path: "/relay/channels",
   method: "POST",
   handler: httpAction(async (ctx, request) => {
-    const secret = process.env.RELAY_SHARED_SECRET ?? "";
-    const provided = (request.headers.get("Authorization") ?? "").replace(/^Bearer\s+/, "");
-
-    if (!secret || !(await timingSafeEqualStrings(provided, secret))) {
-      return new Response(JSON.stringify({ error: "UNAUTHORIZED" }), {
-        status: 401,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
+    const unauthorized = await authorizeTenantRelay(request, ["delivery"]);
+    if (unauthorized) return unauthorized;
 
     const body = await parseJsonObjectBody<{ userId?: string }>(request);
     if (!body) {
@@ -551,19 +713,13 @@ http.route({
 });
 
 // Service-to-service notification channel management (no user JWT required).
-// Authenticated via RELAY_SHARED_SECRET; caller supplies the validated userId.
+// Authenticated via CONVEX_TENANT_RELAY_SECRET; caller supplies the validated userId.
 http.route({
   path: "/relay/notification-channels",
   method: "POST",
   handler: httpAction(async (ctx, request) => {
-    const secret = process.env.RELAY_SHARED_SECRET ?? "";
-    const provided = (request.headers.get("Authorization") ?? "").replace(/^Bearer\s+/, "");
-    if (!secret || !(await timingSafeEqualStrings(provided, secret))) {
-      return new Response(JSON.stringify({ error: "UNAUTHORIZED" }), {
-        status: 401,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
+    const unauthorized = await authorizeTenantRelay(request, ["gateway"]);
+    if (unauthorized) return unauthorized;
 
     const body = await parseJsonObjectBody<{
       action?: string;
@@ -646,12 +802,16 @@ http.route({
         if (!body.channelType) {
           return new Response(JSON.stringify({ error: "channelType required" }), { status: 400, headers: { "Content-Type": "application/json" } });
         }
+        const verifiedAccountEmail = body.channelType === "email"
+          ? requireVerifiedAccountEmail(body.email, await lookupVerifiedAccountEmail(userId))
+          : undefined;
         const setResult = await ctx.runMutation((internal as any).notificationChannels.setChannelForUser, {
           userId,
           channelType: body.channelType as "telegram" | "slack" | "email" | "webhook",
           chatId: body.chatId,
           webhookEnvelope: body.webhookEnvelope,
           email: body.email,
+          verifiedAccountEmail,
           webhookLabel: body.webhookLabel,
           scheduleWelcome: body.scheduleWelcome === true,
         });
@@ -879,8 +1039,12 @@ http.route({
 
       return new Response(JSON.stringify({ error: "Unknown action" }), { status: 400, headers: { "Content-Type": "application/json" } });
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return new Response(JSON.stringify({ error: msg }), { status: 500, headers: { "Content-Type": "application/json" } });
+      const code = extractConvexErrorCode(err);
+      if (code === "EMAIL_OWNERSHIP_REQUIRED" || code === "PRO_REQUIRED") {
+        return new Response(JSON.stringify({ error: code }), { status: code === "PRO_REQUIRED" ? 402 : 400, headers: { "Content-Type": "application/json" } });
+      }
+      console.error('[notification-channels] Operation failed', err);
+      return new Response(JSON.stringify({ error: 'Operation failed' }), { status: 500, headers: { "Content-Type": "application/json" } });
     }
   }),
 });
@@ -890,14 +1054,8 @@ http.route({
   path: "/relay/digest-rules",
   method: "GET",
   handler: httpAction(async (ctx, request) => {
-    const secret = process.env.RELAY_SHARED_SECRET ?? "";
-    const provided = (request.headers.get("Authorization") ?? "").replace(/^Bearer\s+/, "");
-    if (!secret || !(await timingSafeEqualStrings(provided, secret))) {
-      return new Response(JSON.stringify({ error: "UNAUTHORIZED" }), {
-        status: 401,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
+    const unauthorized = await authorizeTenantRelay(request, ["delivery"]);
+    if (unauthorized) return unauthorized;
     const rules = await ctx.runQuery((internal as any).alertRules.getDigestRules);
     return new Response(JSON.stringify(rules), {
       status: 200,
@@ -915,14 +1073,8 @@ http.route({
   path: "/relay/enabled-rules",
   method: "GET",
   handler: httpAction(async (ctx, request) => {
-    const secret = process.env.RELAY_SHARED_SECRET ?? "";
-    const provided = (request.headers.get("Authorization") ?? "").replace(/^Bearer\s+/, "");
-    if (!secret || !(await timingSafeEqualStrings(provided, secret))) {
-      return new Response(JSON.stringify({ error: "UNAUTHORIZED" }), {
-        status: 401,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
+    const unauthorized = await authorizeTenantRelay(request, ["delivery"]);
+    if (unauthorized) return unauthorized;
     const enabled = new URL(request.url).searchParams.get("enabled") !== "false";
     const rules = await ctx.runQuery(
       (internal as any).alertRules.getByEnabled,
@@ -939,14 +1091,8 @@ http.route({
   path: "/relay/user-preferences",
   method: "POST",
   handler: httpAction(async (ctx, request) => {
-    const secret = process.env.RELAY_SHARED_SECRET ?? "";
-    const provided = (request.headers.get("Authorization") ?? "").replace(/^Bearer\s+/, "");
-    if (!secret || !(await timingSafeEqualStrings(provided, secret))) {
-      return new Response(JSON.stringify({ error: "UNAUTHORIZED" }), {
-        status: 401,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
+    const unauthorized = await authorizeTenantRelay(request, ["delivery"]);
+    if (unauthorized) return unauthorized;
     const body = await parseJsonObjectBody<{ userId?: string; variant?: string }>(request);
     if (!body) {
       return new Response(JSON.stringify({ error: "INVALID_JSON" }), {
@@ -980,14 +1126,8 @@ http.route({
   path: "/relay/followed-countries",
   method: "POST",
   handler: httpAction(async (ctx, request) => {
-    const secret = process.env.RELAY_SHARED_SECRET ?? "";
-    const provided = (request.headers.get("Authorization") ?? "").replace(/^Bearer\s+/, "");
-    if (!secret || !(await timingSafeEqualStrings(provided, secret))) {
-      return new Response(JSON.stringify({ error: "UNAUTHORIZED" }), {
-        status: 401,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
+    const unauthorized = await authorizeTenantRelay(request, ["gateway", "delivery"]);
+    if (unauthorized) return unauthorized;
     const body = await parseJsonObjectBody<{ userId?: unknown }>(request);
     if (!body) {
       return new Response(JSON.stringify({ error: "INVALID_JSON" }), {
@@ -1023,14 +1163,8 @@ http.route({
   path: "/relay/entitlement",
   method: "POST",
   handler: httpAction(async (ctx, request) => {
-    const secret = process.env.RELAY_SHARED_SECRET ?? "";
-    const provided = (request.headers.get("Authorization") ?? "").replace(/^Bearer\s+/, "");
-    if (!secret || !(await timingSafeEqualStrings(provided, secret))) {
-      return new Response(JSON.stringify({ error: "UNAUTHORIZED" }), {
-        status: 401,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
+    const unauthorized = await authorizeTenantRelay(request, ["delivery"]);
+    if (unauthorized) return unauthorized;
     const body = await parseJsonObjectBody<{ userId?: string }>(request);
     if (!body) {
       return new Response(JSON.stringify({ error: "INVALID_JSON" }), {
@@ -1064,20 +1198,14 @@ http.route({
 // 8-char share code to the signed-in user's Clerk userId so future
 // /pro?ref=<code> signups can credit the sharer via the
 // userReferralCredits path in registerInterest:register. Auth is
-// server-to-server via RELAY_SHARED_SECRET — the edge route already
+// server-to-server via CONVEX_TENANT_RELAY_SECRET — the edge route already
 // validated the caller's Clerk bearer before hitting this.
 http.route({
   path: "/relay/register-referral-code",
   method: "POST",
   handler: httpAction(async (ctx, request) => {
-    const secret = process.env.RELAY_SHARED_SECRET ?? "";
-    const provided = (request.headers.get("Authorization") ?? "").replace(/^Bearer\s+/, "");
-    if (!secret || !(await timingSafeEqualStrings(provided, secret))) {
-      return new Response(JSON.stringify({ error: "UNAUTHORIZED" }), {
-        status: 401,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
+    const unauthorized = await authorizeTenantRelay(request, ["gateway"]);
+    if (unauthorized) return unauthorized;
     const body = await parseJsonObjectBody<{ userId?: string; code?: string }>(request);
     if (!body) {
       return new Response(JSON.stringify({ error: "INVALID_JSON" }), {
@@ -1216,6 +1344,66 @@ http.route({
     );
 
     return new Response(JSON.stringify(result), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }),
+});
+
+// Service-to-service: validate a partner-embed key by its SHA-256 hash.
+// Separate from /api/internal-validate-api-key on purpose — the two credential
+// surfaces must never resolve through one another's table.
+http.route({
+  path: "/api/internal-validate-embed-key",
+  method: "POST",
+  handler: httpAction(async (ctx, request) => {
+    const providedSecret = request.headers.get("x-convex-shared-secret") ?? "";
+    const expectedSecret = process.env.CONVEX_SERVER_SHARED_SECRET ?? "";
+    if (!expectedSecret || !(await timingSafeEqualStrings(providedSecret, expectedSecret))) {
+      return new Response(JSON.stringify({ error: "UNAUTHORIZED" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    const body = await parseJsonObjectBody<{ keyHash?: unknown }>(request);
+    if (!body) {
+      return new Response(JSON.stringify({ error: "INVALID_JSON" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    if (typeof body.keyHash !== "string" || !/^[a-f0-9]{64}$/.test(body.keyHash)) {
+      return new Response(JSON.stringify({ error: "INVALID_KEY_HASH" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    const result = await ctx.runQuery(
+      (internal as any).embedKeys.validateKeyByHash,
+      { keyHash: body.keyHash },
+    );
+
+    if (result && touchIsDue(result.lastUsedAt)) {
+      try {
+        await ctx.scheduler.runAfter(0, (internal as any).embedKeys.touchKeyLastUsed, { keyId: result.id });
+      } catch (err) {
+        // sentry-coverage-ok: re-throwing here would 500 the edge validator, which
+        // coerces to null and stamps a negative-cache sentinel for a valid key.
+        // lastUsedAt is best-effort telemetry.
+        console.warn("[validate-embed-key] touchKeyLastUsed schedule failed:", err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    // Strip the gate's input from the response for the same reason the API-key
+    // route does: the edge caches this blob and its shape is load-bearing.
+    const publicResult = result
+      ? (({ lastUsedAt: _lastUsedAt, ...rest }) => rest)(result)
+      : null;
+
+    return new Response(JSON.stringify(publicResult), {
       status: 200,
       headers: { "Content-Type": "application/json" },
     });
@@ -1448,23 +1636,14 @@ http.route({
 });
 
 // Service-to-service: Vercel edge gateway creates Dodo checkout sessions.
-// Authenticated via RELAY_SHARED_SECRET; edge endpoint validates Clerk JWT
+// Authenticated via CONVEX_TENANT_RELAY_SECRET; edge endpoint validates Clerk JWT
 // and forwards the verified userId.
 http.route({
   path: "/relay/create-checkout",
   method: "POST",
   handler: httpAction(async (ctx, request) => {
-    const secret = process.env.RELAY_SHARED_SECRET ?? "";
-    const provided = (request.headers.get("Authorization") ?? "").replace(
-      /^Bearer\s+/,
-      "",
-    );
-    if (!secret || !(await timingSafeEqualStrings(provided, secret))) {
-      return new Response(JSON.stringify({ error: "UNAUTHORIZED" }), {
-        status: 401,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
+    const unauthorized = await authorizeTenantRelay(request, ["gateway"]);
+    if (unauthorized) return unauthorized;
 
     const body = await parseJsonObjectBody<{
       userId?: string;
@@ -1506,6 +1685,10 @@ http.route({
           bypassPendingGuard: body.bypassPendingGuard,
         },
       );
+      if (isCheckoutTimedOutOutcome(result)) {
+        // Keep provider failures at 500; 502 triggers another browser retry.
+        return Response.json({ error: result.code }, { status: 500 });
+      }
       if (isCheckoutRateLimitedOutcome(result)) {
         return new Response(
           JSON.stringify({
@@ -1547,6 +1730,9 @@ http.route({
         headers: { "Content-Type": "application/json" },
       });
     } catch (err) {
+      if (extractConvexErrorCode(err) === "INVALID_CHECKOUT_PRODUCT") {
+        return Response.json({ error: "INVALID_CHECKOUT_PRODUCT" }, { status: 400 });
+      }
       const msg = err instanceof Error ? err.message : "Checkout creation failed";
       return new Response(JSON.stringify({ error: msg }), {
         status: 500,
@@ -1557,23 +1743,14 @@ http.route({
 });
 
 // Service-to-service: Vercel edge gateway creates Dodo customer portal sessions.
-// Authenticated via RELAY_SHARED_SECRET; edge endpoint validates Clerk JWT
+// Authenticated via CONVEX_TENANT_RELAY_SECRET; edge endpoint validates Clerk JWT
 // and forwards the verified userId.
 http.route({
   path: "/relay/customer-portal",
   method: "POST",
   handler: httpAction(async (ctx, request) => {
-    const secret = process.env.RELAY_SHARED_SECRET ?? "";
-    const provided = (request.headers.get("Authorization") ?? "").replace(
-      /^Bearer\s+/,
-      "",
-    );
-    if (!secret || !(await timingSafeEqualStrings(provided, secret))) {
-      return new Response(JSON.stringify({ error: "UNAUTHORIZED" }), {
-        status: 401,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
+    const unauthorized = await authorizeTenantRelay(request, ["gateway"]);
+    if (unauthorized) return unauthorized;
 
     const body = await parseJsonObjectBody<{ userId?: string }>(request);
     if (!body) {
@@ -1618,23 +1795,14 @@ http.route({
   handler: resendWebhookHandler,
 });
 
-// Bulk email suppression: service-to-service, authenticated via RELAY_SHARED_SECRET.
+// Bulk email suppression: service-to-service, authenticated via CONVEX_EMAIL_SUPPRESSION_SECRET.
 // Used by the one-time import script (scripts/import-bounced-emails.mjs).
 http.route({
   path: "/relay/bulk-suppress-emails",
   method: "POST",
   handler: httpAction(async (ctx, request) => {
-    const secret = process.env.RELAY_SHARED_SECRET ?? "";
-    const provided = (request.headers.get("Authorization") ?? "").replace(
-      /^Bearer\s+/,
-      "",
-    );
-    if (!secret || !(await timingSafeEqualStrings(provided, secret))) {
-      return new Response(JSON.stringify({ error: "UNAUTHORIZED" }), {
-        status: 401,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
+    const unauthorized = await authorizeTenantRelay(request, ["suppression"]);
+    if (unauthorized) return unauthorized;
 
     const body = await parseJsonObjectBody<{
       emails: Array<{
@@ -1680,7 +1848,7 @@ http.route({
 // Historical intelligence memory (#5694).
 //
 // Ingest is server-to-server from the Railway seeders (RELAY_SHARED_SECRET,
-// same bearer convention as every other /relay/* route); the two read routes
+// separate from tenant relay credentials); the two read routes
 // are called by the Vercel edge (CONVEX_SERVER_SHARED_SECRET, same header
 // convention as the other /api/internal-* routes). Nothing here is reachable
 // by a browser: the underlying Convex functions are all `internal*`.

@@ -13,7 +13,7 @@ const NAV_ITEMS = [
   { href: '/pro#pricing', labelKey: 'welcome.nav.pricing', accent: true },
   { href: '#faq', labelKey: 'welcome.nav.faq', accent: false },
   { href: '/blog/', labelKey: 'welcome.nav.blog', accent: false },
-  { href: 'https://www.worldmonitor.app/docs', labelKey: 'welcome.nav.docs', accent: false },
+  { href: 'https://www.worldmonitor.app/docs/documentation', labelKey: 'welcome.nav.docs', accent: false },
 ] as const;
 
 const NavItems = ({ compact = false }: { compact?: boolean }) => (
@@ -54,9 +54,9 @@ export const Nav = () => (
       </details>
       <a
         href={`${DASHBOARD_PATH}?utm_source=welcome&utm_content=nav`}
+        aria-label={t('welcome.nav.launch')}
         data-umami-event="welcome-cta"
         data-umami-event-target="welcome-nav"
-        aria-label={t('welcome.nav.launch')}
         className="shrink-0 bg-wm-green text-wm-bg px-3 sm:px-4 py-2 rounded-sm font-mono text-xs uppercase tracking-wide sm:tracking-wider font-bold hover:bg-green-400 transition-colors inline-flex items-center gap-1.5"
       >
         {t('welcome.nav.launch')} <ArrowRight className="w-3 h-3" aria-hidden="true" />

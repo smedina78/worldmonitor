@@ -51,6 +51,7 @@ import {
   type GlobeLayerTruncation,
   type GlobeMarkerGroup,
 } from '@/utils/globe-marker-budget';
+import { renderLayerTruncationBadges } from '@/utils/layer-truncation-badge';
 import type { FeatureCollection, Geometry } from 'geojson';
 import type { MapLayers, Hotspot, MilitaryFlight, MilitaryVessel, MilitaryVesselCluster, NaturalEvent, InternetOutage, CyberThreat, SocialUnrestEvent, UcdpGeoEvent, MilitaryBase, GammaIrradiator, Spaceport, EconomicCenter, StrategicWaterway, CriticalMineralProject, AIDataCenter, UnderseaCable, Pipeline, CableAdvisory, RepairShip, AisDisruptionEvent, AisDensityZone, AisDisruptionType } from '@/types';
 import type { Earthquake } from '@/services/earthquakes';
@@ -81,6 +82,7 @@ import {
   PremiumLayerGate,
 } from './premium-layer-gate';
 import { globeAltitudeToMapZoom, mapZoomToGlobeAltitude } from '@/utils/globe-zoom';
+import { headingToCompass } from '@/utils/heading-to-compass';
 
 export interface GlobeMapOptions {
   onInitError?: (error: unknown) => void;
@@ -874,7 +876,7 @@ export class GlobeMap {
       .arcDashLength(0.9)
       .arcDashGap(4)
       .arcDashAnimateTime(5000)
-      .arcLabel((d: TradeRouteSegment) => `${d.routeName} · ${d.volumeDesc}`);
+      .arcLabel((d: TradeRouteSegment) => escapeHtml(`${d.routeName} · ${d.volumeDesc}`));
 
     // Path accessors — set once
     (globe as any)
@@ -939,7 +941,7 @@ export class GlobeMap {
         if (d.pathType === 'stormHistory') return 0;
         return 5000;
       })
-      .pathLabel((d: GlobePath) => d?.name ?? '');
+      .pathLabel((d: GlobePath) => escapeHtml(d?.name ?? ''));
 
     // Polygon accessors — set once
     (globe as any)
@@ -974,7 +976,7 @@ export class GlobeMap {
         return 0.005;
       })
       .polygonLabel((d: GlobePolygon) => {
-        if (d._kind === 'cii') return `<b>${escapeHtml(d.name)}</b><br/>CII: ${d.score}/100 (${escapeHtml(d.level ?? '')})`;
+        if (d._kind === 'cii') return `<b>${escapeHtml(d.name)}</b><br/>CII: ${Number.isFinite(Number(d.score)) ? Number(d.score) : '—'}/100 (${escapeHtml(d.level ?? '')})`;
         if (d._kind === 'conflict') {
           let label = `<b>${escapeHtml(d.name)}</b>`;
           if (d.parties?.length) label += `<br/>Parties: ${d.parties.map(p => escapeHtml(p)).join(', ')}`;
@@ -986,7 +988,7 @@ export class GlobeMap {
           if (d.datetime) label += `<br><span style="opacity:.7;">${escapeHtml(d.datetime)}</span>`;
           if (d.resolutionM != null || d.mode) {
             const parts: string[] = [];
-            if (d.resolutionM != null) parts.push(`${d.resolutionM}m`);
+            if (d.resolutionM != null) parts.push(`${Number.isFinite(Number(d.resolutionM)) ? Number(d.resolutionM) : '—'}m`);
             if (d.mode) parts.push(escapeHtml(d.mode));
             label += `<br><span style="opacity:.5;">Res: ${parts.join(' \u00B7 ')}</span>`;
           }
@@ -1477,8 +1479,7 @@ export class GlobeMap {
       html = `<span style="color:${sc};font-weight:bold;">🎯 ${esc(d.name)}</span>` +
              `<br><span style="opacity:.7;">Escalation: ${d.escalationScore}/5</span>`;
     } else if (d._kind === 'flight') {
-      const dirs = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'];
-      const compass = dirs[Math.round(((d.heading ?? 0) % 360 + 360) % 360 / 22.5) % 16];
+      const compass = headingToCompass(d.heading);
       html = `<span style="font-weight:bold;">✈ ${esc(d.callsign)}</span>` +
              `<br><span style="opacity:.7;">${esc(d.type)}</span>` +
              `<br><span style="opacity:.5;">Heading: ${compass} (${Math.round(d.heading ?? 0)}°)</span>`;
@@ -2900,26 +2901,7 @@ export class GlobeMap {
   private updateLayerTruncationLabels(): void {
     const root = this.layerTogglesEl;
     if (!root) return;
-    for (const row of Array.from(root.querySelectorAll<HTMLElement>('.layer-toggle-row'))) {
-      const layer = row.getAttribute('data-layer');
-      const counts = layer ? this.markerTruncation[layer] : undefined;
-      const existing = row.querySelector<HTMLElement>('.layer-truncation-count');
-      if (!counts) { existing?.remove(); continue; }
-      const badge = existing ?? document.createElement('span');
-      if (!existing) {
-        badge.className = 'layer-truncation-count';
-        // Sibling of the <label>, not a child: inside it, every click on the
-        // badge would toggle the layer off. `.layer-explain-btn` sits outside
-        // the label for the same reason.
-        row.appendChild(badge);
-      }
-      badge.textContent = `${counts.shown}/${counts.total}`;
-      // Untranslated literal: a new i18n key is a ~29-file change across locales,
-      // and the badge itself is numeric. Real key tracked as follow-up.
-      // Says "nearest this view" rather than "highest priority" because that is
-      // what the ranking actually does for layers with no severity of their own.
-      badge.title = `Showing ${counts.shown} of ${counts.total} markers — the most significant, and those nearest the current view. The globe caps markers per layer to keep interaction responsive; rotate or zoom to bring others in.`;
-    }
+    renderLayerTruncationBadges(root, this.markerTruncation, 'rotate');
   }
 
   /**
