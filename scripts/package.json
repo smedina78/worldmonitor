@@ -31,6 +31,7 @@
     "undici": "$undici",
     "ws": "$ws",
     "ip-address": "^10.3.1",
+    "uuid": "^11.1.1",
     "brace-expansion@1": "^1.1.18",
     "brace-expansion@2": "^2.1.4"
   },
