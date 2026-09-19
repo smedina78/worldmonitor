@@ -28,6 +28,8 @@ type HarnessWindow = Window & {
         | 'recent-protest'
     ) => void;
     setNewsPulseScenario: (scenario: 'none' | 'recent' | 'stale') => void;
+    setPositiveEvents: (events: unknown[]) => void;
+    setKindnessData: (points: unknown[]) => void;
     setHotspotActivityScenario: (scenario: 'none' | 'breaking') => void;
     forcePulseStartupElapsed: () => void;
     resetPulseStartupTime: () => void;
@@ -454,6 +456,12 @@ test.describe('DeckGL map harness', () => {
     await page.evaluate(() => {
       const w = window as HarnessWindow;
       w.__mapHarness?.seedAllDynamicData();
+      // `seedAllDynamicData()` siembra los otros dos disparadores del pulso
+      // (positiveEvents con count > 10 y kindness 'real'). El test neutraliza
+      // hotspots, news y protests para aislar la recencia del riot: sin limpiar
+      // estos dos, el pulso arranca por ellos y la aserción no mide lo que dice.
+      w.__mapHarness?.setPositiveEvents([]);
+      w.__mapHarness?.setKindnessData([]);
       w.__mapHarness?.setHotspotActivityScenario('none');
       w.__mapHarness?.setPulseProtestsScenario('none');
       w.__mapHarness?.setNewsPulseScenario('none');

@@ -61,7 +61,16 @@ interface MapStyle {
 interface LocalizableMap {
   getStyle?: () => MapStyle | null | undefined;
   getLayoutProperty?: (layerId: string, property: 'text-field') => unknown;
-  setLayoutProperty?: (layerId: string, property: 'text-field', value: Expression) => void;
+  // `value: any` is deliberate, not laziness. MapLibre declares this generic
+  // (`<K extends keyof AllLayoutProperties>(layerId, name: K, value:
+  // AllLayoutProperties[K])`) and since v6 the instantiated value type is no
+  // longer assignable FROM this shim's `Expression` under strict parameter
+  // contravariance, so a real `Map` stopped being assignable to this interface.
+  // The shim only ever *passes* an expression here and never reads the value
+  // back, so widening the input keeps `Map` (v5 and v6) assignable without the
+  // shim having to import MapLibre's style-spec types — which is the whole
+  // point of this file.
+  setLayoutProperty?: (layerId: string, property: 'text-field', value: any) => void;
 }
 
 const ENGLISH_ONLY: readonly string[] = ['name:en'];

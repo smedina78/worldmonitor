@@ -6,8 +6,69 @@
 import { MapboxOverlay } from '@deck.gl/mapbox';
 import type { Layer, LayersList, PickingInfo } from '@deck.gl/core';
 import { GeoJsonLayer, ScatterplotLayer, PathLayer, IconLayer, TextLayer, PolygonLayer } from '@deck.gl/layers';
-import maplibregl from 'maplibre-gl';
+import * as maplibregl from 'maplibre-gl';
 import type { StyleSpecification } from 'maplibre-gl';
+// maplibre-gl v6 construye la URL de su worker EN RUNTIME a partir de
+// `import.meta.url` (`new URL('./maplibre-gl-worker.mjs', moduleUrl)`), y eso no
+// hay bundler que lo detecte de forma estática: el optimizer de Vite
+// pre-bundlea el paquete en `.vite/deps/maplibre-gl.js` y busca ahí el hermano
+// `maplibre-gl-worker.mjs`, que no existe (404 medido el 2026-09-12), y en el
+// build el asset tampoco se emite (`dist/assets/maplibre-gl-worker.mjs` -> 404).
+// Con el worker roto, maplibre no puede parsear tiles: el mapa queda sin basemap
+// sin lanzar un error de página, que es la peor forma de romperse.
+//
+// `setWorkerUrl()` es la salida oficial de v6 (`config.WORKER_URL`). El
+// `?worker&url` hace que Vite emita el worker como entry propio — arrastrando su
+// import de `maplibre-gl-shared.mjs`, que es la razón por la que copiar el
+// archivo a mano no alcanza — y devuelve su URL servible en dev y en build.
+// Debe correr antes de crear la primera instancia de Map (este módulo es el que
+// las crea, y se importa de forma perezosa con MapContainer).
+import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
+
+maplibregl.setWorkerUrl(maplibreWorkerUrl);
+
+/**
+ * maplibre-gl 6 retiró `map.transform` de su superficie pública (medido el
+ * 2026-09-12: no está ni en la instancia ni en el prototipo), pero
+ * `@deck.gl/mapbox` lo lee en `getViewport()` para escalar el near/far plane:
+ * `viewState.nearZ = nearZ / map.transform.height`. Está igual en 9.2.11 y en
+ * 9.4.0 (mismo código), así que subir deck no lo arregla.
+ *
+ * Sin esto, cada frame de la capa interleaved tira "Cannot read properties of
+ * undefined (reading 'height')" (27 errores en 1 s, medidos) y el mapa queda sin
+ * basemap ni capas de deck.
+ *
+ * Ojo con el orden de descubrimiento: el worker de v6 roto (ver arriba) TAPABA
+ * este problema — sin worker, maplibre nunca llegaba a renderizar la capa custom,
+ * así que el smoke del repo pasaba en verde con el mapa roto.
+ *
+ * Se expone sólo lo que deck usa, con getters para que siga el tamaño del canvas.
+ * `_nearZ`/`_farZ` quedan fuera a propósito: v6 ya pasa `nearZ`/`farZ` en
+ * `renderParameters`, y si algún día no lo hace, deck cae a su cálculo por
+ * `nearZMultiplier` (`Number.isFinite(undefined)` es false) en vez de romper.
+ *
+ * Es un puente, no el arreglo: el fix real pertenece a deck.gl. Se define sólo si
+ * falta, así que si deck deja de necesitarlo (o maplibre lo devuelve) no interfiere.
+ */
+function exposeMapTransformForDeckGl(map: maplibregl.Map): void {
+  if ('transform' in map) return;
+  const canvas = map.getCanvas();
+  const shim = {
+    get height() {
+      return canvas.clientHeight || canvas.height;
+    },
+    get width() {
+      return canvas.clientWidth || canvas.width;
+    },
+    get elevation() {
+      return 0;
+    },
+  };
+  Object.defineProperty(map, 'transform', {
+    get: () => shim,
+    configurable: true,
+  });
+}
 import { FALLBACK_DARK_STYLE, FALLBACK_LIGHT_STYLE, getMapProvider, getMapTheme, isLightMapTheme } from '@/config/basemap';
 import { getStyleForProvider } from '@/config/basemap-styles';
 import Supercluster from 'supercluster';
@@ -1105,6 +1166,7 @@ export class DeckGLMap {
         }
         : {}),
     });
+    exposeMapTransformForDeckGl(this.maplibreMap);
 
     const recreateWithFallback = () => {
       if (this.usedFallbackStyle) return;
@@ -1135,6 +1197,7 @@ export class DeckGLMap {
           }
           : {}),
       });
+      exposeMapTransformForDeckGl(this.maplibreMap);
       this.maplibreMap.on('load', () => {
         this.attachMapLibreInteractionHandlers();
         localizeMapLabels(this.maplibreMap);
@@ -1156,7 +1219,7 @@ export class DeckGLMap {
     let tileLoadOk = false;
     let tileErrorCount = 0;
 
-    this.maplibreMap.on('error', (e: { error?: Error; message?: string }) => {
+    this.maplibreMap.on('error', (e: { error?: { message?: string }; message?: string }) => {
       const msg = e.error?.message ?? e.message ?? '';
       console.warn('[DeckGLMap] map error:', msg);
       if (msg.includes('Failed to fetch') || msg.includes('AJAXError') || msg.includes('CORS') || msg.includes('NetworkError') || msg.includes('403') || msg.includes('Forbidden')) {
@@ -8034,7 +8097,7 @@ export class DeckGLMap {
       if (timeoutId) { clearTimeout(timeoutId); timeoutId = null; }
     };
 
-    const onError = (e: { error?: Error; message?: string }) => {
+    const onError = (e: { error?: { message?: string }; message?: string }) => {
       if (gen !== this.tileMonitorGeneration) { cleanup(); return; }
       const msg = e.error?.message ?? e.message ?? '';
       if (msg.includes('Failed to fetch') || msg.includes('AJAXError') || msg.includes('CORS') || msg.includes('NetworkError') || msg.includes('403') || msg.includes('Forbidden')) {

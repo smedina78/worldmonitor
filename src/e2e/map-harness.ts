@@ -115,6 +115,12 @@ type MapHarness = {
   setProtestsScenario: (scenario: Scenario) => void;
   setPulseProtestsScenario: (scenario: PulseProtestScenario) => void;
   setNewsPulseScenario: (scenario: NewsPulseScenario) => void;
+  // `needsPulseAnimation()` dispara también por `positiveEvents` (count > 10) y
+  // por `kindnessPoints` de tipo 'real', y `seedAllDynamicData()` siembra ambos.
+  // Sin estos dos setters, un test que quiere aislar el disparador de protestas
+  // no puede apagar los otros dos y su aserción es inalcanzable.
+  setPositiveEvents: (events: PositiveGeoEvent[]) => void;
+  setKindnessData: (points: KindnessPoint[]) => void;
   setHotspotActivityScenario: (scenario: 'none' | 'breaking') => void;
   forcePulseStartupElapsed: () => void;
   resetPulseStartupTime: () => void;
@@ -1656,6 +1662,12 @@ window.__mapHarness = {
     map.setProtests(buildPulseProtests(scenario));
   },
   setNewsPulseScenario,
+  setPositiveEvents: (events: PositiveGeoEvent[]): void => {
+    map.setPositiveEvents(events);
+  },
+  setKindnessData: (points: KindnessPoint[]): void => {
+    map.setKindnessData(points);
+  },
   setHotspotActivityScenario: (scenario: 'none' | 'breaking'): void => {
     map.updateHotspotActivity(buildHotspotActivityNews(scenario));
   },
